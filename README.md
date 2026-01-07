@@ -12,6 +12,12 @@
 
 <a name="english"></a>
 
+## Preview
+
+<div align="center">
+  <img src="images/web-en.png" alt="English Preview" width="900" style="border: 1px solid #ddd; border-radius: 4px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);"/>
+</div>
+
 ## Key Features
 
 - **Ribbon Interface**: Modern ribbon-style UI similar to professional CAD software, enhancing workflow efficiency.
@@ -108,6 +114,12 @@ This project is licensed under the MIT License.
 ---
 
 <a name="chinese"></a>
+
+## 界面预览
+
+<div align="center">
+  <img src="images/web-zh.png" alt="中文预览" width="900" style="border: 1px solid #ddd; border-radius: 4px; box-shadow: 0 4px 12px rgba(0,0,0,0.1);"/>
+</div>
 
 ## 特色功能
 
