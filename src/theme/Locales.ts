@@ -49,6 +49,7 @@ const resources: Record<Lang, Record<string, string>> = {
         monitor_mem: "Memory",
         monitor_calls: "DrawCalls",
         confirm_delete: "Are you sure you want to delete",
+        confirm_clear: "Are you sure you want to clear the scene?",
         delete_item: "Delete Item",
         btn_confirm: "Confirm",
         btn_cancel: "Cancel",
@@ -141,6 +142,7 @@ const resources: Record<Lang, Record<string, string>> = {
         monitor_mem: "显存",
         monitor_calls: "绘制调用",
         confirm_delete: "确定要删除",
+        confirm_clear: "确定要清空场景吗？",
         delete_item: "删除模型",
         btn_confirm: "确定",
         btn_cancel: "取消",
@@ -190,7 +192,6 @@ const resources: Record<Lang, Record<string, string>> = {
         st_instancing: "实例化渲染",
         theme_dark: "深色模式",
         theme_light: "浅色模式",
-        ready: "就绪",
     }
 };
 
