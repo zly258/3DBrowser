@@ -92,21 +92,12 @@ const resources: Record<Lang, Record<string, string>> = {
         st_dir: "Direct Int.",
         st_bg: "Background",
         st_lang: "Language",
-        st_import_settings: "Import Axis Settings",
-        st_imp_glb: "GLB Up Axis",
-        st_imp_ifc: "IFC Up Axis",
+        st_import_settings: "Import Settings",
         st_theme: "Theme",
         st_monitor: "Performance Monitor",
         st_instancing: "Instancing Render",
         theme_dark: "Dark",
-        theme_light: "Light",
-        // 轴向选项
-        axis_px: "+X",
-        axis_nx: "-X",
-        axis_py: "+Y",
-        axis_ny: "-Y",
-        axis_pz: "+Z",
-        axis_nz: "-Z"
+        theme_light: "Light"
     },
     zh: {
         menu_open_file: "打开文件",
@@ -193,21 +184,13 @@ const resources: Record<Lang, Record<string, string>> = {
         st_dir: "直射光强度",
         st_bg: "背景颜色",
         st_lang: "界面语言",
-        st_import_settings: "模型导入轴向",
-        st_imp_glb: "GLB 向上轴",
-        st_imp_ifc: "IFC 向上轴",
+        st_import_settings: "导入设置",
         st_theme: "界面主题",
-        st_monitor: "性能监测",
+        st_monitor: "性能监视器",
         st_instancing: "实例化渲染",
-        theme_dark: "深色",
-        theme_light: "浅色",
-        // 轴向
-        axis_px: "+X",
-        axis_nx: "-X",
-        axis_py: "+Y",
-        axis_ny: "-Y",
-        axis_pz: "+Z",
-        axis_nz: "-Z"
+        theme_dark: "深色模式",
+        theme_light: "浅色模式",
+        ready: "就绪",
     }
 };
 

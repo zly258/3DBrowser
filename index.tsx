@@ -111,13 +111,7 @@ const App = () => {
                     dirInt: typeof parsed.dirInt === 'number' ? parsed.dirInt : 1.0,
                     bgColor: typeof parsed.bgColor === 'string' ? parsed.bgColor : theme.canvasBg,
                     wireframe: typeof parsed.wireframe === 'boolean' ? parsed.wireframe : false,
-                    progressive: typeof parsed.progressive === 'boolean' ? parsed.progressive : true,
-                    hideRatio: typeof parsed.hideRatio === 'number' ? parsed.hideRatio : 0.6,
-                    progressiveThreshold: typeof parsed.progressiveThreshold === 'number' ? parsed.progressiveThreshold : 15000,
-                    sse: typeof parsed.sse === 'number' ? parsed.sse : 16,
-                    maxMemory: typeof parsed.maxMemory === 'number' ? parsed.maxMemory : 500,
-                    importAxisGLB: typeof parsed.importAxisGLB === 'string' ? parsed.importAxisGLB : '+y',
-                    importAxisIFC: typeof parsed.importAxisIFC === 'string' ? parsed.importAxisIFC : '+z',
+                    enableInstancing: typeof parsed.enableInstancing === 'boolean' ? parsed.enableInstancing : true,
                 };
             }
         } catch (e) { console.error("Failed to load sceneSettings", e); }
@@ -126,11 +120,6 @@ const App = () => {
             dirInt: 1.0,
             bgColor: theme.canvasBg,
             wireframe: false,
-            progressive: true,
-            hideRatio: 0.6,
-            progressiveThreshold: 15000,
-            importAxisGLB: '+y',
-            importAxisIFC: '+z',
             enableInstancing: true,
         };
     });
