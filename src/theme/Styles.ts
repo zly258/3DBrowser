@@ -181,7 +181,6 @@ export const createStyles = (theme: ThemeColors, fontFamily: string = "'Segoe UI
         display: "flex",
         alignItems: "center",
         backgroundColor: theme.bg,
-        borderBottom: `1px solid ${theme.border}`,
         padding: "0 8px",
         height: "28px",
         gap: "4px",
