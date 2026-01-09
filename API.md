@@ -111,42 +111,59 @@ sceneMgr.fitView();
 | `enableInstancing`| `boolean`| `true` | Enable GPU instancing for LMB. |
 | `appMode` | `'local' \| 'remote'` | `'local'` | UI mode (file vs URL). |
 
-### 5. React Integration
+### 5. React Components
 
-The library provides components that can be used directly in React projects.
+#### `ThreeViewer`
+The primary reusable component that encapsulates the entire 3D viewer.
 
+**Props:**
+
+| Prop | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `lang` | `'zh' \| 'en'` | `'zh'` | Initial language. |
+| `themeMode` | `'dark' \| 'light'` | `'light'` | Theme mode. |
+| `accentColor` | `string` | `#0078D4` | Accent color. |
+| `menuMode` | `'ribbon' \| 'classic'` | `'ribbon'` | Menu bar style. |
+| `showStats` | `boolean` | `true` | Show performance stats. |
+| `showOutline` | `boolean` | `true` | Show scene tree panel. |
+| `showProps` | `boolean` | `true` | Show properties panel. |
+| `showLogo` | `boolean` | `true` | Show top logo. |
+| `showTitle` | `boolean` | `true` | Show top title. |
+| `showMiddleTitle`| `boolean` | `true` | Show middle title. |
+| `showMenuBar` | `boolean` | `true` | Show menu bar. |
+| `showViewCube` | `boolean` | `true` | Show navigation cube. |
+| `logoUrl` | `string` | - | Custom logo URL. |
+| `title` | `string` | - | Custom title text. |
+| `middleTitle` | `string` | - | Custom middle title text. |
+| `hiddenMenus` | `string[]` | `[]` | List of menu IDs to hide. |
+| `initialSettings` | `Partial<SceneSettings>` | - | Initial scene settings. |
+| `onSceneReady` | `(mgr: SceneManager) => void` | - | Callback when scene is ready. |
+
+**Usage:**
 ```tsx
-import React, { useEffect, useRef } from 'react';
-import { SceneManager, MenuBar, createStyles, themes } from '3dbrowser';
+import { ThreeViewer } from '3dbrowser';
 
-const MyViewer = () => {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const sceneMgrRef = useRef<SceneManager | null>(null);
-  const theme = themes.light;
-  const styles = createStyles(theme);
-
-  useEffect(() => {
-    if (canvasRef.current) {
-      sceneMgrRef.current = new SceneManager(canvasRef.current);
-    }
-  }, []);
-
+const App = () => {
   return (
-    <div style={{ width: '100vw', height: '100vh', display: 'flex', flexDirection: 'column' }}>
-      <MenuBar 
-        sceneMgr={sceneMgrRef.current}
-        t={(key) => key} // Translation function
-        theme={theme}
-        styles={styles}
-        // ... other props
-      />
-      <canvas ref={canvasRef} style={{ flex: 1 }} />
-    </div>
+    <ThreeViewer 
+      themeMode="dark"
+      showStats={true}
+      title="My 3D Viewer"
+      hiddenMenus={['export', 'about']}
+      onSceneReady={(mgr) => {
+        console.log('Viewer is ready!', mgr);
+      }}
+    />
   );
 };
 ```
 
-### 6. Development
+### 6. CAD Support (STP/IGS)
+The library supports loading STP and IGS files using `occt-import-js`. 
+- **Coordinate System**: The viewer uses a **Z-up** coordinate system (matching engineering standards).
+- **Auto-Correction**: Models are automatically rotated to match the Z-up orientation based on their source format.
+
+### 7. Development
 
 To contribute to this project:
 
@@ -268,42 +285,59 @@ sceneMgr.fitView();
 | `enableInstancing`| `boolean`| `true` | 开启 LMB 实例化渲染。 |
 | `appMode` | `'local' \| 'remote'` | `'local'` | UI 模式（本地 vs 远程）。 |
 
-### 5. React 集成
+### 5. React 组件
 
-该库提供了可以直接在 React 项目中使用的组件。
+#### `ThreeViewer`
+核心可复用组件，封装了完整的 3D 浏览器功能。
 
+**属性 (Props):**
+
+| 属性 | 类型 | 默认值 | 描述 |
+| :--- | :--- | :--- | :--- |
+| `lang` | `'zh' \| 'en'` | `'zh'` | 初始语言。 |
+| `themeMode` | `'dark' \| 'light'` | `'light'` | 主题模式。 |
+| `accentColor` | `string` | `#0078D4` | 强调色。 |
+| `menuMode` | `'ribbon' \| 'classic'` | `'ribbon'` | 菜单栏样式。 |
+| `showStats` | `boolean` | `true` | 是否显示性能统计。 |
+| `showOutline` | `boolean` | `true` | 是否显示场景树面板。 |
+| `showProps` | `boolean` | `true` | 是否显示属性面板。 |
+| `showLogo` | `boolean` | `true` | 是否显示顶部 Logo。 |
+| `showTitle` | `boolean` | `true` | 是否显示顶部标题。 |
+| `showMiddleTitle`| `boolean` | `true` | 是否显示中间标题。 |
+| `showMenuBar` | `boolean` | `true` | 是否显示菜单栏。 |
+| `showViewCube` | `boolean` | `true` | 是否显示导航方块。 |
+| `logoUrl` | `string` | - | 自定义 Logo URL。 |
+| `title` | `string` | - | 自定义标题文本。 |
+| `middleTitle` | `string` | - | 自定义中间标题文本。 |
+| `hiddenMenus` | `string[]` | `[]` | 需要隐藏的菜单 ID 列表。 |
+| `initialSettings` | `Partial<SceneSettings>` | - | 初始场景设置。 |
+| `onSceneReady` | `(mgr: SceneManager) => void` | - | 场景初始化完成后的回调。 |
+
+**用法:**
 ```tsx
-import React, { useEffect, useRef } from 'react';
-import { SceneManager, MenuBar, createStyles, themes } from '3dbrowser';
+import { ThreeViewer } from '3dbrowser';
 
-const MyViewer = () => {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const sceneMgrRef = useRef<SceneManager | null>(null);
-  const theme = themes.light;
-  const styles = createStyles(theme);
-
-  useEffect(() => {
-    if (canvasRef.current) {
-      sceneMgrRef.current = new SceneManager(canvasRef.current);
-    }
-  }, []);
-
+const App = () => {
   return (
-    <div style={{ width: '100vw', height: '100vh', display: 'flex', flexDirection: 'column' }}>
-      <MenuBar 
-        sceneMgr={sceneMgrRef.current}
-        t={(key) => key} // 翻译函数
-        theme={theme}
-        styles={styles}
-        // ... 其他属性
-      />
-      <canvas ref={canvasRef} style={{ flex: 1 }} />
-    </div>
+    <ThreeViewer 
+      themeMode="dark"
+      showStats={true}
+      title="我的 3D 浏览器"
+      hiddenMenus={['export', 'about']}
+      onSceneReady={(mgr) => {
+        console.log('浏览器已就绪!', mgr);
+      }}
+    />
   );
 };
 ```
 
-### 6. 开发
+### 6. CAD 支持 (STP/IGS)
+本库支持通过 `occt-import-js` 加载 STP 和 IGS 文件。
+- **坐标系**: 浏览器采用 **Z轴向上 (Z-up)** 坐标系（符合工程与建筑标准）。
+- **自动校正**: 模型加载时会根据其原始格式自动旋转，以匹配浏览器的 Z-up 方向。
+
+### 7. 开发
 
 参与本项目开发：
 

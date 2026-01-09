@@ -18,34 +18,34 @@ export interface LoadedItem {
     object?: THREE.Object3D;
 }
 
-// 辅助函数：纠正上轴到Y轴向上
+// 辅助函数：纠正上轴到Z轴向上（匹配SceneManager的camera.up）
 const applyUpAxisCorrection = (object: THREE.Object3D, sourceAxis: AxisOption) => {
-    // 我们假设目标是+Y轴向上（Three.js标准）
+    // 目标是+Z轴向上（工程/建筑常用标准，匹配本项目的 SceneManager）
     const q = new THREE.Quaternion();
     
     switch (sourceAxis) {
         case '+x':
-            // +X向上。我们需要X -> Y。绕Z轴旋转+90度。
-            q.setFromAxisAngle(new THREE.Vector3(0,0,1), Math.PI/2);
+            // +X向上。绕Y轴旋转-90度使X变为Z。
+            q.setFromAxisAngle(new THREE.Vector3(0,1,0), -Math.PI/2);
             break;
         case '-x':
-            // -X向上。我们需要-X -> Y。绕Z轴旋转-90度。
-            q.setFromAxisAngle(new THREE.Vector3(0,0,1), -Math.PI/2);
+            // -X向上。绕Y轴旋转+90度。
+            q.setFromAxisAngle(new THREE.Vector3(0,1,0), Math.PI/2);
             break;
         case '+y':
-            // 已经是Y轴向上。
-            return;
-        case '-y':
-            // -Y向上。绕X轴旋转180度。
-            q.setFromAxisAngle(new THREE.Vector3(1,0,0), Math.PI);
+            // +Y向上。绕X轴旋转+90度使Y变为Z。
+            q.setFromAxisAngle(new THREE.Vector3(1,0,0), Math.PI/2);
             break;
-        case '+z':
-            // +Z向上（标准工程坐标）。绕X轴旋转-90度（右手坐标系）。
+        case '-y':
+            // -Y向上。绕X轴旋转-90度。
             q.setFromAxisAngle(new THREE.Vector3(1,0,0), -Math.PI/2);
             break;
+        case '+z':
+            // 已经是Z轴向上。
+            return;
         case '-z':
-            // -Z向上。绕X轴旋转+90度。
-            q.setFromAxisAngle(new THREE.Vector3(1,0,0), Math.PI/2);
+            // -Z向上。绕X轴旋转180度。
+            q.setFromAxisAngle(new THREE.Vector3(1,0,0), Math.PI);
             break;
     }
 
