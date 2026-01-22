@@ -48,14 +48,15 @@
     "react-dom": "^19.2.0"
   },
   "devDependencies": {
-    "terser": "^5.44.1",
     "@types/node": "^22.14.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
-    "react": "^19.2.0",
-    "react-dom": "^19.2.0",
+    "@types/three": "^0.182.0",
     "@vitejs/plugin-react": "^5.0.0",
     "concurrently": "^9.2.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "terser": "^5.44.1",
     "typescript": "~5.8.2",
     "vite": "^6.2.0",
     "wait-on": "^9.0.3"

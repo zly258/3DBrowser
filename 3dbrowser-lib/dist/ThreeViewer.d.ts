@@ -505,7 +505,7 @@ export declare class SceneManager {
     private lastReportedProgress;
     constructor(canvas: HTMLCanvasElement);
     updateSettings(newSettings: Partial<SceneSettings>): void;
-    createCircleTexture(): any;
+    createCircleTexture(): THREE.CanvasTexture<HTMLCanvasElement>;
     animate(): void;
     updateCameraClipping(): void;
     resize(): void;
@@ -587,7 +587,7 @@ export declare class SceneManager {
         meshes: number;
         faces: number;
         memory: number;
-        drawCalls: any;
+        drawCalls: number;
     };
     dispose(): void;
 }

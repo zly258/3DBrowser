@@ -2197,11 +2197,20 @@ class LMBLoader extends Loader {
     super(manager);
     this.manager = manager || THREE.DefaultLoadingManager;
   }
-  async loadAsync(url, t, onProgress) {
+  async loadLmbAsync(url, t, onProgress) {
     const loader = new FileLoader(this.manager);
+    loader.setPath(this.path);
     loader.setResponseType("arraybuffer");
-    let buffer = await new Promise((resolve, reject) => {
-      loader.load(url, (data) => resolve(data), onProgress, reject);
+    loader.setRequestHeader(this.requestHeader);
+    loader.setWithCredentials(this.withCredentials);
+    let buffer = await loader.loadAsync(url, (event) => {
+      if (onProgress) {
+        onProgress({
+          loaded: event.loaded,
+          total: event.total,
+          percent: Math.floor(event.loaded / event.total * 100)
+        });
+      }
     });
     try {
       const compressedData = new Uint8Array(buffer);
@@ -2211,7 +2220,7 @@ class LMBLoader extends Loader {
     } catch (error) {
       console.log("[LMBLoader] File is not compressed or decompression failed. URL:", url);
     }
-    return this.parse(buffer, t, onProgress);
+    return this.parse(buffer, t);
   }
   parse(buffer, t, onProgress = () => {
   }) {
@@ -2438,7 +2447,7 @@ const loadModelFiles = async (files, onProgress, t, settings, libPath = "./libs"
       console.log(`[LoaderUtils] Dispatching loader for ext: ${ext}`);
       if (ext === "lmb" || ext === "lmbz") {
         const loader = new LMBLoader();
-        object = await loader.loadAsync(url, t, (p) => updateFileProgress(p * 100));
+        object = await loader.loadLmbAsync(url, t, (p) => updateFileProgress(p * 100));
       } else if (ext === "glb" || ext === "gltf") {
         const { GLTFLoader } = await import('./GLTFLoader-ADgnQB1v.js');
         const loader = new GLTFLoader();
@@ -3936,7 +3945,7 @@ class SceneManager {
                 mat.premultiply(bm.matrixWorld);
                 return v.setFromMatrixPosition(mat);
               };
-              proxy.position.setFromMatrixPosition(new THREE.Matrix4().getMatrixAt ? new THREE.Matrix4() : new THREE.Matrix4());
+              proxy.position.setFromMatrixPosition(new THREE.Matrix4());
               hit.object = proxy;
             }
           }
