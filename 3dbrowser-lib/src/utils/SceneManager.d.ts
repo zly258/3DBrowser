@@ -267,11 +267,12 @@ export declare class SceneManager {
     addTileset(url: string, onProgress?: (p: number, msg: string) => void): import("3d-tiles-renderer").TilesGroup;
     private generateChunkBinaryV8;
     private reconstructBatchedMesh;
-    exportNbim(): Promise<void>;
+    exportNbim(fileName?: string): Promise<void>;
     loadNbim(file: File, onProgress?: (p: number, msg: string) => void): Promise<void>;
     clear(): Promise<void>;
     getStructureNodes(id: string): StructureTreeNode[] | undefined;
     getNbimProperties(id: string): any | null;
+    getNbimIfcPropertyGroups(id: string, mode?: "raw" | "normalized"): Record<string, Record<string, string>> | null;
     setAllVisibility(visible: boolean): void;
     hideObjects(uuids: string[]): void;
     isolateObjects(uuids: string[]): void;

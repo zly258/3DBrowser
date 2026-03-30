@@ -1648,7 +1648,16 @@ class SceneManager {
     const fileGroup = new THREE.Group();
     fileGroup.name = `file_${object.uuid}`;
     fileGroup.userData.originalUuid = object.uuid;
+    const modelName = sanitizeFileStem(
+      sanitizeDisplayLabel(
+        typeof object.userData?.modelName === "string" ? object.userData.modelName : "",
+        stripFileExtension(object.name),
+        object.name
+      ) || "model"
+    );
+    fileGroup.userData.modelName = modelName;
     object.userData.originalUuid = object.uuid;
+    object.userData.modelName = modelName;
     fileGroup.add(object);
     object.visible = keepVisible;
     this.contentGroup.add(fileGroup);
@@ -2121,7 +2130,7 @@ class SceneManager {
     bm.computeBoundingSphere();
     return bm;
   }
-  async exportNbim() {
+  async exportNbim(fileName) {
     if (this.chunks.length === 0) throw new Error("无模型数据可导出");
     const bimIdTable = [""];
     const bimIdToIndex = /* @__PURE__ */ new Map();
@@ -2138,13 +2147,19 @@ class SceneManager {
     };
     traverseBimIds(this.structureRoot);
     const ifcApiByModel = /* @__PURE__ */ new Map();
+    const ifcManagerByModel = /* @__PURE__ */ new Map();
     this.contentGroup.traverse((obj) => {
       if (obj.userData?.ifcAPI && obj.userData?.modelID !== void 0 && obj.userData?.originalUuid) {
         ifcApiByModel.set(String(obj.userData.originalUuid), { ifcApi: obj.userData.ifcAPI, modelID: obj.userData.modelID });
       }
+      if (obj.userData?.ifcManager && obj.userData?.modelID !== void 0 && obj.userData?.originalUuid) {
+        ifcManagerByModel.set(String(obj.userData.originalUuid), { ifcManager: obj.userData.ifcManager, modelID: obj.userData.modelID });
+      }
     });
     const bimProperties = {};
-    const fillBimProperties = (node) => {
+    const stack = [this.structureRoot];
+    while (stack.length > 0) {
+      const node = stack.pop();
       const originalUuid = node.userData?.originalUuid ? String(node.userData.originalUuid) : "";
       if (node.bimId) {
         const key = `${originalUuid}::${node.bimId}`;
@@ -2163,11 +2178,29 @@ class SceneManager {
             } catch {
             }
           }
+          if (expressID !== void 0 && ifcManagerByModel.has(originalUuid)) {
+            try {
+              const { ifcManager, modelID } = ifcManagerByModel.get(originalUuid);
+              const fullProps = await ifcManager.getItemProperties(modelID, Number(expressID));
+              const rawGroups = fullProps?.rawGroups || fullProps?.groups || null;
+              const normalizedGroups = fullProps?.normalizedGroups || null;
+              if (rawGroups && Object.keys(rawGroups).length > 0) {
+                bimProperties[key].ifcRawGroups = rawGroups;
+              }
+              if (normalizedGroups && Object.keys(normalizedGroups).length > 0) {
+                bimProperties[key].ifcNormalizedGroups = normalizedGroups;
+              }
+            } catch {
+            }
+          }
         }
       }
-      if (node.children) node.children.forEach(fillBimProperties);
-    };
-    fillBimProperties(this.structureRoot);
+      if (node.children && node.children.length > 0) {
+        for (let i = node.children.length - 1; i >= 0; i--) {
+          stack.push(node.children[i]);
+        }
+      }
+    }
     const chunkBlobs = [];
     const exportChunks = this.chunks.map((c) => ({
       id: c.id,
@@ -2175,6 +2208,7 @@ class SceneManager {
         min: { x: c.bounds.min.x, y: c.bounds.min.y, z: c.bounds.min.z },
         max: { x: c.bounds.max.x, y: c.bounds.max.y, z: c.bounds.max.z }
       },
+      originalUuid: c.originalUuid ? String(c.originalUuid) : void 0,
       byteOffset: 0,
       byteLength: 0
     }));
@@ -2279,9 +2313,9 @@ class SceneManager {
         if (srcRoot?.chunkId !== void 0) rootCopy.chunkId = srcRoot.chunkId;
         const rootUd = sanitizeUserData(srcRoot?.userData);
         if (rootUd) rootCopy.userData = rootUd;
-        const stack = [{ src: srcRoot, dst: rootCopy }];
-        while (stack.length > 0) {
-          const { src, dst } = stack.pop();
+        const stack2 = [{ src: srcRoot, dst: rootCopy }];
+        while (stack2.length > 0) {
+          const { src, dst } = stack2.pop();
           const children = Array.isArray(src?.children) ? src.children : [];
           for (const child of children) {
             const childCopy = {
@@ -2296,7 +2330,7 @@ class SceneManager {
             const ud = sanitizeUserData(child?.userData);
             if (ud) childCopy.userData = ud;
             dst.children.push(childCopy);
-            stack.push({ src: child, dst: childCopy });
+            stack2.push({ src: child, dst: childCopy });
           }
         }
         return rootCopy;
@@ -2329,7 +2363,25 @@ class SceneManager {
     const url = URL.createObjectURL(finalBlob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `model_${(/* @__PURE__ */ new Date()).getTime()}.nbim`;
+    const deriveDefaultStem = () => {
+      const names = [];
+      this.contentGroup.children.forEach((child) => {
+        if (child.userData?.isOptimizedGroup) return;
+        if (child.name === "TilesRenderer" || child.name.startsWith("optimized_")) return;
+        const rawName = (typeof child.userData?.modelName === "string" ? child.userData.modelName : "") || (child.children?.[0]?.name || "") || child.name;
+        const baseName = sanitizeFileStem(stripFileExtension(rawName));
+        names.push(baseName);
+      });
+      const uniqueNames = Array.from(new Set(names));
+      if (uniqueNames.length === 1) return uniqueNames[0];
+      const now = /* @__PURE__ */ new Date();
+      const pad = (v) => String(v).padStart(2, "0");
+      const suffix = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+      return `批量导出_${suffix}`;
+    };
+    const defaultStem = deriveDefaultStem();
+    const resolvedName = sanitizeFileStem(stripFileExtension((fileName || "").trim()) || defaultStem);
+    a.download = `${resolvedName}.nbim`;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -2378,7 +2430,21 @@ class SceneManager {
       }
     }
     const rootId = modelRoot?.id || fileId;
-    this.nbimPropsByOriginalUuid.set(rootId, manifest.bimProperties || {});
+    const manifestBimProperties = manifest?.bimProperties && typeof manifest.bimProperties === "object" ? manifest.bimProperties : {};
+    const groupedBimProperties = /* @__PURE__ */ new Map();
+    Object.entries(manifestBimProperties).forEach(([key, value]) => {
+      const sepIndex = key.indexOf("::");
+      const owner = sepIndex > 0 ? key.slice(0, sepIndex) : rootId;
+      if (!groupedBimProperties.has(owner)) groupedBimProperties.set(owner, {});
+      groupedBimProperties.get(owner)[key] = value;
+    });
+    if (groupedBimProperties.size > 0) {
+      groupedBimProperties.forEach((props, owner) => {
+        this.nbimPropsByOriginalUuid.set(owner, props);
+      });
+    } else {
+      this.nbimPropsByOriginalUuid.set(rootId, manifestBimProperties);
+    }
     const quickStats = manifest.stats || {
       meshes: this.countStructureRenderableNodes(modelRoot),
       faces: 0,
@@ -2388,16 +2454,20 @@ class SceneManager {
     const fileGroup = new THREE.Group();
     fileGroup.name = `file_${rootId}`;
     fileGroup.userData.originalUuid = rootId;
+    const fileBaseName = sanitizeFileStem(stripFileExtension(file.name));
+    const modelRootName = typeof modelRoot?.name === "string" && modelRoot.name !== "Root" ? modelRoot.name : "";
+    fileGroup.userData.modelName = sanitizeFileStem(sanitizeDisplayLabel(modelRootName, fileBaseName, rootId) || fileBaseName);
     this.contentGroup.add(fileGroup);
     this.interactableListValid = false;
     if (modelRoot) {
       const traverse = (node) => {
         if (!node.userData) node.userData = {};
-        node.userData.originalUuid = rootId;
+        const nodeOriginalUuid = node.userData?.originalUuid ? String(node.userData.originalUuid) : rootId;
+        node.userData.originalUuid = nodeOriginalUuid;
         if (!this.nodeMap.has(node.id)) this.nodeMap.set(node.id, []);
         this.nodeMap.get(node.id).push(node);
         if (node.bimId) {
-          const key = `${rootId}::${node.bimId}`;
+          const key = `${nodeOriginalUuid}::${node.bimId}`;
           if (!this.bimIdToNodeIds.has(key)) this.bimIdToNodeIds.set(key, []);
           this.bimIdToNodeIds.get(key).push(node.id);
         }
@@ -2432,7 +2502,7 @@ class SceneManager {
         byteLength: c.byteLength,
         nbimFileId: fileId,
         groupName: `optimized_${rootId}`,
-        originalUuid: rootId
+        originalUuid: c.originalUuid ? String(c.originalUuid) : rootId
       });
       const size = new THREE.Vector3();
       bounds.getSize(size);
@@ -2538,7 +2608,27 @@ class SceneManager {
     const map = this.nbimPropsByOriginalUuid.get(originalUuid);
     if (!map) return null;
     const key = `${originalUuid}::${node.bimId}`;
-    return map[key] || null;
+    const entry = map[key];
+    if (!entry || typeof entry !== "object") return entry || null;
+    const { ifcRawGroups, ifcNormalizedGroups, ...flatProps } = entry;
+    return flatProps;
+  }
+  getNbimIfcPropertyGroups(id, mode = "raw") {
+    const node = this.nodeMap.get(id)?.[0];
+    if (!node || !node.bimId) return null;
+    const originalUuid = node.userData?.originalUuid ? String(node.userData.originalUuid) : "";
+    if (!originalUuid) return null;
+    const map = this.nbimPropsByOriginalUuid.get(originalUuid);
+    if (!map) return null;
+    const key = `${originalUuid}::${node.bimId}`;
+    const entry = map[key];
+    if (!entry || typeof entry !== "object") return null;
+    const rawGroups = entry.ifcRawGroups;
+    const normalizedGroups = entry.ifcNormalizedGroups;
+    if (mode === "normalized") {
+      return normalizedGroups || rawGroups || null;
+    }
+    return rawGroups || normalizedGroups || null;
   }
   setAllVisibility(visible) {
     const setNodeVisible = (n) => {
@@ -4267,6 +4357,13 @@ class SceneManager {
     if (this.tilesRenderer) this.tilesRenderer.dispose();
   }
 }
+function stripFileExtension(name) {
+  return name.replace(/\.[^./\\]+$/, "");
+}
+function sanitizeFileStem(name) {
+  const sanitized = name.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, " ").trim();
+  return sanitized || "model";
+}
 
 function normalizePath(path) {
   return path.replace(/\\/g, "/").replace(/^(\.\/)+/, "").replace(/^\/+/, "").toLowerCase();
@@ -4811,6 +4908,10 @@ const resources = {
     export_lmb: "LMB (Custom Compressed)",
     export_3dtiles: "3D Tiles (Web)",
     export_nbim: "NBIM (High Performance)",
+    export_filename: "File Name",
+    export_filename_placeholder: "Enter file name",
+    export_filename_hint: "Leave empty to auto-generate from model names",
+    export_batch_name: "batch_export",
     export_btn: "Export",
     // 设置
     st_lighting: "Lighting",
@@ -5088,6 +5189,10 @@ const resources = {
     export_lmb: "LMB (自定义压缩)",
     export_3dtiles: "3D Tiles (Web大模型)",
     export_nbim: "NBIM (高性能分块模型)",
+    export_filename: "文件名",
+    export_filename_placeholder: "请输入文件名",
+    export_filename_hint: "为空时自动按模型名生成",
+    export_batch_name: "批量导出",
     export_btn: "开始导出",
     // 设置
     st_lighting: "场景光照",
@@ -7997,9 +8102,13 @@ const ClipPanel = ({
   );
 };
 
-const ExportPanel = ({ t, onClose, onExport, theme }) => {
+const ExportPanel = ({ t, onClose, onExport, getDefaultFileName, theme }) => {
   const [format, setFormat] = useState("glb");
-  return /* @__PURE__ */ jsx(FloatingPanel, { title: t("export_title"), onClose, width: 320, height: 400, resizable: false, theme, storageId: "tool_export", children: /* @__PURE__ */ jsxs("div", { style: { padding: 16 }, children: [
+  const [fileName, setFileName] = useState(() => getDefaultFileName("glb"));
+  useEffect(() => {
+    setFileName(getDefaultFileName(format));
+  }, [format, getDefaultFileName]);
+  return /* @__PURE__ */ jsx(FloatingPanel, { title: t("export_title"), onClose, width: 320, height: 500, resizable: false, theme, storageId: "tool_export", children: /* @__PURE__ */ jsxs("div", { style: { padding: 16 }, children: [
     /* @__PURE__ */ jsxs("div", { style: { marginBottom: 10, fontSize: 12, color: theme.textMuted }, children: [
       t("export_format"),
       ":"
@@ -8026,11 +8135,27 @@ const ExportPanel = ({ t, onClose, onExport, theme }) => {
         /* @__PURE__ */ jsx("div", { style: { fontSize: 11, color: theme.textMuted }, children: opt.desc })
       ] })
     ] }, opt.id)),
+    /* @__PURE__ */ jsxs("div", { style: { marginTop: 12, marginBottom: 8, fontSize: 12, color: theme.textMuted }, children: [
+      t("export_filename") || "文件名",
+      ":"
+    ] }),
+    /* @__PURE__ */ jsx(
+      "input",
+      {
+        type: "text",
+        value: fileName,
+        onChange: (e) => setFileName(e.target.value),
+        placeholder: t("export_filename_placeholder") || "请输入文件名",
+        className: "ui-input ui-input-compact",
+        style: { width: "100%", marginBottom: 6 }
+      }
+    ),
+    /* @__PURE__ */ jsx("div", { style: { fontSize: 11, color: theme.textMuted }, children: t("export_filename_hint") || "留空时自动按模型名生成" }),
     /* @__PURE__ */ jsx(
       Button,
       {
         theme,
-        onClick: () => onExport(format),
+        onClick: () => onExport(format, fileName),
         style: { width: "100%", marginTop: 10, height: 40 },
         children: t("export_btn")
       }
@@ -10364,12 +10489,14 @@ const ThreeViewer = ({
       }
     }
     const nbimProps = sceneMgr.current.getNbimProperties(focusUuid);
+    const nbimIfcGroups = sceneMgr.current.getNbimIfcPropertyGroups(focusUuid, "raw");
+    const mergedIfcGroups = ifcGroups || nbimIfcGroups || null;
     const selectedGroups = buildSelectedPropertyGroups({
       basicLabel: t("pg_basic"),
       geoLabel: t("pg_geo"),
       basicProps,
       geoProps,
-      ifcProps: ifcGroups,
+      ifcProps: mergedIfcGroups,
       nbimProps
     });
     setSelectedProps(selectedGroups);
@@ -10578,9 +10705,44 @@ const ThreeViewer = ({
       setLoading(false);
     }
   };
-  const handleExport = async (format) => {
+  const stripFileExtension = (name) => name.replace(/\.[^./\\]+$/, "");
+  const sanitizeFileStem = (name) => {
+    const sanitized = name.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, " ").trim();
+    return sanitized || "model";
+  };
+  const getExportModelNames = useCallback(() => {
+    if (!sceneMgr.current) return [];
+    const content = sceneMgr.current.contentGroup;
+    const names = [];
+    content.children.forEach((child) => {
+      if (child.userData?.isOptimizedGroup) return;
+      if (child.name === "TilesRenderer" || child.name.startsWith("optimized_")) return;
+      const rawName = (typeof child.userData?.modelName === "string" ? child.userData.modelName : "") || (child.children?.[0]?.name || "") || child.name;
+      const baseName = sanitizeFileStem(stripFileExtension(rawName));
+      names.push(baseName);
+    });
+    return Array.from(new Set(names));
+  }, []);
+  const getDefaultExportFileName = useCallback((format) => {
+    const modelNames = getExportModelNames();
+    if (modelNames.length === 1) {
+      return modelNames[0];
+    }
+    const now = /* @__PURE__ */ new Date();
+    const pad = (v) => String(v).padStart(2, "0");
+    const suffix = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+    return `${t("export_batch_name") || "批量导出"}_${suffix}`;
+  }, [getExportModelNames, t]);
+  const resolveExportFilename = (format, requestedName) => {
+    const fallback = getDefaultExportFileName(format);
+    const stem = sanitizeFileStem(stripFileExtension((requestedName || "").trim()) || fallback);
+    return format === "3dtiles" ? stem : `${stem}.${format}`;
+  };
+  const handleExport = async (format, requestedName) => {
     if (!sceneMgr.current) return;
     const content = sceneMgr.current.contentGroup;
+    const resolvedFileName = resolveExportFilename(format, requestedName);
+    const resolvedStem = stripFileExtension(resolvedFileName);
     if (format === "nbim") {
       if (content.children.length === 0) {
         setToast({ message: t("no_models"), type: "info" });
@@ -10591,7 +10753,7 @@ const ThreeViewer = ({
       setActiveTool("none");
       setTimeout(async () => {
         try {
-          await sceneMgr.current?.exportNbim();
+          await sceneMgr.current?.exportNbim(resolvedStem);
           setToast({ message: t("success"), type: "success" });
         } catch (e) {
           console.error(e);
@@ -10616,7 +10778,7 @@ const ThreeViewer = ({
     setTimeout(async () => {
       try {
         let blob = null;
-        let filename = `export.${format}`;
+        const filename = resolvedFileName;
         if (format === "3dtiles") {
           if (!window.showDirectoryPicker) {
             setToast({ message: t("select_output"), type: "info" });
@@ -10964,7 +11126,16 @@ const ThreeViewer = ({
                 theme
               }
             ),
-            activeTool === "export" && /* @__PURE__ */ jsx(ExportPanel, { t, onClose: () => setActiveTool("none"), onExport: handleExport, theme }),
+            activeTool === "export" && /* @__PURE__ */ jsx(
+              ExportPanel,
+              {
+                t,
+                onClose: () => setActiveTool("none"),
+                onExport: handleExport,
+                getDefaultFileName: getDefaultExportFileName,
+                theme
+              }
+            ),
             activeTool === "screenshot" && /* @__PURE__ */ jsx(
               ScreenshotPanel,
               {
