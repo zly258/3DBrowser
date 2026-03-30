@@ -1,10 +1,20 @@
-import { jsx, jsxs, Fragment } from 'react/jsx-runtime';
-import React, { useRef, useCallback, useState, useEffect, useMemo, Component } from 'react';
+import { jsxs, jsx, Fragment } from 'react/jsx-runtime';
+import React, { useState, useEffect, useRef, useCallback, useMemo, Component } from 'react';
 import * as THREE from 'three';
-import { O as OrbitControls } from './loaders-MBHA5ASo.js';
+import { O as OrbitControls } from './loaders-TXHpcosE.js';
 import { TilesRenderer } from '3d-tiles-renderer';
-import { c as calculateGeometryMemory, b as buildOctree, a as collectLeafNodes, d as createBatchedMeshFromItemsAsync, e as collectItemsBatched, f as collectItems, g as convertLMBTo3DTiles, h as exportGLB, i as exportLMB } from './utils-D0sDuH7g.js';
+import { c as calculateGeometryMemory, b as buildOctree, a as collectLeafNodes, d as createBatchedMeshFromItemsAsync, e as collectItemsBatched, f as collectItems, g as convertLMBTo3DTiles, h as exportGLB, i as exportLMB } from './utils-DjWw9cMe.js';
 
+const INVALID_DISPLAY_LABELS = /* @__PURE__ */ new Set(["", "n/a", "na", "undefined", "null", "-", "--"]);
+function sanitizeDisplayLabel(...candidates) {
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+    const trimmed = candidate.trim();
+    if (INVALID_DISPLAY_LABELS.has(trimmed.toLowerCase())) continue;
+    return trimmed;
+  }
+  return "";
+}
 class SceneManager {
   constructor(canvas) {
     this.structureRoot = { id: "root", name: "Root", type: "Group", children: [] };
@@ -13,6 +23,18 @@ class SceneManager {
     this.tilesRenderer = null;
     this.lastSelectedUuid = null;
     this.highlightedUuids = /* @__PURE__ */ new Set();
+    this.locateFocusUuid = null;
+    this.locateResultSet = /* @__PURE__ */ new Set();
+    this.locateMaterialCache = /* @__PURE__ */ new Map();
+    this.locateObjectMaterialCache = /* @__PURE__ */ new Map();
+    this.locateDimmedInstances = /* @__PURE__ */ new Map();
+    this.highlightPulseColor = new THREE.Color("#ffffff");
+    this.explodeEnabled = false;
+    this.explodeStrength = 0;
+    this.explodeCenter = new THREE.Vector3();
+    this.explodeMode = "radial";
+    this.explodeObjectStates = /* @__PURE__ */ new Map();
+    this.explodeInstanceStates = /* @__PURE__ */ new Map();
     this.measureType = "none";
     this.currentMeasurePoints = [];
     this.currentMeasureModelUuid = null;
@@ -29,6 +51,8 @@ class SceneManager {
     };
     this.clippingPlanes = [];
     this.clipPlaneHelpers = [];
+    this.clipHelperVisible = false;
+    this.clipHelperOpacity = 0.12;
     this.sceneCenter = new THREE.Vector3();
     this.globalOffset = new THREE.Vector3();
     this.componentMap = /* @__PURE__ */ new Map();
@@ -46,6 +70,9 @@ class SceneManager {
       minPixelRatio: 0.8,
       maxPixelRatio: 2,
       targetFps: 50,
+      performanceMode: "balanced",
+      highlightColor: "#ff9f1c",
+      highlightShowBox: false,
       maxRenderDistance: 1e6
       // 增加默认渲染距离到 1km (针对 mm 单位)
     };
@@ -54,6 +81,7 @@ class SceneManager {
     this.sceneSphereValid = false;
     this.precomputedBounds = new THREE.Box3();
     this.chunks = [];
+    this.chunkIdSet = /* @__PURE__ */ new Set();
     this.processingChunks = /* @__PURE__ */ new Set();
     this.cancelledChunkIds = /* @__PURE__ */ new Set();
     this.frustum = new THREE.Frustum();
@@ -182,6 +210,10 @@ class SceneManager {
     this.movingPeripheralCursor = 0;
     this.movingPeripheralLastRefreshAt = 0;
     this.postMoveRecoveryUntil = 0;
+    this.deferredStructureTimer = null;
+    this.deferredStructureToken = 0;
+    this.fastPreviewMeshLimit = 1200;
+    this.fastPreviewModels = /* @__PURE__ */ new Set();
     this.chunkCullingTempSize = new THREE.Vector3();
     this.chunkCullingTempDirection = new THREE.Vector3();
     this.chunkCullingTempForward = new THREE.Vector3();
@@ -189,6 +221,15 @@ class SceneManager {
     this.boundsScanBatchSize = 2400;
     this.chunkRegistrationBatchSize = 18;
     this.chunkGhostBatchSize = 24;
+    this.animationFrameId = null;
+    this.disposed = false;
+    this.interactionShadowDowngraded = false;
+    this.interactionShadowRestoreAt = 0;
+    this.interactionShadowRestoreDelayMs = 220;
+    this.cullingScanCursor = 0;
+    this.cullingTimeBudgetMovingMs = 4.5;
+    this.cullingTimeBudgetRecoveryMs = 6;
+    this.cullingTimeBudgetIdleMs = 9;
     this.canvas = canvas;
     const width = canvas.clientWidth;
     const height = canvas.clientHeight;
@@ -255,6 +296,7 @@ class SceneManager {
       this.isCameraMoving = true;
       this.chunkLoadResumeAt = performance.now() + profile.resumeAfterMoveMs;
       this.postMoveRecoveryUntil = 0;
+      this.interactionShadowRestoreAt = 0;
       this.movingPeripheralLastRefreshAt = 0;
       this.movingPeripheralCursor = 0;
       this.cullingDirty = true;
@@ -264,6 +306,7 @@ class SceneManager {
       this.isCameraMoving = true;
       this.chunkLoadResumeAt = performance.now() + profile.resumeAfterMoveMs;
       this.postMoveRecoveryUntil = 0;
+      this.interactionShadowRestoreAt = 0;
       this.cullingDirty = true;
     });
     this.controls.addEventListener("end", () => {
@@ -272,6 +315,7 @@ class SceneManager {
       this.isCameraMoving = false;
       this.chunkLoadResumeAt = now + Math.max(24, Math.floor(profile.resumeAfterMoveMs * 0.75));
       this.postMoveRecoveryUntil = now + profile.postMoveRecoveryMs;
+      this.interactionShadowRestoreAt = now + this.interactionShadowRestoreDelayMs;
       this.movingPeripheralLastRefreshAt = 0;
       this.movingPeripheralCursor = 0;
       this.cullingDirty = true;
@@ -297,18 +341,20 @@ class SceneManager {
     this.sunLight.shadow.camera.top = 100;
     this.sunLight.shadow.camera.bottom = -100;
     this.sunLight.shadow.bias = -5e-4;
+    this.sunLight.shadow.normalBias = 0.02;
     this.scene.add(this.sunLight);
+    this.scene.add(this.sunLight.target);
     const box = new THREE.Box3(new THREE.Vector3(), new THREE.Vector3());
     this.selectionBox = new THREE.Box3Helper(box, new THREE.Color(16776960));
     this.selectionBox.visible = false;
     this.helpersGroup.add(this.selectionBox);
     const highlightMat = new THREE.MeshBasicMaterial({
-      color: 16755200,
-      transparent: true,
-      opacity: 0.3,
+      color: this.settings.highlightColor,
+      transparent: false,
+      opacity: 1,
       depthTest: false,
       depthWrite: false,
-      side: THREE.DoubleSide
+      side: THREE.BackSide
     });
     this.highlightMesh = new THREE.Mesh(new THREE.BufferGeometry(), highlightMat);
     this.highlightMesh.visible = false;
@@ -336,10 +382,30 @@ class SceneManager {
     this.raycaster.params.Line.threshold = 2;
     this.mouse = new THREE.Vector2();
     this.animate = this.animate.bind(this);
-    requestAnimationFrame(this.animate);
+    this.animationFrameId = requestAnimationFrame(this.animate);
+  }
+  registerChunk(chunk) {
+    this.chunks.push(chunk);
+    this.chunkIdSet.add(chunk.id);
+  }
+  rebuildChunkIdSet() {
+    this.chunkIdSet.clear();
+    for (const chunk of this.chunks) {
+      this.chunkIdSet.add(chunk.id);
+    }
   }
   updateSettings(newSettings) {
     this.settings = { ...this.settings, ...newSettings };
+    this.applyHighlightSettings();
+    if (newSettings.clip) {
+      this.setClipHelperOptions({
+        visible: newSettings.clip.helperVisible,
+        opacity: newSettings.clip.helperOpacity
+      });
+    }
+    if (newSettings.ifcGridVisible !== void 0) {
+      this.setIfcGridVisibility(newSettings.ifcGridVisible);
+    }
     this.ambientLight.intensity = this.settings.ambientInt;
     this.dirLight.intensity = this.settings.dirInt;
     this.renderer.outputColorSpace = this.settings.colorSpace === "linear" ? THREE.LinearSRGBColorSpace : THREE.SRGBColorSpace;
@@ -367,26 +433,44 @@ class SceneManager {
     }
     this.renderer.render(this.scene, this.camera);
   }
+  setIfcGridVisibility(visible) {
+    this.contentGroup.traverse((obj) => {
+      if (obj.userData?.isIfcGridHelper) {
+        obj.visible = visible;
+      }
+    });
+  }
   // 根据经纬度和时间计算太阳位置
   updateSunPosition() {
     const lat = this.settings.sunLatitude || 0;
     const lng = this.settings.sunLongitude || 0;
     const time = this.settings.sunTime !== void 0 ? this.settings.sunTime : 12;
     const enabled = this.settings.sunEnabled !== false;
+    let bounds = this.computeTotalBounds(true);
+    if (bounds.isEmpty()) {
+      bounds = this.computeTotalBounds(false);
+    }
+    const center = !bounds.isEmpty() ? bounds.getCenter(new THREE.Vector3()) : new THREE.Vector3();
+    const size = !bounds.isEmpty() ? bounds.getSize(new THREE.Vector3()) : new THREE.Vector3(100, 100, 100);
+    const sceneSpan = Math.max(size.x, size.y, size.z, 100);
     this.sunLight.visible = enabled;
     if (!enabled) {
       this.dirLight.intensity = this.settings.dirInt;
+      this.ambientLight.intensity = this.settings.ambientInt;
+      this.backLight.intensity = 0.5;
       return;
     }
     const hourAngle = (time - 12) * 15 * (Math.PI / 180);
     const sunElevation = 90 - Math.abs(lat) + 23.5 * Math.sin((time - 6) * 15 * (Math.PI / 180));
     const elevationRad = sunElevation * (Math.PI / 180);
     const azimuthAngle = hourAngle + lng * Math.PI / 180;
-    const distance = 100;
+    const distance = Math.max(sceneSpan * 2.2, 120);
     const x = distance * Math.cos(elevationRad) * Math.sin(azimuthAngle);
     const y = distance * Math.sin(elevationRad);
     const z = distance * Math.cos(elevationRad) * Math.cos(azimuthAngle);
-    this.sunLight.position.set(x, Math.max(y, 1), z);
+    this.sunLight.position.set(center.x + x, center.y + Math.max(y, sceneSpan * 0.15), center.z + z);
+    this.sunLight.target.position.copy(center);
+    this.sunLight.target.updateMatrixWorld();
     const intensity = Math.max(0.2, Math.sin(elevationRad)) * 2;
     this.sunLight.intensity = intensity;
     const sunColor = new THREE.Color();
@@ -398,11 +482,13 @@ class SceneManager {
       sunColor.setHex(16774373);
     }
     this.sunLight.color = sunColor;
-    this.dirLight.intensity = this.settings.dirInt * 0.3;
-    this.updateSunShadow();
+    this.dirLight.intensity = this.settings.dirInt * 0.18;
+    this.ambientLight.intensity = this.settings.ambientInt * 0.65;
+    this.backLight.intensity = 0.22;
+    this.updateSunShadow(bounds, center, sceneSpan);
   }
   // 更新阴影设置
-  updateSunShadow() {
+  updateSunShadow(bounds, center, sceneSpan) {
     const shadowEnabled = this.settings.shadowQuality !== "off" && this.settings.sunShadow === true && this.settings.sunEnabled !== false;
     const shadowMapSize = this.settings.shadowQuality === "high" ? 4096 : this.settings.shadowQuality === "low" ? 1024 : 2048;
     if (shadowEnabled) {
@@ -410,6 +496,19 @@ class SceneManager {
       this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
       this.sunLight.shadow.mapSize.width = shadowMapSize;
       this.sunLight.shadow.mapSize.height = shadowMapSize;
+      this.sunLight.shadow.bias = -15e-5;
+      this.sunLight.shadow.normalBias = 0.02;
+      const effectiveBounds = bounds && !bounds.isEmpty() ? bounds : this.computeTotalBounds(true);
+      const effectiveCenter = center || (!effectiveBounds.isEmpty() ? effectiveBounds.getCenter(new THREE.Vector3()) : new THREE.Vector3());
+      const effectiveSize = sceneSpan || (!effectiveBounds.isEmpty() ? effectiveBounds.getSize(new THREE.Vector3()).length() : 100);
+      const radius = Math.max(effectiveSize * 0.7, 40);
+      this.sunLight.shadow.camera.left = -radius;
+      this.sunLight.shadow.camera.right = radius;
+      this.sunLight.shadow.camera.top = radius;
+      this.sunLight.shadow.camera.bottom = -radius;
+      this.sunLight.shadow.camera.near = 0.5;
+      this.sunLight.shadow.camera.far = Math.max(radius * 6, 500);
+      this.sunLight.shadow.camera.updateProjectionMatrix();
       this.contentGroup.traverse((obj) => {
         if (obj.isMesh) {
           const mesh = obj;
@@ -418,6 +517,8 @@ class SceneManager {
         }
       });
       this.sunLight.castShadow = true;
+      this.sunLight.target.position.copy(effectiveCenter);
+      this.sunLight.target.updateMatrixWorld();
     } else {
       this.renderer.shadowMap.enabled = false;
       this.sunLight.castShadow = false;
@@ -439,7 +540,8 @@ class SceneManager {
     return texture;
   }
   animate() {
-    requestAnimationFrame(this.animate);
+    if (this.disposed) return;
+    this.animationFrameId = requestAnimationFrame(this.animate);
     this.frameCounter++;
     const frameNow = performance.now();
     if (frameNow - this.frameSampleTime >= 500) {
@@ -450,6 +552,7 @@ class SceneManager {
     if (this.controls) {
       this.controls.update();
     }
+    this.updateInteractionPerformance(frameNow);
     this.updateAdaptiveQuality();
     if (this._needsBoundsUpdate) {
       this.updateSceneBounds();
@@ -458,7 +561,8 @@ class SceneManager {
     this.updateCameraClipping();
     const now = performance.now();
     const profile = this.getChunkRuntimeProfile();
-    const cullingInterval = this.cullingDirty ? this.isCameraMoving ? profile.movingCullingIntervalMs : this.isInPostMoveRecovery(now) ? profile.recoveryCullingIntervalMs : Math.min(profile.recoveryCullingIntervalMs, 70) : profile.idleCullingIntervalMs;
+    const phase = this.getChunkRenderPhase(now);
+    const cullingInterval = this.cullingDirty ? phase === "moving" ? profile.movingCullingIntervalMs : phase === "recovery" ? profile.recoveryCullingIntervalMs : Math.min(profile.recoveryCullingIntervalMs, 70) : profile.idleCullingIntervalMs;
     if (!this._lastCullingTime || now - this._lastCullingTime > cullingInterval) {
       this.checkCullingAndLoad(now);
       this._lastCullingTime = now;
@@ -468,6 +572,18 @@ class SceneManager {
       this.camera.updateMatrixWorld();
       this.tilesRenderer.update();
     }
+    const highlightMaterial = this.highlightMesh.material;
+    if (highlightMaterial) {
+      if (this.locateFocusUuid && this.highlightMesh.visible) {
+        const focusColor = new THREE.Color(this.settings.highlightColor || "#ff9f1c");
+        const pulseMix = 0.15 + (Math.sin(frameNow / 180) + 1) * 0.18;
+        highlightMaterial.color.copy(focusColor).lerp(this.highlightPulseColor, pulseMix);
+        highlightMaterial.opacity = 1;
+      } else {
+        highlightMaterial.color.set(this.settings.highlightColor || "#ff9f1c");
+        highlightMaterial.opacity = 1;
+      }
+    }
     this.renderer.render(this.scene, this.camera);
   }
   updateAdaptiveQuality() {
@@ -476,9 +592,17 @@ class SceneManager {
     const minRatio = Math.min(deviceRatio, this.settings.minPixelRatio ?? 0.8);
     const maxRatio = Math.min(deviceRatio, this.settings.maxPixelRatio ?? 2);
     const targetFps = this.settings.targetFps ?? 50;
+    const chunkCount = this.chunks.length;
+    const meshCount = this.originalStats.meshes;
+    const mode = this.settings.performanceMode ?? "balanced";
     let desiredRatio = maxRatio;
     if (this.isCameraMoving) {
-      desiredRatio = Math.max(minRatio, maxRatio * 0.65);
+      const movingScale = mode === "quality" ? chunkCount > 3500 || meshCount > 25e4 ? 0.68 : chunkCount > 1600 || meshCount > 12e4 ? 0.76 : 0.84 : mode === "smooth" ? chunkCount > 3500 || meshCount > 25e4 ? 0.44 : chunkCount > 1600 || meshCount > 12e4 ? 0.52 : 0.6 : chunkCount > 3500 || meshCount > 25e4 ? 0.48 : chunkCount > 1600 || meshCount > 12e4 ? 0.56 : 0.65;
+      desiredRatio = Math.max(minRatio, maxRatio * movingScale);
+      const movingPenaltyThreshold = mode === "quality" ? targetFps - 12 : targetFps - 8;
+      if (this.fps > 0 && this.fps < movingPenaltyThreshold) {
+        desiredRatio = Math.max(minRatio, desiredRatio - 0.08);
+      }
     } else if (this.fps > 0 && this.fps < targetFps - 5) {
       desiredRatio = Math.max(minRatio, this.activePixelRatio - 0.1);
     } else if (this.fps > targetFps + 8) {
@@ -490,6 +614,29 @@ class SceneManager {
     this.renderer.setPixelRatio(desiredRatio);
     const rect = this.canvas.getBoundingClientRect();
     this.renderer.setSize(Math.max(1, rect.width), Math.max(1, rect.height), false);
+  }
+  isSunShadowConfigured() {
+    return this.settings.shadowQuality !== "off" && this.settings.sunShadow === true && this.settings.sunEnabled !== false;
+  }
+  updateInteractionPerformance(now) {
+    const mode = this.settings.performanceMode ?? "balanced";
+    const shadowConfigured = this.isSunShadowConfigured();
+    const allowShadowDowngrade = mode !== "quality";
+    if (this.isCameraMoving) {
+      if (allowShadowDowngrade && shadowConfigured && this.renderer.shadowMap.enabled) {
+        this.renderer.shadowMap.enabled = false;
+        this.interactionShadowDowngraded = true;
+      }
+      return;
+    }
+    if (!this.interactionShadowDowngraded) return;
+    if (!shadowConfigured) {
+      this.interactionShadowDowngraded = false;
+      return;
+    }
+    if (now < this.interactionShadowRestoreAt) return;
+    this.renderer.shadowMap.enabled = true;
+    this.interactionShadowDowngraded = false;
   }
   initHardwareProfile() {
     const nav = navigator;
@@ -827,7 +974,7 @@ class SceneManager {
         const paddedBounds = chunkBounds.clone();
         const padSize = chunkBounds.getSize(new THREE.Vector3()).multiplyScalar(this.chunkPadding);
         paddedBounds.expandByVector(padSize);
-        this.chunks.push({
+        this.registerChunk({
           id: chunkId,
           bounds: chunkBounds,
           paddedBounds,
@@ -964,6 +1111,61 @@ class SceneManager {
   isInPostMoveRecovery(now) {
     return !this.isCameraMoving && now < this.postMoveRecoveryUntil;
   }
+  applyHighlightSettings() {
+    const highlightMaterial = this.highlightMesh.material;
+    if (highlightMaterial) {
+      highlightMaterial.color.set(this.settings.highlightColor || "#ff9f1c");
+      highlightMaterial.transparent = false;
+      highlightMaterial.opacity = 1;
+      highlightMaterial.depthTest = false;
+      highlightMaterial.depthWrite = false;
+      highlightMaterial.side = THREE.BackSide;
+      highlightMaterial.needsUpdate = true;
+    }
+    const boxMaterial = this.selectionBox.material;
+    if (Array.isArray(boxMaterial)) {
+      boxMaterial.forEach((material) => material.color.set(this.settings.highlightColor || "#ff9f1c"));
+    } else if (boxMaterial) {
+      boxMaterial.color.set(this.settings.highlightColor || "#ff9f1c");
+    }
+  }
+  getChunkRenderPhase(now) {
+    if (this.isCameraMoving) return "moving";
+    if (this.isInPostMoveRecovery(now)) return "recovery";
+    return "idle";
+  }
+  getChunkFrameBudget(phase, profile, warmupExtra) {
+    const mode = this.settings.performanceMode ?? "balanced";
+    const chunkCount = this.chunks.length;
+    const isHugeScene = chunkCount > 2e3;
+    const isLargeScene = chunkCount > 600;
+    if (phase === "moving") {
+      const baseMovingBudget = Math.max(
+        profile.movingLoadBudgetMin,
+        Math.min(profile.movingLoadBudgetMax, Math.floor(this.maxChunkLoadsPerFrame / 4))
+      );
+      if (mode === "smooth") {
+        if (isHugeScene) return Math.max(1, Math.floor(baseMovingBudget * 0.35));
+        if (isLargeScene) return Math.max(1, Math.floor(baseMovingBudget * 0.5));
+        return Math.max(1, Math.floor(baseMovingBudget * 0.7));
+      }
+      if (isHugeScene) return Math.max(1, Math.floor(baseMovingBudget * 0.55));
+      if (isLargeScene) return Math.max(1, Math.floor(baseMovingBudget * 0.75));
+      return baseMovingBudget;
+    }
+    if (phase === "recovery") {
+      const recoveryBudget = Math.max(
+        profile.recoveryLoadBudgetMin,
+        Math.min(
+          profile.recoveryLoadBudgetMax,
+          Math.floor(this.maxChunkLoadsPerFrame * profile.recoveryLoadBudgetRatio)
+        )
+      );
+      const recoveryBoost = mode === "smooth" ? Math.max(2, Math.floor(recoveryBudget * 0.6)) : 0;
+      return recoveryBudget + recoveryBoost + warmupExtra;
+    }
+    return this.maxChunkLoadsPerFrame + warmupExtra;
+  }
   isMovingPeripheralChunk(centrality, pixelSize, forwardness, profile) {
     return centrality < profile.movingCoreCentralityThreshold && pixelSize < profile.movingCorePixelThreshold && forwardness < profile.movingCoreForwardThreshold;
   }
@@ -994,6 +1196,8 @@ class SceneManager {
     this.reportChunkProgress();
     if (this.processingChunks.size >= this.maxConcurrentChunkLoads) return;
     const profile = this.getChunkRuntimeProfile();
+    const phase = this.getChunkRenderPhase(now);
+    const mode = this.settings.performanceMode ?? "balanced";
     this.camera.updateMatrixWorld();
     this.projScreenMatrix.multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse);
     this.frustum.setFromProjectionMatrix(this.projScreenMatrix);
@@ -1010,7 +1214,24 @@ class SceneManager {
     const loadedChunks = [];
     const isClippingActive = this.renderer.clippingPlanes.length > 0;
     const totalChunks = this.chunks.length;
-    this.chunks.forEach((c, chunkIndex) => {
+    const cullingLoopStart = performance.now();
+    const cullingTimeBudgetMs = phase === "moving" ? this.cullingTimeBudgetMovingMs : phase === "recovery" ? this.cullingTimeBudgetRecoveryMs : this.cullingTimeBudgetIdleMs;
+    let abortedByBudget = false;
+    const sampleUnloadedWhileMoving = mode !== "quality" && phase === "moving" && totalChunks > 1800;
+    const movingSampleStride = sampleUnloadedWhileMoving ? totalChunks > 5e3 ? 8 : totalChunks > 3e3 ? 6 : 4 : 1;
+    const movingSampleSeed = sampleUnloadedWhileMoving ? Math.floor(now / Math.max(1, profile.movingPeripheralRefreshMs)) % movingSampleStride : 0;
+    const startIndex = totalChunks > 0 ? this.cullingScanCursor % totalChunks : 0;
+    for (let scanOffset = 0; scanOffset < totalChunks; scanOffset++) {
+      const chunkIndex = (startIndex + scanOffset) % totalChunks;
+      const c = this.chunks[chunkIndex];
+      if ((scanOffset & 31) === 0) {
+        const elapsed = performance.now() - cullingLoopStart;
+        if (elapsed > cullingTimeBudgetMs) {
+          abortedByBudget = true;
+          this.cullingScanCursor = (chunkIndex + 1) % totalChunks;
+          break;
+        }
+      }
       if (!c.paddedBounds || c._padding !== padding) {
         const size = c.bounds.getSize(tempSize);
         const pb = c.bounds.clone();
@@ -1024,6 +1245,9 @@ class SceneManager {
       toChunkDirection.copy(c.center).sub(cameraPos);
       const dist = toChunkDirection.length();
       const inRange = dist < this.maxRenderDistance;
+      if (sampleUnloadedWhileMoving && !c.loaded && chunkIndex % movingSampleStride !== movingSampleSeed) {
+        return;
+      }
       const boxSize = c.bounds.getSize(tempSize).length();
       const pixelSize = boxSize / viewHeight * canvasHeight;
       const centerNDC = tempCenterNdc.copy(c.center).applyMatrix4(this.projScreenMatrix);
@@ -1031,13 +1255,13 @@ class SceneManager {
       const centrality = 1 - Math.min(1, ndcDistance);
       const forwardness = dist > 1e-5 ? Math.max(0, cameraForward.dot(toChunkDirection.divideScalar(dist))) : 1;
       const isTooSmall = pixelSize < 4;
-      const shouldHidePeripheralWhileMoving = this.isCameraMoving && centrality < profile.movingFocusCentralityThreshold && pixelSize < profile.movingFocusPixelThreshold;
+      const shouldHidePeripheralWhileMoving = phase === "moving" && centrality < profile.movingFocusCentralityThreshold && pixelSize < profile.movingFocusPixelThreshold;
       const shouldBeVisible = inFrustum && !isClipped && inRange && !isTooSmall && !shouldHidePeripheralWhileMoving;
       const lastTouchedAt = Math.max(c.lastVisibleAt || 0, c.lastFocusAt || 0);
-      const shouldKeepVisibleWhileMoving = this.isCameraMoving && inFrustum && !isClipped && inRange && !isTooSmall && now - lastTouchedAt < profile.chunkVisibilityHoldMs;
+      const shouldKeepVisibleWhileMoving = phase === "moving" && inFrustum && !isClipped && inRange && !isTooSmall && now - lastTouchedAt < profile.chunkVisibilityHoldMs;
       const isPeripheralWhileMoving = this.isMovingPeripheralChunk(centrality, pixelSize, forwardness, profile);
       const shouldRefreshPeripheral = !isPeripheralWhileMoving || this.shouldRefreshPeripheralChunk(now, chunkIndex, totalChunks, profile);
-      const effectiveVisible = this.isCameraMoving && isPeripheralWhileMoving && !shouldRefreshPeripheral ? c.lastEffectiveVisible ?? c.mesh?.visible ?? false : shouldBeVisible || shouldKeepVisibleWhileMoving;
+      const effectiveVisible = phase === "moving" && isPeripheralWhileMoving && !shouldRefreshPeripheral ? c.lastEffectiveVisible ?? c.mesh?.visible ?? false : shouldBeVisible || shouldKeepVisibleWhileMoving;
       const centerPriorityWindow = this.chunkWarmupActive || now < this.chunkLoadResumeAt + profile.centerPriorityWindowMs;
       const isPeripheralCandidate = centrality < profile.centerPriorityThreshold && forwardness < profile.forwardPriorityThreshold && pixelSize < 96;
       if (effectiveVisible) {
@@ -1068,20 +1292,28 @@ class SceneManager {
         const forwardScore = forwardness * 550;
         const cacheBoost = this.chunkMeshCache.has(c.id) ? 420 : 0;
         const warmupBoost = this.chunkWarmupActive && this.chunkLoadedCount < this.initialChunkLoadTarget ? centrality > 0.65 ? 1500 : centrality > 0.45 ? 500 : 0 : 0;
-        const movingPriorityBoost = this.isCameraMoving ? centrality > 0.65 || forwardness > 0.7 ? 900 : centrality > 0.4 ? 250 : -250 : 0;
-        if (this.isCameraMoving && centrality < 0.08 && pixelSize < 18) {
-          return;
+        const movingPriorityBoost = phase === "moving" ? centrality > 0.65 || forwardness > 0.7 ? 900 : centrality > 0.4 ? 250 : -250 : 0;
+        if (phase === "moving" && centrality < 0.08 && pixelSize < 18) {
+          continue;
         }
-        if (this.isCameraMoving && isPeripheralWhileMoving && !shouldRefreshPeripheral) {
-          return;
+        if (phase === "moving" && isPeripheralWhileMoving && !shouldRefreshPeripheral) {
+          continue;
         }
-        if (!this.isCameraMoving && centerPriorityWindow && isPeripheralCandidate) {
-          return;
+        if (phase !== "moving" && centerPriorityWindow && isPeripheralCandidate) {
+          continue;
+        }
+        if (phase === "moving" && (this.settings.performanceMode ?? "balanced") === "smooth") {
+          if (centrality < 0.3 && pixelSize < 54 && forwardness < 0.62) {
+            continue;
+          }
         }
         c.priority = movingPriorityBoost + cacheBoost + warmupBoost + forwardScore + viewportBoost * 1e3 + sizeScore * 120 + distanceScore + centrality * 300;
         toLoad.push(c);
       }
-    });
+    }
+    if (!abortedByBudget) {
+      this.cullingScanCursor = (startIndex + totalChunks) % Math.max(totalChunks, 1);
+    }
     if (!this.isCameraMoving && loadedChunks.length > this.maxLoadedChunks) {
       loadedChunks.sort((a, b) => b.center.distanceToSquared(cameraPos) - a.center.distanceToSquared(cameraPos));
       let unloadedCount = 0;
@@ -1100,22 +1332,14 @@ class SceneManager {
       toLoad.sort((a, b) => b.priority - a.priority);
       const available = this.maxConcurrentChunkLoads - this.processingChunks.size;
       const warmupExtra = this.chunkWarmupActive && this.chunkLoadedCount < this.initialChunkLoadTarget ? this.warmupChunkBoost : 0;
-      const movingBudget = Math.max(
-        profile.movingLoadBudgetMin,
-        Math.min(profile.movingLoadBudgetMax, Math.floor(this.maxChunkLoadsPerFrame / 4))
-      );
-      const recoveryBudget = Math.max(
-        profile.recoveryLoadBudgetMin,
-        Math.min(
-          profile.recoveryLoadBudgetMax,
-          Math.floor(this.maxChunkLoadsPerFrame * profile.recoveryLoadBudgetRatio)
-        )
-      );
-      const frameBudget = this.isCameraMoving ? movingBudget : this.isInPostMoveRecovery(now) ? recoveryBudget + warmupExtra : this.maxChunkLoadsPerFrame + warmupExtra;
+      const frameBudget = this.getChunkFrameBudget(phase, profile, warmupExtra);
       const count = Math.min(available, frameBudget, toLoad.length);
       for (let i = 0; i < count; i++) {
         this.loadChunk(toLoad[i]);
       }
+    }
+    if (abortedByBudget) {
+      this.cullingDirty = true;
     }
     if (this.chunkWarmupActive && this.chunkLoadedCount >= this.initialChunkLoadTarget) {
       this.chunkWarmupActive = false;
@@ -1133,7 +1357,7 @@ class SceneManager {
     this.activeWorkerCount++;
     let worker = this.workers.pop();
     if (!worker) {
-      worker = new Worker(new URL(/* @vite-ignore */ ""+new URL('assets/chunkWorker-DAPcrn6M.js', import.meta.url).href+"", import.meta.url), { type: "module" });
+      worker = new Worker(new URL(/* @vite-ignore */ ""+new URL('assets/chunkWorker-46LMRdEv.js', import.meta.url).href+"", import.meta.url), { type: "module" });
     }
     const onMessage = (e) => {
       worker.removeEventListener("message", onMessage);
@@ -1189,7 +1413,10 @@ class SceneManager {
         const file = this.nbimFiles.get(chunk.nbimFileId);
         const buffer = await file.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength).arrayBuffer();
         const meta = this.nbimMeta.get(chunk.nbimFileId);
-        const version = meta?.version ?? 7;
+        const version = meta?.version ?? 8;
+        if (version !== 8) {
+          throw new Error(`Unsupported NBIM version: ${version}. Only V8 is supported.`);
+        }
         const workerResult = await this.runWorkerTask({
           buffer,
           version,
@@ -1199,7 +1426,7 @@ class SceneManager {
         bm = this.reconstructBatchedMesh(workerResult, this.sharedMaterial);
       }
       if (bm) {
-        if (this.cancelledChunkIds.has(chunk.id) || !this.chunks.some((c) => c.id === chunk.id)) {
+        if (this.cancelledChunkIds.has(chunk.id) || !this.chunkIdSet.has(chunk.id)) {
           this.disposeChunkMesh(bm);
           return;
         }
@@ -1230,6 +1457,9 @@ class SceneManager {
         this.chunkLoadedCount++;
         chunk.lastVisibleAt = performance.now();
         chunk.lastFocusAt = chunk.lastVisibleAt;
+        if (chunk.originalUuid) {
+          this.deactivateFastPreviewForModel(chunk.originalUuid);
+        }
         if (this.chunkWarmupActive && this.chunkLoadedCount >= this.initialChunkLoadTarget) {
           this.chunkWarmupActive = false;
         }
@@ -1259,9 +1489,10 @@ class SceneManager {
     this.renderer.render(this.scene, this.camera);
   }
   buildSceneGraph(object) {
+    const fallbackName = object.isMesh ? `Mesh_${object.id}` : `Group_${object.id}`;
     const node = {
       id: object.uuid,
-      name: object.name || `Object_${object.id}`,
+      name: sanitizeDisplayLabel(object.name, object.userData?.name) || fallbackName,
       type: object.isMesh ? "Mesh" : "Group",
       children: [],
       bimId: object.userData?.bimId ? String(object.userData.bimId) : object.userData?.expressID !== void 0 ? String(object.userData.expressID) : void 0,
@@ -1282,9 +1513,10 @@ class SceneManager {
    */
   buildIFCStructure(object) {
     const buildSpatialRecursive = (obj) => {
+      const fallbackName = obj.isMesh ? `Mesh_${obj.id}` : `Group_${obj.id}`;
       const node = {
         id: obj.uuid,
-        name: obj.name || `Object_${obj.id}`,
+        name: sanitizeDisplayLabel(obj.name, obj.userData?.name) || fallbackName,
         type: obj.isMesh ? "Mesh" : "Group",
         children: [],
         bimId: obj.userData?.expressID !== void 0 ? String(obj.userData.expressID) : void 0,
@@ -1293,67 +1525,12 @@ class SceneManager {
       if (!this.nodeMap.has(obj.uuid)) this.nodeMap.set(obj.uuid, []);
       this.nodeMap.get(obj.uuid).push(node);
       for (const child of obj.children) {
+        if (child.userData?.isIfcGridHelper) continue;
         node.children.push(buildSpatialRecursive(child));
       }
       return node;
     };
-    const spatialRoot = buildSpatialRecursive(object);
-    const layerMap = object.userData.layerMap;
-    if (layerMap && layerMap.size > 0) {
-      const layerRoot = {
-        id: `layers_${object.uuid}`,
-        name: "图层结构 (Layers)",
-        type: "Group",
-        children: [],
-        userData: { originalUuid: object.uuid }
-      };
-      if (!this.nodeMap.has(layerRoot.id)) this.nodeMap.set(layerRoot.id, []);
-      this.nodeMap.get(layerRoot.id).push(layerRoot);
-      const layers = /* @__PURE__ */ new Map();
-      object.traverse((child) => {
-        if (child.isMesh && child.userData.expressID !== void 0) {
-          const expressID = child.userData.expressID;
-          const layerName = layerMap.get(expressID) || "未分类图层";
-          if (!layers.has(layerName)) {
-            const lNode = {
-              id: `layer_${layerName}_${object.uuid}`,
-              name: layerName,
-              type: "Group",
-              children: [],
-              userData: { originalUuid: object.uuid }
-            };
-            layers.set(layerName, lNode);
-            if (!this.nodeMap.has(lNode.id)) this.nodeMap.set(lNode.id, []);
-            this.nodeMap.get(lNode.id).push(lNode);
-          }
-          const layerNode = layers.get(layerName);
-          const node = {
-            id: child.uuid,
-            name: child.name,
-            type: "Mesh",
-            bimId: String(expressID),
-            userData: { ...child.userData }
-          };
-          layerNode.children.push(node);
-          if (!this.nodeMap.has(child.uuid)) this.nodeMap.set(child.uuid, []);
-          this.nodeMap.get(child.uuid).push(node);
-        }
-      });
-      layerRoot.children = Array.from(layers.values());
-      if (layerRoot.children.length > 0) {
-        const compositeRoot = {
-          id: `composite_${object.uuid}`,
-          name: object.name || "IFC Model",
-          type: "Group",
-          children: [spatialRoot, layerRoot],
-          userData: { originalUuid: object.uuid }
-        };
-        if (!this.nodeMap.has(compositeRoot.id)) this.nodeMap.set(compositeRoot.id, []);
-        this.nodeMap.get(compositeRoot.id).push(compositeRoot);
-        return compositeRoot;
-      }
-    }
-    return spatialRoot;
+    return buildSpatialRecursive(object);
   }
   async prepareObjectRuntimeData(object, maxAnisotropy, batchSize = 6e3) {
     const stack = [object];
@@ -1446,13 +1623,34 @@ class SceneManager {
       await this.prepareObjectRuntimeData(object, maxAnisotropy, 6e3);
     }
   }
-  attachModelToContentGroup(object) {
+  prepareFastVisibleStage(object, meshCount, onProgress) {
+    if (meshCount < 12e3) return false;
+    let visibleCount = 0;
+    const limit = this.fastPreviewMeshLimit;
+    object.traverse((child) => {
+      if (!child.isMesh) return;
+      const mesh = child;
+      const isVisible = visibleCount < limit;
+      mesh.visible = isVisible;
+      mesh.userData.fastPreview = isVisible;
+      if (isVisible) visibleCount++;
+    });
+    if (onProgress) {
+      onProgress(8, `正在准备快速预览... (${visibleCount} meshes)`);
+    }
+    if (visibleCount > 0) {
+      object.userData.fastPreviewActive = true;
+      this.fastPreviewModels.add(object.uuid);
+    }
+    return visibleCount > 0;
+  }
+  attachModelToContentGroup(object, keepVisible = false) {
     const fileGroup = new THREE.Group();
     fileGroup.name = `file_${object.uuid}`;
     fileGroup.userData.originalUuid = object.uuid;
     object.userData.originalUuid = object.uuid;
     fileGroup.add(object);
-    object.visible = false;
+    object.visible = keepVisible;
     this.contentGroup.add(fileGroup);
     this.interactableListValid = false;
   }
@@ -1477,14 +1675,27 @@ class SceneManager {
     this.reportChunkProgress();
     this.checkCullingAndLoad();
     void this.createChunkGhostsProgressively(ghostSpecs);
-    const meshesToHide = [];
-    object.traverse((child) => {
-      if (child.isMesh) {
-        meshesToHide.push(child);
+    const meshesToHideSet = /* @__PURE__ */ new Set();
+    for (const item of items) {
+      const sourceMesh = item.sourceMesh;
+      if (sourceMesh?.isMesh) {
+        meshesToHideSet.add(sourceMesh);
       }
-    });
+    }
+    const meshesToHide = meshesToHideSet.size > 0 ? Array.from(meshesToHideSet) : (() => {
+      const fallbackMeshes = [];
+      object.traverse((child) => {
+        if (child.isMesh) {
+          fallbackMeshes.push(child);
+        }
+      });
+      return fallbackMeshes;
+    })();
     for (let i = 0; i < meshesToHide.length; i++) {
       const child = meshesToHide[i];
+      if (object.userData.fastPreviewActive && child.userData.fastPreview) {
+        continue;
+      }
       child.visible = false;
       child.userData.isOptimized = true;
       if (i > 0 && i % 6e3 === 0) {
@@ -1510,17 +1721,42 @@ class SceneManager {
       materials.forEach((m) => m.dispose && m.dispose());
     }
   }
+  cancelDeferredStructureBuild() {
+    if (this.deferredStructureTimer) {
+      clearTimeout(this.deferredStructureTimer);
+      this.deferredStructureTimer = null;
+    }
+    this.deferredStructureToken++;
+  }
+  deactivateFastPreviewForModel(originalUuid) {
+    if (!this.fastPreviewModels.has(originalUuid)) return;
+    this.fastPreviewModels.delete(originalUuid);
+    const fileGroup = this.contentGroup.getObjectByName(`file_${originalUuid}`);
+    if (!fileGroup) return;
+    fileGroup.traverse((child) => {
+      if (child.isMesh) {
+        child.visible = false;
+        if (child.userData.fastPreview) delete child.userData.fastPreview;
+      }
+      if (child.userData?.fastPreviewActive) {
+        child.userData.fastPreviewActive = false;
+      }
+    });
+  }
   scheduleDeferredStructureReplacement(object, shouldDeferStructure, deferredPlaceholderId) {
     if (shouldDeferStructure && deferredPlaceholderId) {
-      setTimeout(() => {
+      this.cancelDeferredStructureBuild();
+      const token = this.deferredStructureToken;
+      this.deferredStructureTimer = setTimeout(() => {
         try {
+          if (token !== this.deferredStructureToken) return;
           const modelRoot = this.buildAndRegisterModelStructure(object);
           this.replaceStructureNode(deferredPlaceholderId, modelRoot);
           if (this.onStructureUpdate) this.onStructureUpdate();
         } catch (error) {
           console.warn("延迟构建结构树失败:", error);
         }
-      }, 0);
+      }, 80);
       return;
     }
     if (this.onStructureUpdate) {
@@ -1536,13 +1772,15 @@ class SceneManager {
     this.registerOriginalStats(object.uuid, objectOverview);
     const { shouldDeferStructure, deferredPlaceholderId } = this.prepareStructureStage(object, meshCount, onProgress);
     const previewGhost = this.prepareModelBoundsStage(object, modelBox);
+    const quickVisibleEnabled = this.prepareFastVisibleStage(object, meshCount, onProgress);
     await this.prepareModelRuntimeStage(object, meshCount);
-    this.attachModelToContentGroup(object);
+    this.attachModelToContentGroup(object, quickVisibleEnabled);
     await this.prepareModelChunkStage(object, meshCount, onProgress);
     this.finalizeModelStage(previewGhost, onProgress);
     this.scheduleDeferredStructureReplacement(object, shouldDeferStructure, deferredPlaceholderId);
   }
   removeObject(uuid) {
+    this.cancelDeferredStructureBuild();
     const nodes = this.nodeMap.get(uuid);
     const originalUuid = nodes?.[0]?.userData?.originalUuid || uuid;
     const optimizedGroupsToRemove = [];
@@ -1608,6 +1846,8 @@ class SceneManager {
     }
     this.interactableListValid = false;
     this.unregisterOriginalStats(originalUuid);
+    this.fastPreviewModels.delete(uuid);
+    this.fastPreviewModels.delete(originalUuid);
     this.clearChunkCache((chunkId, mesh) => {
       const owner = mesh.userData.originalUuid || "";
       return owner === uuid || owner === originalUuid || chunkId.startsWith(uuid) || chunkId.startsWith(originalUuid);
@@ -1629,6 +1869,7 @@ class SceneManager {
       }
       return true;
     });
+    this.rebuildChunkIdSet();
     if (this.structureRoot) {
       const filterNodes = (nodes2) => {
         return nodes2.filter((n) => {
@@ -1739,22 +1980,6 @@ class SceneManager {
     this.updateSettings(this.settings);
     return renderer.group;
   }
-  // --- 辅助功能 (对齐 refs) ---
-  getTypeIndex(type) {
-    const types = ["Generic", "Column", "Beam", "Slab", "Wall", "Window", "Door", "Pipe", "Duct"];
-    const idx = types.indexOf(type);
-    return idx === -1 ? 0 : idx;
-  }
-  guessType(name) {
-    const n = name.toLowerCase();
-    if (n.includes("col") || n.includes("柱")) return "Column";
-    if (n.includes("beam") || n.includes("梁")) return "Beam";
-    if (n.includes("slab") || n.includes("板")) return "Slab";
-    if (n.includes("wall") || n.includes("墙")) return "Wall";
-    if (n.includes("window") || n.includes("窗")) return "Window";
-    if (n.includes("door") || n.includes("门")) return "Door";
-    return "Generic";
-  }
   // --- NBIM 导入/导出功能 ---
   generateChunkBinaryV8(items, bimIdToIndex) {
     const uniqueGeos = [];
@@ -1820,10 +2045,9 @@ class SceneManager {
       const firstNode = treeNodes?.[0];
       const bimId = item.bimId || firstNode?.bimId || firstNode?.id || item.uuid;
       const bimIdIndex = bimIdToIndex.get(bimId) ?? 0;
-      const typeStr = this.guessType(firstNode?.name || "");
       dv.setUint32(offset, bimIdIndex, true);
       offset += 4;
-      const typeIndex = typeof item.typeIndex === "number" ? item.typeIndex : this.getTypeIndex(typeStr);
+      const typeIndex = typeof item.typeIndex === "number" ? item.typeIndex : 0;
       dv.setUint32(offset, typeIndex, true);
       offset += 4;
       dv.setUint32(offset, item.color, true);
@@ -1955,52 +2179,6 @@ class SceneManager {
       byteLength: 0
     }));
     let currentOffset = 1024;
-    const decodeV7 = (buffer) => {
-      const dv2 = new DataView(buffer);
-      let offset = 0;
-      const geoCount = dv2.getUint32(offset, true);
-      offset += 4;
-      const geometries = [];
-      for (let i = 0; i < geoCount; i++) {
-        const vertCount = dv2.getUint32(offset, true);
-        offset += 4;
-        const indexCount = dv2.getUint32(offset, true);
-        offset += 4;
-        const posArr = new Float32Array(buffer, offset, vertCount * 3);
-        offset += vertCount * 12;
-        const normArr = new Float32Array(buffer, offset, vertCount * 3);
-        offset += vertCount * 12;
-        const geo = new THREE.BufferGeometry();
-        geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(posArr), 3));
-        geo.setAttribute("normal", new THREE.BufferAttribute(new Float32Array(normArr), 3));
-        if (indexCount > 0) {
-          const indexArr = new Uint32Array(buffer, offset, indexCount);
-          offset += indexCount * 4;
-          geo.setIndex(new THREE.BufferAttribute(new Uint32Array(indexArr), 1));
-        }
-        geometries.push(geo);
-      }
-      const instanceCount = dv2.getUint32(offset, true);
-      offset += 4;
-      const matrix = new THREE.Matrix4();
-      const instances = [];
-      for (let i = 0; i < instanceCount; i++) {
-        const bimIdNum = dv2.getUint32(offset, true);
-        offset += 4;
-        const typeIndex = dv2.getUint32(offset, true);
-        offset += 4;
-        const color = dv2.getUint32(offset, true);
-        offset += 4;
-        for (let k = 0; k < 16; k++) {
-          matrix.elements[k] = dv2.getFloat32(offset, true);
-          offset += 4;
-        }
-        const geoIdx = dv2.getUint32(offset, true);
-        offset += 4;
-        instances.push({ bimId: String(bimIdNum), typeIndex, color, matrix: matrix.clone(), geometry: geometries[geoIdx] });
-      }
-      return instances;
-    };
     const decodeV8 = (buffer, table) => {
       const dv2 = new DataView(buffer);
       let offset = 0;
@@ -2057,8 +2235,11 @@ class SceneManager {
         const file = this.nbimFiles.get(chunk.nbimFileId);
         const raw = await file.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength).arrayBuffer();
         const meta = this.nbimMeta.get(chunk.nbimFileId);
-        const version = meta?.version ?? 7;
-        const instances = version >= 8 ? decodeV8(raw, meta?.bimIdTable || []) : decodeV7(raw);
+        const version = meta?.version ?? 8;
+        if (version !== 8) {
+          throw new Error(`Unsupported NBIM version: ${version}. Only V8 is supported.`);
+        }
+        const instances = decodeV8(raw, meta?.bimIdTable || []);
         const items = instances.map((inst) => ({ uuid: "", bimId: inst.bimId, typeIndex: inst.typeIndex, color: inst.color, matrix: inst.matrix, geometry: inst.geometry }));
         buffer = this.generateChunkBinaryV8(items, bimIdToIndex);
       } else {
@@ -2161,6 +2342,9 @@ class SceneManager {
     const magic = dv.getUint32(0, true);
     if (magic !== 1296646734) throw new Error("不是有效的 NBIM 文件");
     const version = dv.getUint32(4, true);
+    if (version !== 8) {
+      throw new Error(`不支持的 NBIM 版本: ${version}，当前仅支持 V8`);
+    }
     const manifestOffset = dv.getUint32(8, true);
     const manifestLen = dv.getUint32(12, true);
     if (onProgress) onProgress(20, "正在读取元数据...");
@@ -2237,7 +2421,7 @@ class SceneManager {
       const paddedBounds = bounds.clone();
       const padSize = bounds.getSize(new THREE.Vector3()).multiplyScalar(this.chunkPadding);
       paddedBounds.expandByVector(padSize);
-      this.chunks.push({
+      this.registerChunk({
         id: chunkId,
         bounds,
         paddedBounds,
@@ -2278,6 +2462,8 @@ class SceneManager {
   }
   async clear() {
     console.log("开始清空场景...");
+    this.cancelDeferredStructureBuild();
+    this.resetExplode();
     try {
       const disposeObject = (obj) => {
         if (obj.isMesh) {
@@ -2319,6 +2505,7 @@ class SceneManager {
       this.nodeMap.clear();
       this.bimIdToNodeIds.clear();
       this.chunks = [];
+      this.chunkIdSet.clear();
       this.lastReportedProgress = { loaded: -1, total: -1 };
       this.processingChunks.clear();
       this.cancelledChunkIds.clear();
@@ -2328,6 +2515,7 @@ class SceneManager {
       this.clearChunkCache();
       this.originalStats = { meshes: 0, faces: 0, memory: 0 };
       this.originalStatsByModel.clear();
+      this.fastPreviewModels.clear();
       this.chunkLoadingEnabled = true;
       this.contentGroup.visible = true;
       this.ghostGroup.visible = true;
@@ -2372,6 +2560,7 @@ class SceneManager {
       o.visible = visible;
     });
     this.updateSceneBounds();
+    this.refreshExplodeState();
   }
   hideObjects(uuids) {
     uuids.forEach((id) => this.setObjectVisibility(id, false));
@@ -2422,6 +2611,7 @@ class SceneManager {
     });
     this.interactableListValid = false;
     this.updateSceneBounds();
+    this.refreshExplodeState();
   }
   setObjectVisibility(uuid, visible, showParents = true) {
     const nodes = this.nodeMap.get(uuid);
@@ -2506,6 +2696,268 @@ class SceneManager {
   highlightObject(uuid) {
     this.highlightObjects(uuid ? [uuid] : []);
   }
+  toLocalDirection(directionWorld, matrixWorld) {
+    return directionWorld.clone().transformDirection(matrixWorld.clone().invert()).normalize();
+  }
+  getExplodeWorldDirection(vectorFromCenter) {
+    const direction = vectorFromCenter.clone();
+    if (this.explodeMode === "horizontal") {
+      direction.z = 0;
+    } else if (this.explodeMode === "vertical") {
+      direction.x = 0;
+      direction.y = 0;
+      direction.z = direction.z >= 0 ? 1 : -1;
+    }
+    if (direction.lengthSq() < 1e-8) {
+      if (this.explodeMode === "vertical") return new THREE.Vector3(0, 0, 1);
+      if (this.explodeMode === "horizontal") return new THREE.Vector3(1, 0, 0);
+      return new THREE.Vector3(0, 0, 1);
+    }
+    return direction.normalize();
+  }
+  captureExplodeSnapshot() {
+    this.explodeObjectStates.clear();
+    this.explodeInstanceStates.clear();
+    let bounds = this.computeTotalBounds(true, true);
+    if (bounds.isEmpty()) bounds = this.computeTotalBounds(false, true);
+    if (bounds.isEmpty()) {
+      this.explodeCenter.set(0, 0, 0);
+      return;
+    }
+    this.explodeCenter.copy(bounds.getCenter(new THREE.Vector3()));
+    const radius = Math.max(bounds.getSize(new THREE.Vector3()).length() * 0.5, 1);
+    const objectBox = new THREE.Box3();
+    const objectCenter = new THREE.Vector3();
+    this.contentGroup.updateMatrixWorld(true);
+    this.contentGroup.traverse((obj) => {
+      const mesh = obj;
+      if (!mesh.isMesh || !obj.visible || obj.userData?.isIfcGridHelper) return;
+      objectBox.setFromObject(obj);
+      if (objectBox.isEmpty()) return;
+      objectCenter.copy(objectBox.getCenter(new THREE.Vector3()));
+      const vectorFromCenter = objectCenter.sub(this.explodeCenter);
+      const weight = THREE.MathUtils.clamp(vectorFromCenter.length() / radius, 0.18, 1.25);
+      const directionWorld = this.getExplodeWorldDirection(vectorFromCenter);
+      const directionLocal = this.toLocalDirection(directionWorld, obj.parent?.matrixWorld || new THREE.Matrix4());
+      this.explodeObjectStates.set(obj.uuid, {
+        object: obj,
+        basePosition: obj.position.clone(),
+        directionLocal,
+        weight
+      });
+    });
+    const instanceBox = new THREE.Box3();
+    const instanceMatrix = new THREE.Matrix4();
+    const worldMatrix = new THREE.Matrix4();
+    this.optimizedMapping.forEach((mappings, originalUuid) => {
+      const isVisible = this.nodeMap.get(originalUuid)?.some((node) => node.visible !== false) ?? true;
+      if (!isVisible) return;
+      mappings.forEach((mapping) => {
+        const key = `${mapping.mesh.uuid}:${mapping.instanceId}`;
+        if (this.explodeInstanceStates.has(key)) return;
+        mapping.mesh.getMatrixAt(mapping.instanceId, instanceMatrix);
+        const geometry = mapping.geometry || mapping.mesh.geometry;
+        if (!geometry?.boundingBox) geometry?.computeBoundingBox?.();
+        if (!geometry?.boundingBox) return;
+        worldMatrix.copy(mapping.mesh.matrixWorld).multiply(instanceMatrix);
+        instanceBox.copy(geometry.boundingBox).applyMatrix4(worldMatrix);
+        if (instanceBox.isEmpty()) return;
+        objectCenter.copy(instanceBox.getCenter(new THREE.Vector3()));
+        const vectorFromCenter = objectCenter.sub(this.explodeCenter);
+        const weight = THREE.MathUtils.clamp(vectorFromCenter.length() / radius, 0.18, 1.25);
+        const directionWorld = this.getExplodeWorldDirection(vectorFromCenter);
+        this.explodeInstanceStates.set(key, {
+          mesh: mapping.mesh,
+          instanceId: mapping.instanceId,
+          baseMatrix: instanceMatrix.clone(),
+          directionLocal: this.toLocalDirection(directionWorld, mapping.mesh.matrixWorld),
+          weight
+        });
+      });
+    });
+  }
+  applyExplodeState() {
+    const bounds = this.computeTotalBounds(true, true);
+    const size = bounds.isEmpty() ? new THREE.Vector3(100, 100, 100) : bounds.getSize(new THREE.Vector3());
+    const magnitude = Math.max(size.length() * 0.08 * (this.explodeStrength / 100), 0);
+    this.explodeObjectStates.forEach((state) => {
+      state.object.position.copy(state.basePosition).addScaledVector(state.directionLocal, magnitude * state.weight);
+      state.object.updateMatrixWorld();
+    });
+    const translation = new THREE.Vector3();
+    const quaternion = new THREE.Quaternion();
+    const scale = new THREE.Vector3();
+    this.explodeInstanceStates.forEach((state) => {
+      const matrix = state.baseMatrix.clone();
+      matrix.decompose(translation, quaternion, scale);
+      translation.addScaledVector(state.directionLocal, magnitude * state.weight);
+      matrix.compose(translation, quaternion, scale);
+      state.mesh.setMatrixAt(state.instanceId, matrix);
+      if (state.mesh.instanceMatrix) state.mesh.instanceMatrix.needsUpdate = true;
+    });
+    this.interactableListValid = false;
+    this.updateSceneBounds();
+  }
+  restoreExplodeSnapshot() {
+    this.explodeObjectStates.forEach((state) => {
+      state.object.position.copy(state.basePosition);
+      state.object.updateMatrixWorld();
+    });
+    this.explodeInstanceStates.forEach((state) => {
+      state.mesh.setMatrixAt(state.instanceId, state.baseMatrix);
+      if (state.mesh.instanceMatrix) state.mesh.instanceMatrix.needsUpdate = true;
+    });
+    this.interactableListValid = false;
+    this.updateSceneBounds();
+  }
+  refreshExplodeState() {
+    if (!this.explodeEnabled) return;
+    this.restoreExplodeSnapshot();
+    this.captureExplodeSnapshot();
+    this.applyExplodeState();
+  }
+  setExplodeEnabled(enabled) {
+    if (enabled === this.explodeEnabled) return;
+    this.explodeEnabled = enabled;
+    if (!enabled) {
+      this.restoreExplodeSnapshot();
+      this.explodeObjectStates.clear();
+      this.explodeInstanceStates.clear();
+      return;
+    }
+    this.captureExplodeSnapshot();
+    this.applyExplodeState();
+  }
+  setExplodeStrength(value) {
+    this.explodeStrength = THREE.MathUtils.clamp(value, 0, 100);
+    if (!this.explodeEnabled) return;
+    if (this.explodeObjectStates.size === 0 && this.explodeInstanceStates.size === 0) {
+      this.captureExplodeSnapshot();
+    }
+    this.applyExplodeState();
+  }
+  setExplodeMode(mode) {
+    this.explodeMode = mode;
+    if (!this.explodeEnabled) return;
+    this.restoreExplodeSnapshot();
+    this.captureExplodeSnapshot();
+    this.applyExplodeState();
+  }
+  resetExplode() {
+    this.explodeStrength = 0;
+    if (this.explodeEnabled) {
+      this.restoreExplodeSnapshot();
+    }
+    this.explodeEnabled = false;
+    this.explodeObjectStates.clear();
+    this.explodeInstanceStates.clear();
+  }
+  clearLocateFocus() {
+    this.locateObjectMaterialCache.forEach((material, uuid) => {
+      const obj = this.contentGroup.getObjectByProperty("uuid", uuid);
+      if (!obj || !obj.isMesh) return;
+      obj.material = material;
+    });
+    this.locateObjectMaterialCache.clear();
+    this.locateMaterialCache.clear();
+    this.locateDimmedInstances.forEach(({ mesh, instanceId, originalColor }) => {
+      mesh.setColorAt(instanceId, new THREE.Color(originalColor));
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    });
+    this.locateDimmedInstances.clear();
+    this.locateResultSet.clear();
+    this.locateFocusUuid = null;
+    this.highlightObjects([]);
+  }
+  hasSameLocateResultSet(uuids) {
+    if (this.locateResultSet.size !== uuids.length) return false;
+    for (const uuid of uuids) {
+      if (!this.locateResultSet.has(uuid)) return false;
+    }
+    return true;
+  }
+  updateLocateFocusHighlight(uuid) {
+    this.locateFocusUuid = uuid;
+    this.highlightObject(uuid);
+  }
+  setLocateResultSet(uuids, focusUuid = null) {
+    const normalized = Array.from(new Set(uuids.filter(Boolean)));
+    if (normalized.length === 0) {
+      this.clearLocateFocus();
+      return;
+    }
+    if (this.hasSameLocateResultSet(normalized)) {
+      const nextFocus = focusUuid && this.locateResultSet.has(focusUuid) ? focusUuid : normalized[0];
+      this.updateLocateFocusHighlight(nextFocus);
+      return;
+    }
+    this.clearLocateFocus();
+    const resultSet = new Set(normalized);
+    this.locateResultSet = resultSet;
+    this.locateFocusUuid = focusUuid && resultSet.has(focusUuid) ? focusUuid : normalized[0];
+    const dimmedColor = new THREE.Color("#d6d9df");
+    const accentColor = new THREE.Color(this.settings.highlightColor || "#ff9f1c");
+    this.contentGroup.traverse((child) => {
+      const mesh = child;
+      if (!mesh.isMesh || !mesh.material) return;
+      if (!this.locateObjectMaterialCache.has(child.uuid)) {
+        this.locateObjectMaterialCache.set(child.uuid, mesh.material);
+      }
+      const sourceMaterials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      const isMatched = resultSet.has(child.uuid);
+      const nextMaterials = sourceMaterials.map((material) => {
+        if (!material) return material;
+        const cloned = material.clone();
+        if ("transparent" in cloned) cloned.transparent = false;
+        if ("opacity" in cloned) cloned.opacity = 1;
+        if ("depthWrite" in cloned) cloned.depthWrite = true;
+        if ("color" in cloned && cloned.color) {
+          const baseColor = cloned.color.clone();
+          if (isMatched) {
+            cloned.color.copy(baseColor.lerp(accentColor, 0.82));
+          } else {
+            cloned.transparent = true;
+            cloned.opacity = 0.14;
+            cloned.depthWrite = false;
+            cloned.color.copy(baseColor.lerp(dimmedColor, 0.72));
+          }
+        }
+        if ("emissive" in cloned && cloned.emissive) {
+          cloned.emissive.copy(isMatched ? accentColor.clone().multiplyScalar(0.16) : new THREE.Color(0));
+        }
+        if ("roughness" in cloned && !isMatched) cloned.roughness = Math.max(0.88, cloned.roughness ?? 0.88);
+        if ("metalness" in cloned && !isMatched) cloned.metalness = Math.min(0.02, cloned.metalness ?? 0.02);
+        cloned.needsUpdate = true;
+        return cloned;
+      });
+      mesh.material = Array.isArray(mesh.material) ? nextMaterials : nextMaterials[0];
+    });
+    this.optimizedMapping.forEach((mappings, originalUuid) => {
+      const isMatched = resultSet.has(originalUuid);
+      mappings.forEach((mapping) => {
+        const key = `${mapping.mesh.uuid}:${mapping.instanceId}`;
+        this.locateDimmedInstances.set(key, {
+          mesh: mapping.mesh,
+          instanceId: mapping.instanceId,
+          originalColor: mapping.originalColor
+        });
+        const sourceColor = new THREE.Color(mapping.originalColor);
+        mapping.mesh.setColorAt(
+          mapping.instanceId,
+          isMatched ? sourceColor.lerp(accentColor, 0.82) : sourceColor.lerp(dimmedColor, 0.82)
+        );
+        if (mapping.mesh.instanceColor) mapping.mesh.instanceColor.needsUpdate = true;
+      });
+    });
+    this.updateLocateFocusHighlight(this.locateFocusUuid);
+  }
+  setLocateFocus(uuid) {
+    if (!uuid) {
+      this.clearLocateFocus();
+      return;
+    }
+    this.setLocateResultSet([uuid], uuid);
+  }
   highlightObjects(uuids) {
     const target = new Set(uuids.filter(Boolean));
     const restoreOne = (id) => {
@@ -2571,27 +3023,13 @@ class SceneManager {
     for (const id of target) addObjectBounds(id);
     if (!union.isEmpty()) {
       this.selectionBox.box.copy(union);
-      this.selectionBox.visible = false;
+      this.selectionBox.visible = !!this.settings.highlightShowBox;
     }
     const focusId = this.lastSelectedUuid;
     if (!focusId) return;
     const focusMappings = this.optimizedMapping.get(focusId);
     if (focusMappings && focusMappings.length > 0) {
-      const m = focusMappings[0];
-      if (m.geometry) {
-        this.highlightMesh.geometry = m.geometry;
-        const matrix = new THREE.Matrix4();
-        m.mesh.getMatrixAt(m.instanceId, matrix);
-        matrix.premultiply(m.mesh.matrixWorld);
-        const worldPos = new THREE.Vector3();
-        const worldQuat = new THREE.Quaternion();
-        const worldScale = new THREE.Vector3();
-        matrix.decompose(worldPos, worldQuat, worldScale);
-        this.highlightMesh.position.copy(worldPos);
-        this.highlightMesh.quaternion.copy(worldQuat);
-        this.highlightMesh.scale.copy(worldScale);
-        this.highlightMesh.visible = true;
-      }
+      this.highlightMesh.visible = false;
       return;
     }
     const focusObj = this.contentGroup.getObjectByProperty("uuid", focusId);
@@ -2603,6 +3041,7 @@ class SceneManager {
       const worldQuat = new THREE.Quaternion();
       const worldScale = new THREE.Vector3();
       focusObj.matrixWorld.decompose(worldPos, worldQuat, worldScale);
+      worldScale.multiplyScalar(1.035);
       this.highlightMesh.position.copy(worldPos);
       this.highlightMesh.quaternion.copy(worldQuat);
       this.highlightMesh.scale.copy(worldScale);
@@ -2796,7 +3235,7 @@ class SceneManager {
     const size = box.getSize(new THREE.Vector3());
     const maxDim = Math.max(size.x, size.y, size.z);
     const extent = maxDim > 0 ? maxDim : 100;
-    const padding = 1.2;
+    const padding = 1.02;
     const w = this.canvas.clientWidth;
     const h = this.canvas.clientHeight;
     const aspect = w / h;
@@ -2850,8 +3289,37 @@ class SceneManager {
       const dist = this.camera.position.distanceTo(this.controls.target);
       const targetPosition = center.clone().add(direction.multiplyScalar(-dist));
       const targetLookAt = center.clone();
+      const paddingForOrientationFit = 1.01;
+      const camRight = new THREE.Vector3(1, 0, 0).applyQuaternion(this.camera.quaternion);
+      const camUp = new THREE.Vector3(0, 1, 0).applyQuaternion(this.camera.quaternion);
+      const halfBaseWidth = Math.max(1e-6, (this.camera.right - this.camera.left) * 0.5);
+      const halfBaseHeight = Math.max(1e-6, (this.camera.top - this.camera.bottom) * 0.5);
+      const corners = [
+        new THREE.Vector3(box.min.x, box.min.y, box.min.z),
+        new THREE.Vector3(box.min.x, box.min.y, box.max.z),
+        new THREE.Vector3(box.min.x, box.max.y, box.min.z),
+        new THREE.Vector3(box.min.x, box.max.y, box.max.z),
+        new THREE.Vector3(box.max.x, box.min.y, box.min.z),
+        new THREE.Vector3(box.max.x, box.min.y, box.max.z),
+        new THREE.Vector3(box.max.x, box.max.y, box.min.z),
+        new THREE.Vector3(box.max.x, box.max.y, box.max.z)
+      ];
+      let maxProjX = 0;
+      let maxProjY = 0;
+      for (let i = 0; i < corners.length; i++) {
+        const delta = corners[i].clone().sub(center);
+        maxProjX = Math.max(maxProjX, Math.abs(delta.dot(camRight)));
+        maxProjY = Math.max(maxProjY, Math.abs(delta.dot(camUp)));
+      }
+      const safeHalfX = Math.max(1e-3, maxProjX * paddingForOrientationFit);
+      const safeHalfY = Math.max(1e-3, maxProjY * paddingForOrientationFit);
+      const targetZoom2 = Math.max(
+        1e-4,
+        Math.min(1e6, Math.min(halfBaseWidth / safeHalfX, halfBaseHeight / safeHalfY))
+      );
       const startPosition = this.camera.position.clone();
       const startTarget = this.controls.target.clone();
+      const startZoom = this.camera.zoom;
       const startTime = performance.now();
       const duration = 600;
       const animate = () => {
@@ -2861,10 +3329,7 @@ class SceneManager {
         this.camera.position.lerpVectors(startPosition, targetPosition, eased);
         this.controls.target.lerpVectors(startTarget, targetLookAt, eased);
         this.camera.lookAt(this.controls.target);
-        this.camera.left = this.camera.left + (targetLeft - this.camera.left) * eased;
-        this.camera.right = this.camera.right + (targetRight - this.camera.right) * eased;
-        this.camera.top = this.camera.top + (targetTop - this.camera.top) * eased;
-        this.camera.bottom = this.camera.bottom + (targetBottom - this.camera.bottom) * eased;
+        this.camera.zoom = startZoom + (targetZoom2 - startZoom) * eased;
         this.camera.updateProjectionMatrix();
         this.controls.update();
         if (progress < 1) {
@@ -3585,7 +4050,7 @@ class SceneManager {
       const mat = new THREE.MeshBasicMaterial({
         color: colors[i],
         transparent: true,
-        opacity: 0.3,
+        opacity: this.clipHelperOpacity,
         side: THREE.DoubleSide,
         depthWrite: false,
         polygonOffset: true,
@@ -3600,7 +4065,7 @@ class SceneManager {
       const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({
         color: colors[i],
         transparent: true,
-        opacity: 0.3,
+        opacity: Math.min(1, this.clipHelperOpacity + 0.08),
         depthWrite: false
       }));
       line.visible = false;
@@ -3608,6 +4073,31 @@ class SceneManager {
       mesh.add(line);
       this.clipPlaneHelpers.push(mesh);
       this.clipHelpersGroup.add(mesh);
+    }
+  }
+  setClipHelperOptions(options) {
+    if (typeof options.visible === "boolean") {
+      this.clipHelperVisible = options.visible;
+    }
+    if (typeof options.opacity === "number" && !Number.isNaN(options.opacity)) {
+      this.clipHelperOpacity = THREE.MathUtils.clamp(options.opacity, 0.05, 0.35);
+    }
+    this.clipPlaneHelpers.forEach((helper) => {
+      const surfaceMat = helper.material;
+      surfaceMat.opacity = this.clipHelperOpacity;
+      surfaceMat.needsUpdate = true;
+      helper.children.forEach((child) => {
+        const lineMat = child.material;
+        if (lineMat) {
+          lineMat.opacity = Math.min(1, this.clipHelperOpacity + 0.08);
+          lineMat.needsUpdate = true;
+        }
+      });
+    });
+    if (!this.clipHelperVisible || this.renderer.clippingPlanes.length === 0) {
+      this.clipPlaneHelpers.forEach((helper) => {
+        helper.visible = false;
+      });
     }
   }
   setClippingEnabled(enabled) {
@@ -3667,7 +4157,7 @@ class SceneManager {
   updatePlaneHelper(idx, normal, dist, center, size, isEnabled) {
     const helper = this.clipPlaneHelpers[idx];
     if (!helper) return;
-    helper.visible = isEnabled;
+    helper.visible = isEnabled && this.clipHelperVisible;
     helper.scale.set(size, size, 1);
     const pos = new THREE.Vector3(center.x, center.y, center.z);
     const epsilon = 1e-3;
@@ -3735,7 +4225,44 @@ class SceneManager {
     };
   }
   dispose() {
+    this.disposed = true;
+    this.cancelDeferredStructureBuild();
+    if (this.animationFrameId !== null) {
+      cancelAnimationFrame(this.animationFrameId);
+      this.animationFrameId = null;
+    }
     if (this.logicTimer) clearInterval(this.logicTimer);
+    for (const worker of this.workers) {
+      try {
+        worker.terminate();
+      } catch (error) {
+        console.warn("Worker terminate failed:", error);
+      }
+    }
+    this.workers = [];
+    if (this.workerQueue.length > 0) {
+      const pending = this.workerQueue.splice(0, this.workerQueue.length);
+      pending.forEach((task) => task.reject(new Error("SceneManager disposed")));
+    }
+    this.activeWorkerCount = 0;
+    this.processingChunks.clear();
+    this.cancelledChunkIds.clear();
+    this.highlightedUuids.clear();
+    this.locateResultSet.clear();
+    this.fastPreviewModels.clear();
+    this.clearChunkCache();
+    this.controls.dispose();
+    if (this.selectionBox.geometry) this.selectionBox.geometry.dispose();
+    const selectionMat = this.selectionBox.material;
+    (Array.isArray(selectionMat) ? selectionMat : [selectionMat]).forEach((m) => m?.dispose?.());
+    if (this.highlightMesh.geometry) this.highlightMesh.geometry.dispose();
+    const highlightMat = this.highlightMesh.material;
+    (Array.isArray(highlightMat) ? highlightMat : [highlightMat]).forEach((m) => m?.dispose?.());
+    if (this.tempMarker.geometry) this.tempMarker.geometry.dispose();
+    const tempMarkerMat = this.tempMarker.material;
+    (Array.isArray(tempMarkerMat) ? tempMarkerMat : [tempMarkerMat]).forEach((m) => m?.dispose?.());
+    this.dotTexture.dispose();
+    this.sharedMaterial.dispose();
     this.renderer.dispose();
     if (this.tilesRenderer) this.tilesRenderer.dispose();
   }
@@ -3827,9 +4354,9 @@ async function createGltfLoaderRuntime(manager, libPath) {
     { KTX2Loader },
     { MeshoptDecoder }
   ] = await Promise.all([
-    import('./loaders-MBHA5ASo.js').then(n => n.a),
-    import('./loaders-MBHA5ASo.js').then(n => n.D),
-    import('./loaders-MBHA5ASo.js').then(n => n.K),
+    import('./loaders-TXHpcosE.js').then(n => n.a),
+    import('./loaders-TXHpcosE.js').then(n => n.D),
+    import('./loaders-TXHpcosE.js').then(n => n.K),
     import('./meshopt_decoder.module-C_9D6xwu.js')
   ]);
   const normalizedLibPath = normalizeLibPath(libPath);
@@ -3903,7 +4430,7 @@ async function loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t,
       }
     }
     if (ext === "fbx") {
-      const { FBXLoader } = await import('./loaders-MBHA5ASo.js').then(n => n.F);
+      const { FBXLoader } = await import('./loaders-TXHpcosE.js').then(n => n.F);
       const loader = new FBXLoader(manager);
       reportStage("parse", 0);
       return await new Promise((resolve, reject) => {
@@ -3919,14 +4446,14 @@ async function loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t,
       });
     }
     if (ext === "ifc") {
-      const { loadIFC } = await import('./IFCLoader-COOPlyDB.js');
+      const { loadIFC } = await import('./IFCLoader-ChC57y1X.js');
       reportStage("parse", 0);
-      return await loadIFC(typeof fileOrUrl === "string" ? url : fileOrUrl, (p, msg) => reportStage("parse", p, msg), t, libPath);
+      return await loadIFC(typeof fileOrUrl === "string" ? url : fileOrUrl, (p, msg) => reportStage("parse", p, msg), t, libPath, settings);
     }
     if (ext === "obj") {
       const [{ OBJLoader }, { MTLLoader }] = await Promise.all([
-        import('./loaders-MBHA5ASo.js').then(n => n.b),
-        import('./loaders-MBHA5ASo.js').then(n => n.M)
+        import('./loaders-TXHpcosE.js').then(n => n.b),
+        import('./loaders-TXHpcosE.js').then(n => n.M)
       ]);
       const objLoader = new OBJLoader(manager);
       const mtlName = url.replace(/\.[^.]+$/i, ".mtl");
@@ -3949,7 +4476,7 @@ async function loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t,
       });
     }
     if (ext === "stl") {
-      const { STLLoader } = await import('./loaders-MBHA5ASo.js').then(n => n.S);
+      const { STLLoader } = await import('./loaders-TXHpcosE.js').then(n => n.S);
       const loader = new STLLoader(manager);
       reportStage("parse", 0);
       const geometry = await loader.loadAsync(url, (e) => {
@@ -3958,7 +4485,7 @@ async function loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t,
       return new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color: 8947848 }));
     }
     if (ext === "ply") {
-      const { PLYLoader } = await import('./loaders-MBHA5ASo.js').then(n => n.P);
+      const { PLYLoader } = await import('./loaders-TXHpcosE.js').then(n => n.P);
       const loader = new PLYLoader(manager);
       reportStage("parse", 0);
       const geometry = await loader.loadAsync(url, (e) => {
@@ -3970,7 +4497,7 @@ async function loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t,
       }));
     }
     if (ext === "3mf") {
-      const { ThreeMFLoader } = await import('./loaders-MBHA5ASo.js').then(n => n._);
+      const { ThreeMFLoader } = await import('./loaders-TXHpcosE.js').then(n => n._);
       const loader = new ThreeMFLoader(manager);
       reportStage("parse", 0);
       return await loader.loadAsync(url, (e) => {
@@ -3981,7 +4508,7 @@ async function loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t,
       reportStage("fetch", 0);
       const buffer = typeof fileOrUrl === "string" ? await fetch(url).then((r) => r.arrayBuffer()) : await fileOrUrl.arrayBuffer();
       const wasmUrl = `${libPath}/occt-import-js/occt-import-js.wasm`;
-      const { OCCTLoader } = await import('./OCCTLoader-CEso80J0.js');
+      const { OCCTLoader } = await import('./OCCTLoader-CiM09x_z.js');
       const loader = new OCCTLoader(wasmUrl);
       reportStage("parse", 0);
       return await loader.load(buffer, t, (p, msg) => reportStage("parse", p, msg));
@@ -4184,6 +4711,27 @@ const resources = {
     no_measurements: "No measurements",
     search_nodes: "Search nodes...",
     search_props: "Search properties...",
+    copy_all_props: "Copy All",
+    copy_group_props: "Copy Group",
+    prop_groups: "Groups",
+    prop_items: "Items",
+    about_version: "Version",
+    ifc_view_normalized: "Normalized",
+    ifc_view_raw: "Raw IFC",
+    ifc_filter_storey: "All Storeys",
+    ifc_filter_elevation: "All Elevations",
+    ifc_filter_system: "All Systems",
+    ifc_filter_category: "All Categories",
+    ifc_filter_material: "All Materials",
+    ifc_filter_clear: "Clear Filters",
+    ifc_filter_apply_viewport: "Apply To Viewport",
+    ifc_filter_applied: "IFC filter isolated",
+    no_matching_ifc_filter: "No components match the current IFC filter",
+    ifc_workset_current: "Current Storey",
+    ifc_workset_adjacent: "Adjacent Storeys",
+    ifc_workset_applied: "Storey workset isolated",
+    ifc_grid_diagnostics: "Grid Diagnostics",
+    ifc_grid_visible: "IFC Grid",
     expand_all: "Expand All",
     collapse_all: "Collapse All",
     isolate_selection: "Isolate Selection",
@@ -4253,6 +4801,9 @@ const resources = {
     clip_x: "X Axis",
     clip_y: "Y Axis",
     clip_z: "Z Axis",
+    clip_helper_visible: "Show Helpers",
+    clip_helper_opacity: "Helper Opacity",
+    clip_reset: "Reset Range",
     // 导出
     export_title: "Export Scene",
     export_format: "Format",
@@ -4298,11 +4849,17 @@ const resources = {
     tb_pick: "Pick",
     tb_measure: "Measure",
     tb_clip: "Clip",
+    tb_screenshot: "Shot",
     tb_settings: "Setting",
     tb_about: "About",
     tb_sun: "Sun",
+    tb_explode: "Explode",
     st_monitor: "Performance Panel",
     st_adaptive_quality: "Adaptive Quality",
+    st_performance_profile: "Performance Profile",
+    st_perf_smooth: "Smooth",
+    st_perf_balanced: "Balanced",
+    st_perf_quality: "Quality",
     st_exposure: "Exposure",
     st_tonemapping: "Tone Mapping",
     st_shadow_quality: "Shadow Quality",
@@ -4314,6 +4871,9 @@ const resources = {
     st_viewport: "Viewport",
     st_viewcube_size: "ViewCube Size",
     st_frustum_culling: "Frustum Culling",
+    st_highlight: "Highlight",
+    st_highlight_color: "Highlight Color",
+    st_highlight_box: "Show Bounding Box",
     unsupported_format: "Unsupported format",
     theme_dark: "Dark",
     theme_light: "Light",
@@ -4346,11 +4906,39 @@ const resources = {
     viewpoint_save: "Save Current Viewpoint",
     viewpoint_empty: "No saved viewpoints",
     viewpoint_loading: "Restoring viewpoint",
+    viewpoint_load: "Restore",
+    viewpoint_overwrite: "Overwrite",
+    viewpoint_no_preview: "No preview",
     chunk_loading: "Chunks",
     select_all: "Select All",
     invert_selection: "Invert Selection",
     set_opacity: "Opacity",
-    copied: "Copied"
+    copied: "Copied",
+    search_results: "Results",
+    locate_in_view: "Locate in View",
+    locate_first_match: "Locate First Match",
+    ifc_locator_all: "All",
+    ifc_locator_name: "Name",
+    ifc_locator_globalid: "GlobalId",
+    ifc_locator_classification: "Classification",
+    ifc_locator_type: "Type",
+    ifc_locator_placeholder: "Locate by IFC identifier...",
+    ifc_locator_results: "IFC Matches",
+    ifc_locator_prev: "Previous",
+    ifc_locator_next: "Next",
+    ifc_locator_action: "Locate Element",
+    explode_title: "Explode View",
+    explode_enable: "Enable",
+    explode_strength: "Strength",
+    explode_mode: "Mode",
+    explode_mode_radial: "Radial",
+    explode_mode_horizontal: "Horizontal",
+    explode_mode_vertical: "Vertical",
+    explode_reset: "Reset",
+    op_screenshot_transparent: "Transparent Screenshot",
+    screenshot_mode: "Capture Mode",
+    screenshot_scene_desc: "Export PNG with the current scene background",
+    screenshot_transparent_desc: "Export transparent PNG for documents and overlays"
   },
   zh: {
     home: "首页",
@@ -4401,6 +4989,27 @@ const resources = {
     no_measurements: "无测量结果",
     search_nodes: "搜索节点...",
     search_props: "搜索属性...",
+    copy_all_props: "复制全部",
+    copy_group_props: "复制组",
+    prop_groups: "分组",
+    prop_items: "条目",
+    about_version: "版本",
+    ifc_view_normalized: "规范化",
+    ifc_view_raw: "原始 IFC",
+    ifc_filter_storey: "全部楼层",
+    ifc_filter_elevation: "全部标高",
+    ifc_filter_system: "全部系统",
+    ifc_filter_category: "全部类别",
+    ifc_filter_material: "全部材质",
+    ifc_filter_clear: "清除筛选",
+    ifc_filter_apply_viewport: "应用到视口",
+    ifc_filter_applied: "已按 IFC 筛选隔离显示",
+    no_matching_ifc_filter: "没有匹配当前 IFC 筛选的构件",
+    ifc_workset_current: "当前楼层",
+    ifc_workset_adjacent: "上下楼层",
+    ifc_workset_applied: "已按楼层工作集隔离显示",
+    ifc_grid_diagnostics: "轴网诊断",
+    ifc_grid_visible: "IFC 轴网",
     expand_all: "全部展开",
     collapse_all: "全部折叠",
     isolate_selection: "隔离选择",
@@ -4469,6 +5078,9 @@ const resources = {
     clip_x: "X 轴",
     clip_y: "Y 轴",
     clip_z: "Z 轴",
+    clip_helper_visible: "显示辅助面",
+    clip_helper_opacity: "辅助面透明度",
+    clip_reset: "重置范围",
     // 导出
     export_title: "导出场景",
     export_format: "导出格式",
@@ -4514,11 +5126,17 @@ const resources = {
     tb_pick: "选择",
     tb_measure: "测量",
     tb_clip: "剖切",
+    tb_screenshot: "截图",
     tb_settings: "设置",
     tb_about: "关于",
     tb_sun: "光照",
+    tb_explode: "爆炸",
     st_monitor: "性能面板",
     st_adaptive_quality: "自适应画质",
+    st_performance_profile: "性能策略",
+    st_perf_smooth: "流畅优先",
+    st_perf_balanced: "平衡",
+    st_perf_quality: "画质优先",
     st_exposure: "曝光",
     st_tonemapping: "色调映射",
     st_shadow_quality: "阴影质量",
@@ -4530,6 +5148,9 @@ const resources = {
     st_viewport: "视口设置",
     st_viewcube_size: "导航方块大小",
     st_frustum_culling: "视锥体剔除",
+    st_highlight: "高亮设置",
+    st_highlight_color: "高亮颜色",
+    st_highlight_box: "显示包围盒",
     unsupported_format: "不支持的文件格式",
     theme_dark: "深色模式",
     theme_light: "浅色模式",
@@ -4562,33 +5183,43 @@ const resources = {
     viewpoint_save: "保存当前视点",
     viewpoint_empty: "暂无保存的视点",
     viewpoint_loading: "恢复视点",
+    viewpoint_load: "恢复",
+    viewpoint_overwrite: "覆盖",
+    viewpoint_no_preview: "无预览",
     chunk_loading: "分片加载",
     select_all: "全选",
     invert_selection: "反选",
     set_opacity: "透明度",
-    copied: "已复制"
+    copied: "已复制",
+    search_results: "结果数",
+    locate_in_view: "定位到视图",
+    locate_first_match: "定位首个匹配",
+    ifc_locator_all: "综合",
+    ifc_locator_name: "名称",
+    ifc_locator_globalid: "GlobalId",
+    ifc_locator_classification: "分类编码",
+    ifc_locator_type: "类型",
+    ifc_locator_placeholder: "按 IFC 标识定位...",
+    ifc_locator_results: "IFC 结果",
+    ifc_locator_prev: "上一个",
+    ifc_locator_next: "下一个",
+    ifc_locator_action: "定位构件",
+    explode_title: "爆炸图",
+    explode_enable: "启用",
+    explode_strength: "强度",
+    explode_mode: "方向",
+    explode_mode_radial: "四周",
+    explode_mode_horizontal: "横向",
+    explode_mode_vertical: "纵向",
+    explode_reset: "重置",
+    op_screenshot_transparent: "透明背景截图",
+    screenshot_mode: "截图方式",
+    screenshot_scene_desc: "导出带当前场景背景的 PNG 截图",
+    screenshot_transparent_desc: "导出透明背景 PNG，便于报告排版"
   }
 };
 const getTranslation = (lang, key) => {
   return resources[lang][key] || key;
-};
-
-const Button = ({
-  children,
-  variant = "default",
-  active,
-  theme,
-  style,
-  className = "",
-  ...props
-}) => {
-  let btnClass = "ui-btn";
-  if (variant === "primary") btnClass += " ui-btn-primary";
-  else if (variant === "danger") btnClass += " bg-error text-white border-error";
-  else if (variant === "ghost") btnClass += " ui-btn-ghost";
-  else btnClass += " ui-btn-default";
-  if (active) btnClass += " active";
-  return /* @__PURE__ */ jsx("button", { className: `${btnClass} ${className}`, style, ...props, children });
 };
 
 const ImageButton = ({
@@ -4609,371 +5240,6 @@ const ImageButton = ({
       children: [
         /* @__PURE__ */ jsx("div", { className: "flex items-center justify-center w-[18px] h-[18px] overflow-hidden", children: icon }),
         label && /* @__PURE__ */ jsx("div", { className: "text-[10px] leading-none font-medium whitespace-nowrap overflow-hidden text-ellipsis max-w-full mt-[2px]", children: label })
-      ]
-    }
-  );
-};
-
-const Slider = ({
-  min,
-  max,
-  step = 1,
-  value,
-  onChange,
-  theme,
-  disabled = false,
-  style
-}) => {
-  const percentage = (value - min) / (max - min) * 100;
-  const sliderRef = useRef(null);
-  const calcValueFromX = useCallback((clientX) => {
-    if (!sliderRef.current) return value;
-    const rect = sliderRef.current.getBoundingClientRect();
-    const percent = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-    const newValue = min + percent * (max - min);
-    return Math.round(newValue / step) * step;
-  }, [min, max, step, value]);
-  const handleMouseDown = useCallback((e) => {
-    if (disabled) return;
-    e.preventDefault();
-    const targetValue = calcValueFromX(e.clientX);
-    onChange(Math.max(min, Math.min(max, targetValue)));
-    const handleMouseMove = (moveEvent) => {
-      const newValue = calcValueFromX(moveEvent.clientX);
-      onChange(Math.max(min, Math.min(max, newValue)));
-    };
-    const handleMouseUp = () => {
-      document.removeEventListener("mousemove", handleMouseMove);
-      document.removeEventListener("mouseup", handleMouseUp);
-    };
-    document.addEventListener("mousemove", handleMouseMove);
-    document.addEventListener("mouseup", handleMouseUp);
-  }, [calcValueFromX, onChange, min, max, disabled]);
-  return /* @__PURE__ */ jsxs(
-    "div",
-    {
-      ref: sliderRef,
-      className: "ui-slider",
-      style: {
-        opacity: disabled ? 0.5 : 1,
-        width: "100%",
-        minWidth: 0,
-        height: "24px",
-        position: "relative",
-        cursor: disabled ? "not-allowed" : "pointer",
-        display: "flex",
-        alignItems: "center",
-        ...style
-      },
-      onMouseDown: handleMouseDown,
-      children: [
-        /* @__PURE__ */ jsx(
-          "div",
-          {
-            className: "ui-slider-track",
-            style: {
-              position: "absolute",
-              width: "100%",
-              height: "6px",
-              backgroundColor: "var(--border-color)",
-              borderRadius: "3px"
-            }
-          }
-        ),
-        /* @__PURE__ */ jsx(
-          "div",
-          {
-            className: "ui-slider-progress",
-            style: {
-              position: "absolute",
-              width: `${percentage}%`,
-              height: "6px",
-              backgroundColor: "var(--accent)",
-              borderRadius: "3px"
-            }
-          }
-        ),
-        /* @__PURE__ */ jsx(
-          "div",
-          {
-            className: "ui-slider-thumb",
-            style: {
-              left: `${percentage}%`,
-              width: "16px",
-              height: "16px",
-              backgroundColor: "var(--bg-primary)",
-              border: `2px solid var(--accent)`,
-              borderRadius: "50%",
-              cursor: disabled ? "not-allowed" : "default",
-              position: "absolute",
-              transform: "translateX(-50%)",
-              boxShadow: "0 1px 3px rgba(0,0,0,0.3)"
-            }
-          }
-        )
-      ]
-    }
-  );
-};
-
-const DualSlider = ({
-  min,
-  max,
-  value,
-  onChange,
-  theme,
-  disabled = false,
-  style
-}) => {
-  const sliderRef = useRef(null);
-  const percentage1 = (value[0] - min) / (max - min) * 100;
-  const percentage2 = (value[1] - min) / (max - min) * 100;
-  const calcValueFromX = useCallback((clientX) => {
-    if (!sliderRef.current) return min;
-    const rect = sliderRef.current.getBoundingClientRect();
-    const percent = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-    return min + percent * (max - min);
-  }, [min, max]);
-  const handleThumb1MouseDown = useCallback((e) => {
-    if (disabled) return;
-    e.preventDefault();
-    e.stopPropagation();
-    const handleMouseMove = (moveEvent) => {
-      const newValue = calcValueFromX(moveEvent.clientX);
-      onChange([Math.max(min, Math.min(value[1] - 1, Math.round(newValue))), value[1]]);
-    };
-    const handleMouseUp = () => {
-      document.removeEventListener("mousemove", handleMouseMove);
-      document.removeEventListener("mouseup", handleMouseUp);
-    };
-    document.addEventListener("mousemove", handleMouseMove);
-    document.addEventListener("mouseup", handleMouseUp);
-  }, [disabled, calcValueFromX, onChange, min, value]);
-  const handleThumb2MouseDown = useCallback((e) => {
-    if (disabled) return;
-    e.preventDefault();
-    e.stopPropagation();
-    const handleMouseMove = (moveEvent) => {
-      const newValue = calcValueFromX(moveEvent.clientX);
-      onChange([value[0], Math.min(max, Math.max(value[0] + 1, Math.round(newValue)))]);
-    };
-    const handleMouseUp = () => {
-      document.removeEventListener("mousemove", handleMouseMove);
-      document.removeEventListener("mouseup", handleMouseUp);
-    };
-    document.addEventListener("mousemove", handleMouseMove);
-    document.addEventListener("mouseup", handleMouseUp);
-  }, [disabled, calcValueFromX, onChange, max, value]);
-  const handleTrackClick = useCallback((e) => {
-    if (disabled) return;
-    e.preventDefault();
-    e.stopPropagation();
-    const clickValue = calcValueFromX(e.clientX);
-    const dist1 = Math.abs(clickValue - value[0]);
-    const dist2 = Math.abs(clickValue - value[1]);
-    if (dist1 <= dist2) {
-      onChange([Math.max(min, Math.min(value[1] - 1, Math.round(clickValue))), value[1]]);
-    } else {
-      onChange([value[0], Math.min(max, Math.max(value[0] + 1, Math.round(clickValue)))]);
-    }
-  }, [disabled, calcValueFromX, onChange, min, max, value]);
-  return /* @__PURE__ */ jsxs(
-    "div",
-    {
-      ref: sliderRef,
-      className: "ui-slider",
-      style: {
-        opacity: disabled ? 0.5 : 1,
-        width: "100%",
-        minWidth: 0,
-        height: "24px",
-        position: "relative",
-        cursor: disabled ? "not-allowed" : "pointer",
-        display: "flex",
-        alignItems: "center",
-        ...style
-      },
-      onClick: handleTrackClick,
-      children: [
-        /* @__PURE__ */ jsx(
-          "div",
-          {
-            className: "ui-slider-track",
-            style: {
-              position: "absolute",
-              width: "100%",
-              height: "6px",
-              backgroundColor: "var(--border-color)",
-              borderRadius: "3px"
-            }
-          }
-        ),
-        /* @__PURE__ */ jsx(
-          "div",
-          {
-            className: "ui-slider-progress",
-            style: {
-              position: "absolute",
-              left: `${percentage1}%`,
-              width: `${percentage2 - percentage1}%`,
-              height: "6px",
-              backgroundColor: "var(--accent)",
-              borderRadius: "3px"
-            }
-          }
-        ),
-        /* @__PURE__ */ jsx(
-          "div",
-          {
-            className: "ui-slider-thumb",
-            style: {
-              left: `${percentage1}%`,
-              width: "16px",
-              height: "16px",
-              backgroundColor: "var(--bg-primary)",
-              border: `2px solid var(--accent)`,
-              borderRadius: "50%",
-              cursor: disabled ? "not-allowed" : "default",
-              position: "absolute",
-              transform: "translateX(-50%)",
-              boxShadow: "0 1px 3px rgba(0,0,0,0.3)"
-            },
-            onMouseDown: handleThumb1MouseDown
-          }
-        ),
-        /* @__PURE__ */ jsx(
-          "div",
-          {
-            className: "ui-slider-thumb",
-            style: {
-              left: `${percentage2}%`,
-              width: "16px",
-              height: "16px",
-              backgroundColor: "var(--bg-primary)",
-              border: `2px solid var(--accent)`,
-              borderRadius: "50%",
-              cursor: disabled ? "not-allowed" : "default",
-              position: "absolute",
-              transform: "translateX(-50%)",
-              boxShadow: "0 1px 3px rgba(0,0,0,0.3)"
-            },
-            onMouseDown: handleThumb2MouseDown
-          }
-        )
-      ]
-    }
-  );
-};
-
-const Switch = ({ checked, onChange, disabled = false, className = "" }) => {
-  return /* @__PURE__ */ jsx(
-    "button",
-    {
-      className: `ui-switch ${checked ? "active" : ""} ${disabled ? "disabled" : ""} ${className}`,
-      onClick: () => !disabled && onChange(!checked),
-      role: "switch",
-      "aria-checked": checked,
-      disabled,
-      children: /* @__PURE__ */ jsx("div", { className: "ui-switch-thumb" })
-    }
-  );
-};
-
-const SegmentedControl$1 = ({
-  options,
-  value,
-  onChange,
-  className = ""
-}) => /* @__PURE__ */ jsx("div", { className: `ui-segmented ${className}`, children: options.map((option) => /* @__PURE__ */ jsxs(
-  "button",
-  {
-    className: `ui-segmented-item ${value === option.value ? "active" : ""}`,
-    onClick: () => onChange(option.value),
-    children: [
-      option.icon && /* @__PURE__ */ jsx("span", { children: option.icon }),
-      /* @__PURE__ */ jsx("span", { children: option.label })
-    ]
-  },
-  option.value
-)) });
-
-const Select = ({ value, options, onChange, className = "", style }) => /* @__PURE__ */ jsx(
-  "select",
-  {
-    value,
-    onChange: (e) => onChange(e.target.value),
-    className: `ui-input ${className}`,
-    style: {
-      padding: "4px 28px 4px 8px",
-      appearance: "none",
-      backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23A0A0A0' d='M2 4l4 4 4-4'/%3E%3C/svg%3E")`,
-      backgroundRepeat: "no-repeat",
-      backgroundPosition: "right 8px center",
-      ...style
-    },
-    children: options.map((option) => /* @__PURE__ */ jsx("option", { value: option.value, children: option.label }, option.value))
-  }
-);
-
-const Checkbox = ({
-  label,
-  checked,
-  onChange,
-  disabled = false,
-  style,
-  labelStyle
-}) => {
-  return /* @__PURE__ */ jsxs(
-    "label",
-    {
-      style: {
-        display: "inline-flex",
-        alignItems: "center",
-        gap: "8px",
-        cursor: disabled ? "not-allowed" : "pointer",
-        userSelect: "none",
-        opacity: disabled ? 0.5 : 1,
-        ...style
-      },
-      onClick: (e) => {
-        if (disabled) return;
-        e.preventDefault();
-        onChange(!checked);
-      },
-      children: [
-        /* @__PURE__ */ jsx(
-          "div",
-          {
-            style: {
-              width: "14px",
-              height: "14px",
-              minWidth: "14px",
-              minHeight: "14px",
-              border: "1px solid var(--border-color)",
-              borderRadius: "2px",
-              backgroundColor: checked ? "var(--accent)" : "var(--bg-primary)",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              transition: "none",
-              flexShrink: 0
-            },
-            children: checked && /* @__PURE__ */ jsx(
-              "svg",
-              {
-                viewBox: "0 0 24 24",
-                fill: "none",
-                stroke: "white",
-                strokeWidth: "2",
-                strokeLinecap: "round",
-                strokeLinejoin: "round",
-                style: { width: "10px", height: "10px" },
-                children: /* @__PURE__ */ jsx("polyline", { points: "20 6 9 17 4 12" })
-              }
-            )
-          }
-        ),
-        label && /* @__PURE__ */ jsx("span", { style: { fontSize: "12px", color: "var(--text-primary)", ...labelStyle }, children: label })
       ]
     }
   );
@@ -5000,8 +5266,20 @@ const createIcon = (paths, props = {}) => {
   );
 };
 const IconChevronRight = (props) => createIcon(/* @__PURE__ */ jsx("polyline", { points: "9 18 15 12 9 6" }), props);
+const IconChevronLeft = (props) => createIcon(/* @__PURE__ */ jsx("polyline", { points: "15 18 9 12 15 6" }), props);
 const IconChevronDown = (props) => createIcon(/* @__PURE__ */ jsx("polyline", { points: "6 9 12 15 18 9" }), props);
 const IconChevronUp = (props) => createIcon(/* @__PURE__ */ jsx("polyline", { points: "18 15 12 9 6 15" }), props);
+const IconTarget = (props) => createIcon(
+  /* @__PURE__ */ jsxs(Fragment, { children: [
+    /* @__PURE__ */ jsx("circle", { cx: "12", cy: "12", r: "7" }),
+    /* @__PURE__ */ jsx("circle", { cx: "12", cy: "12", r: "2.5" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "2", x2: "12", y2: "5" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "19", x2: "12", y2: "22" }),
+    /* @__PURE__ */ jsx("line", { x1: "2", y1: "12", x2: "5", y2: "12" }),
+    /* @__PURE__ */ jsx("line", { x1: "19", y1: "12", x2: "22", y2: "12" })
+  ] }),
+  props
+);
 const IconClose = (props) => createIcon(
   /* @__PURE__ */ jsxs(Fragment, { children: [
     /* @__PURE__ */ jsx("line", { x1: "18", y1: "6", x2: "6", y2: "18" }),
@@ -5125,11 +5403,33 @@ const IconGrid = (props) => createIcon(
   ] }),
   props
 );
+const IconImage = (props) => createIcon(
+  /* @__PURE__ */ jsxs(Fragment, { children: [
+    /* @__PURE__ */ jsx("rect", { x: "3", y: "3", width: "18", height: "18", rx: "2", ry: "2" }),
+    /* @__PURE__ */ jsx("circle", { cx: "8.5", cy: "8.5", r: "1.5" }),
+    /* @__PURE__ */ jsx("polyline", { points: "21 15 16 10 5 21" })
+  ] }),
+  props
+);
 const IconLayers = (props) => createIcon(
   /* @__PURE__ */ jsxs(Fragment, { children: [
     /* @__PURE__ */ jsx("polygon", { points: "12 2 2 7 12 12 22 7 12 2" }),
     /* @__PURE__ */ jsx("polyline", { points: "2 12 12 17 22 12" }),
     /* @__PURE__ */ jsx("polyline", { points: "2 17 12 22 22 17" })
+  ] }),
+  props
+);
+const IconExplode = (props) => createIcon(
+  /* @__PURE__ */ jsxs(Fragment, { children: [
+    /* @__PURE__ */ jsx("circle", { cx: "12", cy: "12", r: "2.25" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "2", x2: "12", y2: "6" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "18", x2: "12", y2: "22" }),
+    /* @__PURE__ */ jsx("line", { x1: "2", y1: "12", x2: "6", y2: "12" }),
+    /* @__PURE__ */ jsx("line", { x1: "18", y1: "12", x2: "22", y2: "12" }),
+    /* @__PURE__ */ jsx("line", { x1: "4.9", y1: "4.9", x2: "7.8", y2: "7.8" }),
+    /* @__PURE__ */ jsx("line", { x1: "16.2", y1: "16.2", x2: "19.1", y2: "19.1" }),
+    /* @__PURE__ */ jsx("line", { x1: "4.9", y1: "19.1", x2: "7.8", y2: "16.2" }),
+    /* @__PURE__ */ jsx("line", { x1: "16.2", y1: "7.8", x2: "19.1", y2: "4.9" })
   ] }),
   props
 );
@@ -5286,19 +5586,6 @@ const Toolbar = (props) => {
             onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
             onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
             children: t("op_clear")
-          }
-        ),
-        !isHidden("screenshot") && /* @__PURE__ */ jsx(
-          "div",
-          {
-            style: { padding: "6px 16px", fontSize: "12px", color: theme.text, cursor: "pointer", backgroundColor: "transparent" },
-            onClick: () => {
-              props.handleScreenshot?.();
-              setOpenMenu(null);
-            },
-            onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
-            onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
-            children: t("op_screenshot") || "截图"
           }
         )
       ] }))
@@ -5586,6 +5873,16 @@ const Toolbar = (props) => {
           theme
         }
       ),
+      !isHidden("screenshot") && /* @__PURE__ */ jsx(
+        ImageButton,
+        {
+          icon: /* @__PURE__ */ jsx(IconImage, {}),
+          label: t("tb_screenshot") || "截图",
+          active: props.activeTool === "screenshot",
+          onClick: () => props.openScreenshotPanel?.(),
+          theme
+        }
+      ),
       !isHidden("sun") && /* @__PURE__ */ jsx(
         ImageButton,
         {
@@ -5593,6 +5890,16 @@ const Toolbar = (props) => {
           label: t("tb_sun"),
           active: props.activeTool === "sun",
           onClick: () => props.setActiveTool?.(props.activeTool === "sun" ? "none" : "sun"),
+          theme
+        }
+      ),
+      !isHidden("explode") && /* @__PURE__ */ jsx(
+        ImageButton,
+        {
+          icon: /* @__PURE__ */ jsx(IconExplode, {}),
+          label: t("tb_explode") || "爆炸",
+          active: props.activeTool === "explode",
+          onClick: () => props.setActiveTool?.(props.activeTool === "explode" ? "none" : "explode"),
           theme
         }
       )
@@ -5621,6 +5928,510 @@ const Toolbar = (props) => {
   ] });
 };
 
+const Button = ({
+  children,
+  variant = "default",
+  active,
+  theme,
+  style,
+  className = "",
+  ...props
+}) => {
+  let btnClass = "ui-btn";
+  if (variant === "primary") btnClass += " ui-btn-primary";
+  else if (variant === "danger") btnClass += " bg-error text-white border-error";
+  else if (variant === "ghost") btnClass += " ui-btn-ghost";
+  else btnClass += " ui-btn-default";
+  if (active) btnClass += " active";
+  return /* @__PURE__ */ jsx("button", { className: `${btnClass} ${className}`, style, ...props, children });
+};
+
+const Slider = ({
+  min,
+  max,
+  step = 1,
+  value,
+  onChange,
+  theme,
+  disabled = false,
+  style
+}) => {
+  const percentage = (value - min) / (max - min) * 100;
+  const sliderRef = useRef(null);
+  const calcValueFromX = useCallback((clientX) => {
+    if (!sliderRef.current) return value;
+    const rect = sliderRef.current.getBoundingClientRect();
+    const percent = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    const newValue = min + percent * (max - min);
+    return Math.round(newValue / step) * step;
+  }, [min, max, step, value]);
+  const handleMouseDown = useCallback((e) => {
+    if (disabled) return;
+    e.preventDefault();
+    const targetValue = calcValueFromX(e.clientX);
+    onChange(Math.max(min, Math.min(max, targetValue)));
+    const handleMouseMove = (moveEvent) => {
+      const newValue = calcValueFromX(moveEvent.clientX);
+      onChange(Math.max(min, Math.min(max, newValue)));
+    };
+    const handleMouseUp = () => {
+      document.removeEventListener("mousemove", handleMouseMove);
+      document.removeEventListener("mouseup", handleMouseUp);
+    };
+    document.addEventListener("mousemove", handleMouseMove);
+    document.addEventListener("mouseup", handleMouseUp);
+  }, [calcValueFromX, onChange, min, max, disabled]);
+  return /* @__PURE__ */ jsxs(
+    "div",
+    {
+      ref: sliderRef,
+      className: "ui-slider",
+      style: {
+        opacity: disabled ? 0.5 : 1,
+        width: "100%",
+        minWidth: 0,
+        height: "24px",
+        position: "relative",
+        cursor: disabled ? "not-allowed" : "pointer",
+        display: "flex",
+        alignItems: "center",
+        ...style
+      },
+      onMouseDown: handleMouseDown,
+      children: [
+        /* @__PURE__ */ jsx(
+          "div",
+          {
+            className: "ui-slider-track",
+            style: {
+              position: "absolute",
+              width: "100%",
+              height: "6px",
+              backgroundColor: "var(--border-color)",
+              borderRadius: "3px"
+            }
+          }
+        ),
+        /* @__PURE__ */ jsx(
+          "div",
+          {
+            className: "ui-slider-progress",
+            style: {
+              position: "absolute",
+              width: `${percentage}%`,
+              height: "6px",
+              backgroundColor: "var(--accent)",
+              borderRadius: "3px"
+            }
+          }
+        ),
+        /* @__PURE__ */ jsx(
+          "div",
+          {
+            className: "ui-slider-thumb",
+            style: {
+              left: `${percentage}%`,
+              width: "16px",
+              height: "16px",
+              backgroundColor: "var(--bg-primary)",
+              border: `2px solid var(--accent)`,
+              borderRadius: "50%",
+              cursor: disabled ? "not-allowed" : "default",
+              position: "absolute",
+              transform: "translateX(-50%)",
+              boxShadow: "0 1px 3px rgba(0,0,0,0.3)"
+            }
+          }
+        )
+      ]
+    }
+  );
+};
+
+const DualSlider = ({
+  min,
+  max,
+  value,
+  onChange,
+  theme,
+  disabled = false,
+  style
+}) => {
+  const sliderRef = useRef(null);
+  const percentage1 = (value[0] - min) / (max - min) * 100;
+  const percentage2 = (value[1] - min) / (max - min) * 100;
+  const calcValueFromX = useCallback((clientX) => {
+    if (!sliderRef.current) return min;
+    const rect = sliderRef.current.getBoundingClientRect();
+    const percent = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    return min + percent * (max - min);
+  }, [min, max]);
+  const handleThumb1MouseDown = useCallback((e) => {
+    if (disabled) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const handleMouseMove = (moveEvent) => {
+      const newValue = calcValueFromX(moveEvent.clientX);
+      onChange([Math.max(min, Math.min(value[1] - 1, Math.round(newValue))), value[1]]);
+    };
+    const handleMouseUp = () => {
+      document.removeEventListener("mousemove", handleMouseMove);
+      document.removeEventListener("mouseup", handleMouseUp);
+    };
+    document.addEventListener("mousemove", handleMouseMove);
+    document.addEventListener("mouseup", handleMouseUp);
+  }, [disabled, calcValueFromX, onChange, min, value]);
+  const handleThumb2MouseDown = useCallback((e) => {
+    if (disabled) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const handleMouseMove = (moveEvent) => {
+      const newValue = calcValueFromX(moveEvent.clientX);
+      onChange([value[0], Math.min(max, Math.max(value[0] + 1, Math.round(newValue)))]);
+    };
+    const handleMouseUp = () => {
+      document.removeEventListener("mousemove", handleMouseMove);
+      document.removeEventListener("mouseup", handleMouseUp);
+    };
+    document.addEventListener("mousemove", handleMouseMove);
+    document.addEventListener("mouseup", handleMouseUp);
+  }, [disabled, calcValueFromX, onChange, max, value]);
+  const handleTrackClick = useCallback((e) => {
+    if (disabled) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const clickValue = calcValueFromX(e.clientX);
+    const dist1 = Math.abs(clickValue - value[0]);
+    const dist2 = Math.abs(clickValue - value[1]);
+    if (dist1 <= dist2) {
+      onChange([Math.max(min, Math.min(value[1] - 1, Math.round(clickValue))), value[1]]);
+    } else {
+      onChange([value[0], Math.min(max, Math.max(value[0] + 1, Math.round(clickValue)))]);
+    }
+  }, [disabled, calcValueFromX, onChange, min, max, value]);
+  return /* @__PURE__ */ jsxs(
+    "div",
+    {
+      ref: sliderRef,
+      className: "ui-slider",
+      style: {
+        opacity: disabled ? 0.5 : 1,
+        width: "100%",
+        minWidth: 0,
+        flex: 1,
+        height: "24px",
+        position: "relative",
+        cursor: disabled ? "not-allowed" : "pointer",
+        display: "flex",
+        alignItems: "center",
+        ...style
+      },
+      onClick: handleTrackClick,
+      children: [
+        /* @__PURE__ */ jsx(
+          "div",
+          {
+            className: "ui-slider-track",
+            style: {
+              position: "absolute",
+              width: "100%",
+              height: "6px",
+              backgroundColor: "var(--border-color)",
+              borderRadius: "3px"
+            }
+          }
+        ),
+        /* @__PURE__ */ jsx(
+          "div",
+          {
+            className: "ui-slider-progress",
+            style: {
+              position: "absolute",
+              left: `${percentage1}%`,
+              width: `${percentage2 - percentage1}%`,
+              height: "6px",
+              backgroundColor: "var(--accent)",
+              borderRadius: "3px"
+            }
+          }
+        ),
+        /* @__PURE__ */ jsx(
+          "div",
+          {
+            className: "ui-slider-thumb",
+            style: {
+              left: `${percentage1}%`,
+              width: "16px",
+              height: "16px",
+              backgroundColor: "var(--bg-primary)",
+              border: `2px solid var(--accent)`,
+              borderRadius: "50%",
+              cursor: disabled ? "not-allowed" : "default",
+              position: "absolute",
+              transform: "translateX(-50%)",
+              boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
+              zIndex: 1
+            },
+            onMouseDown: handleThumb1MouseDown
+          }
+        ),
+        /* @__PURE__ */ jsx(
+          "div",
+          {
+            className: "ui-slider-thumb",
+            style: {
+              left: `${percentage2}%`,
+              width: "16px",
+              height: "16px",
+              backgroundColor: "var(--bg-primary)",
+              border: `2px solid var(--accent)`,
+              borderRadius: "50%",
+              cursor: disabled ? "not-allowed" : "default",
+              position: "absolute",
+              transform: "translateX(-50%)",
+              boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
+              zIndex: 1
+            },
+            onMouseDown: handleThumb2MouseDown
+          }
+        )
+      ]
+    }
+  );
+};
+
+const Switch = ({ checked, onChange, disabled = false, className = "" }) => {
+  return /* @__PURE__ */ jsx(
+    "button",
+    {
+      className: `ui-switch ${checked ? "active" : ""} ${disabled ? "disabled" : ""} ${className}`,
+      onClick: () => !disabled && onChange(!checked),
+      role: "switch",
+      "aria-checked": checked,
+      disabled,
+      children: /* @__PURE__ */ jsx("div", { className: "ui-switch-thumb" })
+    }
+  );
+};
+
+const SegmentedControl$1 = ({
+  options,
+  value,
+  onChange,
+  className = ""
+}) => /* @__PURE__ */ jsx("div", { className: `ui-segmented ${className}`, children: options.map((option) => /* @__PURE__ */ jsxs(
+  "button",
+  {
+    className: `ui-segmented-item ${value === option.value ? "active" : ""}`,
+    onClick: () => onChange(option.value),
+    children: [
+      option.icon && /* @__PURE__ */ jsx("span", { children: option.icon }),
+      /* @__PURE__ */ jsx("span", { children: option.label })
+    ]
+  },
+  option.value
+)) });
+
+const ColorPicker = ({ value, onChange, style }) => /* @__PURE__ */ jsxs("div", { className: "flex items-center gap-2", style, children: [
+  /* @__PURE__ */ jsx(
+    "input",
+    {
+      type: "color",
+      value,
+      onChange: (e) => onChange(e.target.value),
+      style: {
+        width: "28px",
+        height: "28px",
+        padding: 0,
+        border: "1px solid var(--border-color)",
+        borderRadius: "4px",
+        cursor: "pointer",
+        backgroundColor: "transparent"
+      }
+    }
+  ),
+  /* @__PURE__ */ jsx(
+    "span",
+    {
+      style: {
+        fontSize: "11px",
+        color: "var(--text-secondary)"
+      },
+      children: value
+    }
+  )
+] });
+
+const Select = ({ value, options, onChange, className = "", style }) => /* @__PURE__ */ jsx(
+  "select",
+  {
+    value,
+    onChange: (e) => onChange(e.target.value),
+    className: `ui-input ${className}`,
+    style: {
+      padding: "4px 28px 4px 8px",
+      appearance: "none",
+      backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23A0A0A0' d='M2 4l4 4 4-4'/%3E%3C/svg%3E")`,
+      backgroundRepeat: "no-repeat",
+      backgroundPosition: "right 8px center",
+      ...style
+    },
+    children: options.map((option) => /* @__PURE__ */ jsx("option", { value: option.value, children: option.label }, option.value))
+  }
+);
+
+const Checkbox = ({
+  label,
+  checked,
+  onChange,
+  disabled = false,
+  style,
+  labelStyle
+}) => {
+  return /* @__PURE__ */ jsxs(
+    "label",
+    {
+      style: {
+        display: "inline-flex",
+        alignItems: "center",
+        gap: "8px",
+        cursor: disabled ? "not-allowed" : "pointer",
+        userSelect: "none",
+        opacity: disabled ? 0.5 : 1,
+        ...style
+      },
+      onClick: (e) => {
+        if (disabled) return;
+        e.preventDefault();
+        onChange(!checked);
+      },
+      children: [
+        /* @__PURE__ */ jsx(
+          "div",
+          {
+            style: {
+              width: "14px",
+              height: "14px",
+              minWidth: "14px",
+              minHeight: "14px",
+              border: "1px solid var(--border-color)",
+              borderRadius: "2px",
+              backgroundColor: checked ? "var(--accent)" : "var(--bg-primary)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              transition: "none",
+              flexShrink: 0
+            },
+            children: checked && /* @__PURE__ */ jsx(
+              "svg",
+              {
+                viewBox: "0 0 24 24",
+                fill: "none",
+                stroke: "white",
+                strokeWidth: "2",
+                strokeLinecap: "round",
+                strokeLinejoin: "round",
+                style: { width: "10px", height: "10px" },
+                children: /* @__PURE__ */ jsx("polyline", { points: "20 6 9 17 4 12" })
+              }
+            )
+          }
+        ),
+        label && /* @__PURE__ */ jsx("span", { style: { fontSize: "12px", color: "var(--text-primary)", ...labelStyle }, children: label })
+      ]
+    }
+  );
+};
+
+const ContextMenu = ({ x, y, items, onClose, theme }) => {
+  const menuRef = useRef(null);
+  useEffect(() => {
+    const handleClickOutside = (e) => {
+      if (menuRef.current && !menuRef.current.contains(e.target)) {
+        onClose();
+      }
+    };
+    const handleEscape = (e) => {
+      if (e.key === "Escape") {
+        onClose();
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    document.addEventListener("keydown", handleEscape);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("keydown", handleEscape);
+    };
+  }, [onClose]);
+  return /* @__PURE__ */ jsx(
+    "div",
+    {
+      ref: menuRef,
+      className: "ui-context-menu",
+      style: { left: x, top: y },
+      children: items.map((item, index) => {
+        if (item.divider) {
+          return /* @__PURE__ */ jsx(
+            "div",
+            {
+              className: "ui-context-menu-divider"
+            },
+            index
+          );
+        }
+        if (item.slider) {
+          return /* @__PURE__ */ jsxs("div", { className: "ui-context-menu-item", style: { display: "flex", flexDirection: "column", gap: "4px", cursor: "default" }, children: [
+            /* @__PURE__ */ jsxs("div", { style: { display: "flex", justifyContent: "space-between", fontSize: "12px" }, children: [
+              /* @__PURE__ */ jsx("span", { children: item.label }),
+              /* @__PURE__ */ jsxs("span", { children: [
+                Math.round((item.value || 0) * 100),
+                "%"
+              ] })
+            ] }),
+            /* @__PURE__ */ jsx(
+              "input",
+              {
+                type: "range",
+                min: "0",
+                max: "1",
+                step: "0.01",
+                value: item.value || 0,
+                onChange: (e) => item.onChange?.(parseFloat(e.target.value)),
+                style: { width: "100%", cursor: "pointer" }
+              }
+            )
+          ] }, index);
+        }
+        return /* @__PURE__ */ jsx(
+          "div",
+          {
+            onClick: () => {
+              if (!item.disabled && item.onClick) {
+                item.onClick();
+                onClose();
+              }
+            },
+            className: `ui-context-menu-item ${item.disabled ? "disabled" : ""}`,
+            children: item.label
+          },
+          index
+        );
+      })
+    }
+  );
+};
+
+const INVALID_LABELS = /* @__PURE__ */ new Set(["", "n/a", "na", "undefined", "null", "-", "--"]);
+const sanitizeTreeLabel = (...candidates) => {
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+    const trimmed = candidate.trim();
+    if (INVALID_LABELS.has(trimmed.toLowerCase())) continue;
+    return trimmed;
+  }
+  return "";
+};
 const flattenTree = (nodes, result = [], parentIsLast = []) => {
   if (!nodes) return result;
   for (let i = 0; i < nodes.length; i++) {
@@ -5634,229 +6445,737 @@ const flattenTree = (nodes, result = [], parentIsLast = []) => {
   }
   return result;
 };
+const collectExpandedState = (nodes) => {
+  const map = /* @__PURE__ */ new Map();
+  const walk = (list) => {
+    list.forEach((node) => {
+      map.set(node.uuid, node.expanded);
+      if (node.children.length > 0) walk(node.children);
+    });
+  };
+  walk(nodes);
+  return map;
+};
+const applyExpandedState = (nodes, expandedMap) => nodes.map((node) => ({
+  ...node,
+  expanded: expandedMap.get(node.uuid) ?? node.expanded,
+  children: applyExpandedState(node.children, expandedMap)
+}));
+const getRawChildren = (node) => {
+  const children = node?.object?.children ?? node?.children;
+  return Array.isArray(children) ? children : [];
+};
+const createTreeNodeFromRaw = (rawNode, depth, isFileNode = false) => {
+  const rawChildren = Array.isArray(rawNode?.children) ? rawNode.children : [];
+  const fallbackName = rawNode?.type === "Mesh" ? `Mesh_${rawNode?.id ?? "?"}` : `Group_${rawNode?.id ?? "?"}`;
+  return {
+    uuid: rawNode?.id ?? rawNode?.uuid ?? String(Math.random()),
+    name: sanitizeTreeLabel(rawNode?.name, rawNode?.userData?.name) || fallbackName,
+    type: rawNode?.type === "Mesh" ? "MESH" : "GROUP",
+    depth,
+    children: [],
+    expanded: false,
+    visible: rawNode?.visible !== false,
+    object: rawNode,
+    isFileNode,
+    hasChildren: rawChildren.length > 0,
+    childrenLoaded: false
+  };
+};
+const ensureNodeChildrenLoaded = (node) => {
+  if (node.childrenLoaded || !node.hasChildren) return node;
+  return {
+    ...node,
+    childrenLoaded: true,
+    children: getRawChildren(node).map((child) => createTreeNodeFromRaw(child, node.depth + 1))
+  };
+};
+const getNodeSearchText = (node) => {
+  const source = node?.object ?? node;
+  const meta = source?.userData?.ifcMetadata || {};
+  return [
+    source?.name,
+    source?.type,
+    source?.bimId,
+    source?.userData?.bimId,
+    source?.userData?.expressID,
+    meta.storey,
+    meta.category,
+    meta.typeName,
+    meta.globalId,
+    ...meta.systems || [],
+    ...meta.materials || [],
+    ...meta.classifications || []
+  ].filter(Boolean).join(" ").toLowerCase();
+};
+const rawTreeContainsUuid = (rawNode, targetUuid) => {
+  if (!rawNode) return false;
+  if (rawNode.id === targetUuid || rawNode.uuid === targetUuid) return true;
+  const children = Array.isArray(rawNode.children) ? rawNode.children : [];
+  return children.some((child) => rawTreeContainsUuid(child, targetUuid));
+};
+const getNodeLocatorText = (node, mode) => {
+  const source = node?.object ?? node;
+  const meta = source?.userData?.ifcMetadata || {};
+  const valuesByMode = {
+    all: [
+      source?.name,
+      meta.globalId,
+      meta.typeName,
+      meta.category,
+      ...meta.classifications || []
+    ],
+    name: [source?.name],
+    globalId: [meta.globalId],
+    classification: meta.classifications || [],
+    typeName: [meta.typeName, meta.category]
+  };
+  return valuesByMode[mode].filter((value) => value !== void 0 && value !== null && value !== "").join(" ").toLowerCase();
+};
 const SceneTree = ({
   t,
   treeRoot,
   setTreeRoot,
   selectedUuid,
+  locatedUuid,
+  selectedStorey,
   onSelect,
   onToggleVisibility,
   onDelete,
-  onFocus
+  onFocus,
+  onIsolate,
+  onHide,
+  onShowAll,
+  onApplyIfcFiltersToViewport,
+  onApplyStoreyWorkset,
+  onLocate,
+  onClearLocate,
+  onLocateResultsChange,
+  locateResultUuids = []
 }) => {
   const [searchQuery, setSearchQuery] = useState("");
-  const [hoveredUuid, setHoveredUuid] = useState(null);
+  const [locatorMode, setLocatorMode] = useState("all");
+  const [locatorQuery, setLocatorQuery] = useState("");
+  const [locatorIndex, setLocatorIndex] = useState(0);
+  const [filters, setFilters] = useState({
+    storey: "",
+    elevation: "",
+    system: "",
+    category: "",
+    material: ""
+  });
   const [contextMenu, setContextMenu] = useState(null);
-  const [menuHover, setMenuHover] = useState(null);
-  const expandAll = () => {
-    const expand = (nodes) => {
-      return nodes.map((n) => ({
-        ...n,
-        expanded: n.children.length > 0,
-        children: expand(n.children)
-      }));
+  const [scrollTop, setScrollTop] = useState(0);
+  const [containerHeight, setContainerHeight] = useState(400);
+  const containerRef = useRef(null);
+  const searchExpandedStateRef = useRef(null);
+  const previousSearchQueryRef = useRef("");
+  const lastLocateResultsRef = useRef([]);
+  const collectIfcOptions = (nodes) => {
+    const storeys = /* @__PURE__ */ new Set();
+    const systems = /* @__PURE__ */ new Set();
+    const categories = /* @__PURE__ */ new Set();
+    const materials = /* @__PURE__ */ new Set();
+    const elevations = /* @__PURE__ */ new Set();
+    let hasIfcModel = false;
+    const walk = (list) => {
+      list.forEach((entry) => {
+        const source = entry?.object ?? entry;
+        const meta = source?.userData?.ifcMetadata;
+        if (source?.userData?.isIFC || meta) hasIfcModel = true;
+        if (meta?.storey) storeys.add(meta.storey);
+        if (typeof meta?.elevation === "number" && Number.isFinite(meta.elevation)) elevations.add(meta.elevation);
+        if (meta?.category) categories.add(meta.category);
+        meta?.systems?.forEach((item) => systems.add(item));
+        meta?.materials?.forEach((item) => materials.add(item));
+        const rawChildren = getRawChildren(entry);
+        if (rawChildren.length > 0) walk(rawChildren);
+      });
     };
-    setTreeRoot((prev) => expand(prev));
-  };
-  const collapseAll = () => {
-    const collapse = (nodes) => {
-      return nodes.map((n) => ({
-        ...n,
-        expanded: false,
-        children: collapse(n.children)
-      }));
+    walk(nodes);
+    const sort = (set) => Array.from(set).sort((a, b) => a.localeCompare(b, "zh-Hans-CN"));
+    return {
+      storeys: sort(storeys),
+      elevations: Array.from(elevations).sort((a, b) => a - b),
+      systems: sort(systems),
+      categories: sort(categories),
+      materials: sort(materials),
+      hasIfcModel
     };
-    setTreeRoot((prev) => collapse(prev));
   };
-  const handleContextMenu = (e, node) => {
-    e.preventDefault();
-    setContextMenu({ x: e.clientX, y: e.clientY, node });
+  const ifcOptions = useMemo(() => collectIfcOptions(treeRoot), [treeRoot]);
+  const hasIfcFilters = ifcOptions.storeys.length > 0 || ifcOptions.elevations.length > 0 || ifcOptions.systems.length > 0 || ifcOptions.categories.length > 0 || ifcOptions.materials.length > 0;
+  const hasIfcLocator = ifcOptions.hasIfcModel;
+  const hasActiveFilters = Object.values(filters).some(Boolean);
+  const selectedStoreyIndex = selectedStorey ? ifcOptions.storeys.indexOf(selectedStorey) : -1;
+  const adjacentStoreys = selectedStoreyIndex >= 0 ? ifcOptions.storeys.filter((_item, index) => Math.abs(index - selectedStoreyIndex) <= 1) : [];
+  const canApplyCurrentStorey = Boolean(selectedStorey);
+  const canApplyAdjacentStoreys = adjacentStoreys.length > 1;
+  const matchesIfcFilters = (meta) => {
+    if (!hasActiveFilters) return true;
+    if (!meta) return false;
+    if (filters.storey && meta.storey !== filters.storey) return false;
+    if (filters.elevation && String(meta.elevation) !== filters.elevation) return false;
+    if (filters.category && meta.category !== filters.category) return false;
+    if (filters.system && !(meta.systems || []).includes(filters.system)) return false;
+    if (filters.material && !(meta.materials || []).includes(filters.material)) return false;
+    return true;
   };
   useEffect(() => {
-    const handleClick = () => setContextMenu(null);
-    document.addEventListener("click", handleClick);
-    return () => document.removeEventListener("click", handleClick);
+    if (!containerRef.current) return;
+    const resizeObserver = new ResizeObserver((entries) => {
+      entries.forEach((entry) => setContainerHeight(entry.contentRect.height));
+    });
+    resizeObserver.observe(containerRef.current);
+    return () => resizeObserver.disconnect();
   }, []);
+  useEffect(() => {
+    const prevQuery = previousSearchQueryRef.current;
+    if (!prevQuery && searchQuery) {
+      searchExpandedStateRef.current = collectExpandedState(treeRoot);
+    }
+    if (prevQuery && !searchQuery && searchExpandedStateRef.current) {
+      const snapshot = searchExpandedStateRef.current;
+      setTreeRoot((prev) => applyExpandedState(prev, snapshot));
+      searchExpandedStateRef.current = null;
+    }
+    previousSearchQueryRef.current = searchQuery;
+  }, [searchQuery, setTreeRoot, treeRoot]);
+  useEffect(() => {
+    if (!selectedUuid) return;
+    setTreeRoot((prev) => {
+      const expandSelectedPath = (nodes) => {
+        let found2 = false;
+        const nextNodes = nodes.map((node) => {
+          let workingNode = node;
+          if (node.uuid === selectedUuid) {
+            found2 = true;
+            return node;
+          }
+          if (!node.childrenLoaded && node.hasChildren) {
+            const rawChildren = getRawChildren(node);
+            const containsTarget = rawChildren.some((child) => rawTreeContainsUuid(child, selectedUuid));
+            if (containsTarget) {
+              workingNode = ensureNodeChildrenLoaded(node);
+            }
+          }
+          const [children, childFound] = expandSelectedPath(workingNode.children);
+          if (childFound) found2 = true;
+          return {
+            ...workingNode,
+            expanded: childFound ? true : workingNode.expanded,
+            children
+          };
+        });
+        return [nextNodes, found2];
+      };
+      const [nextTree, found] = expandSelectedPath(prev);
+      return found ? nextTree : prev;
+    });
+  }, [selectedUuid, setTreeRoot]);
   const filterTree = (nodes, query) => {
-    if (!query) return nodes;
     const lowercaseQuery = query.toLowerCase();
     return nodes.reduce((acc, node) => {
-      const matches = node.name.toLowerCase().includes(lowercaseQuery);
-      const filteredChildren = filterTree(node.children, query);
-      if (matches || filteredChildren.length > 0) {
+      const meta = node.object?.userData?.ifcMetadata;
+      const matchesQuery = !query || getNodeSearchText(node).includes(lowercaseQuery);
+      const matchesFilter = matchesIfcFilters(meta);
+      const sourceChildren = query || hasActiveFilters ? getRawChildren(node).map((child) => createTreeNodeFromRaw(child, node.depth + 1)) : node.children;
+      const filteredChildren = filterTree(sourceChildren, query);
+      if (matchesQuery && matchesFilter || filteredChildren.length > 0) {
         acc.push({
           ...node,
-          expanded: query ? true : node.expanded,
-          // 搜索时自动展开
+          childrenLoaded: query || hasActiveFilters ? true : node.childrenLoaded,
+          hasChildren: node.hasChildren ?? getRawChildren(node).length > 0,
+          expanded: query || hasActiveFilters ? true : node.expanded,
           children: filteredChildren
         });
       }
       return acc;
     }, []);
   };
-  const filteredTree = useMemo(() => filterTree(treeRoot, searchQuery), [treeRoot, searchQuery]);
+  const filteredTree = useMemo(() => filterTree(treeRoot, searchQuery), [treeRoot, searchQuery, filters, hasActiveFilters]);
   const flatData = useMemo(() => flattenTree(filteredTree), [filteredTree]);
-  const rowHeight = 24;
-  const [scrollTop, setScrollTop] = useState(0);
-  const containerRef = useRef(null);
-  const [containerHeight, setContainerHeight] = useState(400);
-  useEffect(() => {
-    if (containerRef.current) {
-      const resizeObserver = new ResizeObserver((entries) => {
-        for (let entry of entries) setContainerHeight(entry.contentRect.height);
-      });
-      resizeObserver.observe(containerRef.current);
-      return () => resizeObserver.disconnect();
+  const firstSearchMatch = useMemo(() => {
+    if (!searchQuery) return null;
+    const query = searchQuery.toLowerCase();
+    const stack = [...treeRoot];
+    while (stack.length > 0) {
+      const node = stack.shift();
+      if (getNodeSearchText(node).includes(query)) return node;
+      getRawChildren(node).map((child) => createTreeNodeFromRaw(child, (node.depth ?? 0) + 1)).forEach((child) => stack.push(child));
     }
-  }, []);
-  const toggleNode = (nodeUuid) => {
-    const toggle = (nodes) => {
-      return nodes.map((n) => {
-        if (n.uuid === nodeUuid) return { ...n, expanded: !n.expanded };
-        if (n.children.length > 0) return { ...n, children: toggle(n.children) };
-        return n;
-      });
-    };
-    setTreeRoot((prev) => toggle(prev));
-  };
+    return null;
+  }, [searchQuery, treeRoot]);
+  const locatorMatches = useMemo(() => {
+    if (!locatorQuery.trim()) return [];
+    const query = locatorQuery.trim().toLowerCase();
+    const results = [];
+    const stack = [...treeRoot];
+    while (stack.length > 0) {
+      const node = stack.shift();
+      if (getNodeLocatorText(node, locatorMode).includes(query)) {
+        results.push(node);
+      }
+      getRawChildren(node).map((child) => createTreeNodeFromRaw(child, (node.depth ?? 0) + 1)).forEach((child) => stack.push(child));
+    }
+    return results;
+  }, [locatorMode, locatorQuery, treeRoot]);
+  const clampedLocatorIndex = locatorMatches.length > 0 ? Math.min(locatorIndex, locatorMatches.length - 1) : 0;
+  const rowHeight = 24;
   const totalHeight = flatData.length * rowHeight;
   const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight));
   const visibleCount = Math.ceil(containerHeight / rowHeight);
   const endIndex = Math.min(flatData.length, startIndex + visibleCount + 1);
   const visibleItems = flatData.slice(startIndex, endIndex);
-  return /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }, children: [
-    /* @__PURE__ */ jsx("div", { style: { padding: "8px", borderBottom: "1px solid var(--border-color)" }, children: /* @__PURE__ */ jsxs("div", { style: { position: "relative", display: "flex", alignItems: "center" }, children: [
-      /* @__PURE__ */ jsx(
-        "input",
-        {
-          type: "text",
-          placeholder: t("search_nodes"),
-          value: searchQuery,
-          onChange: (e) => setSearchQuery(e.target.value),
-          className: "ui-input",
-          style: {
-            width: "100%",
-            padding: "4px 28px 4px 8px",
-            borderRadius: "0px",
-            boxSizing: "border-box"
+  useEffect(() => {
+    if (!selectedUuid || !containerRef.current) return;
+    const targetIndex = flatData.findIndex((node) => node.uuid === selectedUuid);
+    if (targetIndex < 0) return;
+    const currentTop = containerRef.current.scrollTop;
+    const currentBottom = currentTop + containerHeight;
+    const itemTop = targetIndex * rowHeight;
+    const itemBottom = itemTop + rowHeight;
+    if (itemTop < currentTop) {
+      containerRef.current.scrollTop = itemTop;
+    } else if (itemBottom > currentBottom) {
+      containerRef.current.scrollTop = Math.max(0, itemBottom - containerHeight);
+    }
+  }, [selectedUuid, flatData, containerHeight, rowHeight]);
+  const toggleNode = (nodeUuid) => {
+    const toggle = (nodes) => nodes.map((node) => {
+      if (node.uuid === nodeUuid) {
+        const nextNode = ensureNodeChildrenLoaded(node);
+        return { ...nextNode, expanded: !node.expanded };
+      }
+      if (node.children.length > 0) return { ...node, children: toggle(node.children) };
+      return node;
+    });
+    setTreeRoot((prev) => toggle(prev));
+  };
+  const expandAll = () => {
+    const expand = (nodes) => nodes.map((node) => {
+      const expandedNode = ensureNodeChildrenLoaded(node);
+      return {
+        ...expandedNode,
+        expanded: expandedNode.hasChildren,
+        children: expand(expandedNode.children)
+      };
+    });
+    setTreeRoot((prev) => expand(prev));
+  };
+  const collapseAll = () => {
+    const collapse = (nodes) => nodes.map((node) => ({
+      ...node,
+      expanded: false,
+      children: collapse(node.children)
+    }));
+    setTreeRoot((prev) => collapse(prev));
+  };
+  const handleLocateFirstMatch = () => {
+    if (!firstSearchMatch) return;
+    onSelect(firstSearchMatch.uuid, firstSearchMatch.object);
+    onFocus?.(firstSearchMatch.object);
+  };
+  const handleLocateIfcMatch = (matchIndex = 0) => {
+    const target = locatorMatches[matchIndex];
+    if (!target) return;
+    onSelect(target.uuid, target.object);
+    onLocate?.(target.object);
+  };
+  useEffect(() => {
+    setLocatorIndex(0);
+  }, [locatorMode, locatorQuery]);
+  useEffect(() => {
+    if (!locatorQuery.trim()) {
+      onClearLocate?.();
+    }
+  }, [locatorQuery, onClearLocate]);
+  useEffect(() => {
+    const nextLocateResults = locatorQuery.trim() ? locatorMatches.map((item) => item.uuid) : [];
+    const prevLocateResults = lastLocateResultsRef.current;
+    const changed = prevLocateResults.length !== nextLocateResults.length || prevLocateResults.some((uuid, index) => uuid !== nextLocateResults[index]);
+    if (!changed) return;
+    lastLocateResultsRef.current = nextLocateResults;
+    onLocateResultsChange?.(nextLocateResults);
+  }, [locatorMatches, locatorQuery, onLocateResultsChange]);
+  useEffect(() => {
+    if (locatorMatches.length === 0 && locatorIndex !== 0) {
+      setLocatorIndex(0);
+    } else if (locatorMatches.length > 0 && locatorIndex > locatorMatches.length - 1) {
+      setLocatorIndex(locatorMatches.length - 1);
+    }
+  }, [locatorIndex, locatorMatches.length]);
+  return /* @__PURE__ */ jsxs("div", { className: "ui-tree-panel", children: [
+    /* @__PURE__ */ jsxs("div", { className: "ui-search-bar", children: [
+      /* @__PURE__ */ jsxs("div", { className: "ui-search-input-wrap", children: [
+        /* @__PURE__ */ jsx(
+          "input",
+          {
+            type: "text",
+            placeholder: t("search_nodes"),
+            value: searchQuery,
+            onChange: (e) => setSearchQuery(e.target.value),
+            onKeyDown: (e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                handleLocateFirstMatch();
+              }
+            },
+            className: "ui-input ui-input-compact"
           }
-        }
-      ),
-      searchQuery && /* @__PURE__ */ jsx(
-        "div",
-        {
-          onClick: () => setSearchQuery(""),
-          style: {
-            position: "absolute",
-            right: 4,
-            cursor: "pointer",
-            opacity: 0.6,
-            display: "flex",
-            padding: 2
-          },
-          onMouseEnter: (e) => e.currentTarget.style.opacity = "1",
-          onMouseLeave: (e) => e.currentTarget.style.opacity = "0.6",
-          children: /* @__PURE__ */ jsx(IconClose, { width: 14, height: 14 })
-        }
-      )
-    ] }) }),
-    /* @__PURE__ */ jsx("div", { ref: containerRef, className: "ui-tree-container flex-1 overflow-y-auto overflow-x-hidden py-[2px]", onScroll: (e) => setScrollTop(e.currentTarget.scrollTop), children: /* @__PURE__ */ jsx("div", { style: { height: totalHeight, position: "relative" }, children: /* @__PURE__ */ jsx("div", { style: { position: "absolute", top: startIndex * rowHeight, left: 0, right: 0 }, children: visibleItems.map((node) => /* @__PURE__ */ jsxs(
-      "div",
-      {
-        className: `ui-tree-node ${node.uuid === selectedUuid ? "selected" : ""}`,
-        style: { paddingLeft: 8 },
-        onClick: () => onSelect(node.uuid, node.object),
-        onDoubleClick: () => onFocus?.(node.object),
-        onMouseEnter: () => setHoveredUuid(node.uuid),
-        onMouseLeave: () => setHoveredUuid(null),
-        onContextMenu: (e) => handleContextMenu(e, node),
-        children: [
-          node.depth > 0 && /* @__PURE__ */ jsxs("div", { style: { display: "flex", height: "100%", alignItems: "center", flexShrink: 0 }, children: [
-            node.parentIsLast?.map((isLast, i) => /* @__PURE__ */ jsx("div", { style: {
-              width: 12,
-              height: "100%",
-              position: "relative",
-              borderLeft: isLast ? "none" : `1px solid var(--border-color)`
-            } }, i)),
-            /* @__PURE__ */ jsxs("div", { style: {
-              width: 12,
-              height: "100%",
-              position: "relative",
-              display: "flex",
-              alignItems: "center"
-            }, children: [
-              /* @__PURE__ */ jsx("div", { style: {
-                position: "absolute",
-                left: 0,
-                top: 0,
-                bottom: node.isLastChild ? "50%" : 0,
-                borderLeft: `1px solid var(--border-color)`
-              } }),
-              /* @__PURE__ */ jsx("div", { style: {
-                position: "absolute",
-                left: 0,
-                width: 10,
-                borderTop: `1px solid var(--border-color)`
-              } })
-            ] })
-          ] }),
-          /* @__PURE__ */ jsx("div", { className: "ui-tree-expander", onClick: (e) => {
-            e.stopPropagation();
-            toggleNode(node.uuid);
-          }, children: node.children.length > 0 ? node.expanded ? /* @__PURE__ */ jsx(IconChevronDown, { size: 12 }) : /* @__PURE__ */ jsx(IconChevronRight, { size: 12 }) : null }),
+        ),
+        searchQuery && /* @__PURE__ */ jsx("button", { className: "ui-search-clear", onClick: () => setSearchQuery(""), children: /* @__PURE__ */ jsx(IconClose, { width: 14, height: 14 }) })
+      ] }),
+      searchQuery && /* @__PURE__ */ jsxs("div", { className: "ui-tree-search-meta", children: [
+        /* @__PURE__ */ jsxs("span", { children: [
+          t("search_results") || "结果",
+          ": ",
+          flatData.length
+        ] }),
+        /* @__PURE__ */ jsx(
+          Button,
+          {
+            variant: "ghost",
+            className: "ui-properties-action",
+            onClick: handleLocateFirstMatch,
+            disabled: !firstSearchMatch,
+            children: t("locate_first_match") || "定位首个匹配"
+          }
+        )
+      ] }),
+      hasIfcLocator && /* @__PURE__ */ jsxs("div", { className: "ui-tree-locator", children: [
+        /* @__PURE__ */ jsx(
+          Select,
+          {
+            value: locatorMode,
+            onChange: (value) => setLocatorMode(value),
+            options: [
+              { value: "all", label: t("ifc_locator_all") || "综合" },
+              { value: "name", label: t("ifc_locator_name") || "名称" },
+              { value: "globalId", label: t("ifc_locator_globalid") || "GlobalId" },
+              { value: "classification", label: t("ifc_locator_classification") || "分类编码" },
+              { value: "typeName", label: t("ifc_locator_type") || "类型" }
+            ],
+            className: "ui-input-compact"
+          }
+        ),
+        /* @__PURE__ */ jsxs("div", { className: "ui-search-input-wrap", children: [
           /* @__PURE__ */ jsx(
-            Checkbox,
+            "input",
             {
-              checked: node.visible,
-              onChange: (val) => onToggleVisibility(node.uuid, val),
-              style: { marginRight: 4, padding: 0, flexShrink: 0 }
+              type: "text",
+              placeholder: t("ifc_locator_placeholder") || "按 IFC 标识定位...",
+              value: locatorQuery,
+              onChange: (e) => {
+                setLocatorQuery(e.target.value);
+                setLocatorIndex(0);
+              },
+              onKeyDown: (e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  handleLocateIfcMatch(clampedLocatorIndex);
+                }
+              },
+              className: "ui-input ui-input-compact"
             }
           ),
-          /* @__PURE__ */ jsx("div", { className: "ui-tree-label", children: searchQuery ? node.name.toLowerCase().includes(searchQuery.toLowerCase()) ? /* @__PURE__ */ jsx("span", { children: node.name.split(new RegExp(`(${searchQuery})`, "gi")).map(
-            (part, i) => part.toLowerCase() === searchQuery.toLowerCase() ? /* @__PURE__ */ jsx("span", { style: { backgroundColor: "rgba(255, 255, 0, 0.4)", color: "inherit" }, children: part }, i) : part
-          ) }) : node.name : node.name })
-        ]
-      },
-      node.uuid
-    )) }) }) }),
-    contextMenu && /* @__PURE__ */ jsxs("div", { className: "ui-context-menu", style: { left: contextMenu.x, top: contextMenu.y }, children: [
-      /* @__PURE__ */ jsx(
-        "div",
-        {
-          className: "ui-context-menu-item",
-          onClick: () => {
-            expandAll();
-            setContextMenu(null);
-          },
-          children: t("expand_all")
-        }
-      ),
-      /* @__PURE__ */ jsx(
-        "div",
-        {
-          className: "ui-context-menu-item",
-          onClick: () => {
-            collapseAll();
-            setContextMenu(null);
-          },
-          children: t("collapse_all")
-        }
-      ),
-      contextMenu.node.isFileNode && /* @__PURE__ */ jsxs(Fragment, { children: [
-        /* @__PURE__ */ jsx("div", { className: "ui-context-menu-divider" }),
+          locatorQuery && /* @__PURE__ */ jsx("button", { className: "ui-search-clear", onClick: () => {
+            setLocatorQuery("");
+            setLocatorIndex(0);
+          }, children: /* @__PURE__ */ jsx(IconClose, { width: 14, height: 14 }) })
+        ] })
+      ] }),
+      hasIfcLocator && locatorQuery && /* @__PURE__ */ jsxs("div", { className: "ui-tree-search-meta", children: [
+        /* @__PURE__ */ jsxs("span", { children: [
+          t("ifc_locator_results") || "IFC结果",
+          ": ",
+          locatorMatches.length,
+          locatorMatches.length > 0 ? ` (${clampedLocatorIndex + 1}/${locatorMatches.length})` : ""
+        ] }),
+        /* @__PURE__ */ jsxs("div", { className: "ui-tree-search-actions", children: [
+          /* @__PURE__ */ jsx(
+            Button,
+            {
+              variant: "ghost",
+              className: "ui-properties-action ui-icon-btn ui-tree-locator-btn",
+              onClick: () => {
+                const nextIndex = Math.max(0, clampedLocatorIndex - 1);
+                setLocatorIndex(nextIndex);
+                handleLocateIfcMatch(nextIndex);
+              },
+              disabled: locatorMatches.length === 0 || clampedLocatorIndex === 0,
+              title: t("ifc_locator_prev") || "上一个",
+              children: /* @__PURE__ */ jsx(IconChevronLeft, { size: 18 })
+            }
+          ),
+          /* @__PURE__ */ jsx(
+            Button,
+            {
+              variant: "ghost",
+              className: "ui-properties-action ui-icon-btn ui-tree-locator-btn",
+              onClick: () => {
+                const nextIndex = Math.min(locatorMatches.length - 1, clampedLocatorIndex + 1);
+                setLocatorIndex(nextIndex);
+                handleLocateIfcMatch(nextIndex);
+              },
+              disabled: locatorMatches.length === 0 || clampedLocatorIndex >= locatorMatches.length - 1,
+              title: t("ifc_locator_next") || "下一个",
+              children: /* @__PURE__ */ jsx(IconChevronRight, { size: 18 })
+            }
+          ),
+          /* @__PURE__ */ jsx(
+            Button,
+            {
+              variant: "ghost",
+              className: "ui-properties-action ui-icon-btn ui-tree-locator-btn",
+              onClick: () => handleLocateIfcMatch(clampedLocatorIndex),
+              disabled: locatorMatches.length === 0,
+              title: t("ifc_locator_action") || "定位构件",
+              children: /* @__PURE__ */ jsx(IconTarget, { size: 18 })
+            }
+          )
+        ] })
+      ] })
+    ] }),
+    hasIfcFilters && /* @__PURE__ */ jsxs("div", { className: "ui-tree-filters", children: [
+      /* @__PURE__ */ jsxs("div", { className: "ui-tree-filter-grid", children: [
         /* @__PURE__ */ jsx(
-          "div",
+          Select,
           {
-            className: "ui-context-menu-item",
-            onClick: () => {
-              onDelete?.(contextMenu.node.object);
-              setContextMenu(null);
-            },
-            children: t("delete_item")
+            value: filters.storey,
+            onChange: (value) => setFilters((prev) => ({ ...prev, storey: value })),
+            options: [
+              { value: "", label: t("ifc_filter_storey") || "全部楼层" },
+              ...ifcOptions.storeys.map((item) => ({ value: item, label: item }))
+            ],
+            className: "ui-input-compact"
+          }
+        ),
+        /* @__PURE__ */ jsx(
+          Select,
+          {
+            value: filters.system,
+            onChange: (value) => setFilters((prev) => ({ ...prev, system: value })),
+            options: [
+              { value: "", label: t("ifc_filter_system") || "全部系统" },
+              ...ifcOptions.systems.map((item) => ({ value: item, label: item }))
+            ],
+            className: "ui-input-compact"
+          }
+        ),
+        /* @__PURE__ */ jsx(
+          Select,
+          {
+            value: filters.elevation,
+            onChange: (value) => setFilters((prev) => ({ ...prev, elevation: value })),
+            options: [
+              { value: "", label: t("ifc_filter_elevation") || "全部标高" },
+              ...ifcOptions.elevations.map((item) => ({ value: String(item), label: String(item) }))
+            ],
+            className: "ui-input-compact"
+          }
+        ),
+        /* @__PURE__ */ jsx(
+          Select,
+          {
+            value: filters.category,
+            onChange: (value) => setFilters((prev) => ({ ...prev, category: value })),
+            options: [
+              { value: "", label: t("ifc_filter_category") || "全部类别" },
+              ...ifcOptions.categories.map((item) => ({ value: item, label: item }))
+            ],
+            className: "ui-input-compact"
+          }
+        ),
+        /* @__PURE__ */ jsx(
+          Select,
+          {
+            value: filters.material,
+            onChange: (value) => setFilters((prev) => ({ ...prev, material: value })),
+            options: [
+              { value: "", label: t("ifc_filter_material") || "全部材质" },
+              ...ifcOptions.materials.map((item) => ({ value: item, label: item }))
+            ],
+            className: "ui-input-compact"
+          }
+        )
+      ] }),
+      hasActiveFilters && /* @__PURE__ */ jsxs("div", { className: "ui-tree-filter-actions", children: [
+        /* @__PURE__ */ jsx(
+          Button,
+          {
+            variant: "ghost",
+            className: "ui-properties-action",
+            onClick: () => onApplyIfcFiltersToViewport?.(filters),
+            children: t("ifc_filter_apply_viewport") || "应用到视口"
+          }
+        ),
+        /* @__PURE__ */ jsx(
+          Button,
+          {
+            variant: "ghost",
+            className: "ui-properties-action",
+            onClick: () => setFilters({
+              storey: "",
+              elevation: "",
+              system: "",
+              category: "",
+              material: ""
+            }),
+            children: t("ifc_filter_clear") || "清除筛选"
+          }
+        )
+      ] }),
+      selectedStorey && /* @__PURE__ */ jsxs("div", { className: "ui-tree-filter-actions ui-tree-workset-actions", children: [
+        /* @__PURE__ */ jsx(
+          Button,
+          {
+            variant: "ghost",
+            className: "ui-properties-action",
+            onClick: () => onApplyStoreyWorkset?.([selectedStorey]),
+            disabled: !canApplyCurrentStorey,
+            children: t("ifc_workset_current") || "当前楼层"
+          }
+        ),
+        /* @__PURE__ */ jsx(
+          Button,
+          {
+            variant: "ghost",
+            className: "ui-properties-action",
+            onClick: () => onApplyStoreyWorkset?.(adjacentStoreys),
+            disabled: !canApplyAdjacentStoreys,
+            children: t("ifc_workset_adjacent") || "上下楼层"
           }
         )
       ] })
-    ] })
+    ] }),
+    /* @__PURE__ */ jsx(
+      "div",
+      {
+        ref: containerRef,
+        className: "ui-tree-container flex-1 overflow-y-auto overflow-x-hidden",
+        onScroll: (e) => setScrollTop(e.currentTarget.scrollTop),
+        children: /* @__PURE__ */ jsx("div", { style: { height: totalHeight, position: "relative" }, children: /* @__PURE__ */ jsx("div", { style: { position: "absolute", top: startIndex * rowHeight, left: 0, right: 0 }, children: visibleItems.map((node) => /* @__PURE__ */ jsxs(
+          "div",
+          {
+            className: `ui-tree-node ${node.uuid === selectedUuid ? "selected" : ""} ${locateResultUuids.includes(node.uuid) ? "matched" : ""} ${node.uuid === locatedUuid ? "located" : ""}`,
+            style: { paddingLeft: 8 },
+            onClick: () => onSelect(node.uuid, node.object),
+            onDoubleClick: () => onLocate ? onLocate(node.object) : onFocus?.(node.object),
+            onContextMenu: (e) => {
+              e.preventDefault();
+              setContextMenu({ x: e.clientX, y: e.clientY, node });
+            },
+            children: [
+              node.depth > 0 && /* @__PURE__ */ jsxs("div", { style: { display: "flex", height: "100%", alignItems: "center", flexShrink: 0 }, children: [
+                node.parentIsLast?.map((isLast, i) => /* @__PURE__ */ jsx(
+                  "div",
+                  {
+                    style: {
+                      width: 12,
+                      height: "100%",
+                      position: "relative",
+                      borderLeft: isLast ? "none" : "1px solid var(--border-color)"
+                    }
+                  },
+                  i
+                )),
+                /* @__PURE__ */ jsxs(
+                  "div",
+                  {
+                    style: {
+                      width: 12,
+                      height: "100%",
+                      position: "relative",
+                      display: "flex",
+                      alignItems: "center"
+                    },
+                    children: [
+                      /* @__PURE__ */ jsx(
+                        "div",
+                        {
+                          style: {
+                            position: "absolute",
+                            left: 0,
+                            top: 0,
+                            bottom: node.isLastChild ? "50%" : 0,
+                            borderLeft: "1px solid var(--border-color)"
+                          }
+                        }
+                      ),
+                      /* @__PURE__ */ jsx(
+                        "div",
+                        {
+                          style: {
+                            position: "absolute",
+                            left: 0,
+                            width: 10,
+                            borderTop: "1px solid var(--border-color)"
+                          }
+                        }
+                      )
+                    ]
+                  }
+                )
+              ] }),
+              /* @__PURE__ */ jsx(
+                "div",
+                {
+                  className: "ui-tree-expander",
+                  onClick: (e) => {
+                    e.stopPropagation();
+                    toggleNode(node.uuid);
+                  },
+                  children: node.hasChildren ? node.expanded ? /* @__PURE__ */ jsx(IconChevronDown, { size: 12 }) : /* @__PURE__ */ jsx(IconChevronRight, { size: 12 }) : null
+                }
+              ),
+              /* @__PURE__ */ jsx(
+                Checkbox,
+                {
+                  checked: node.visible,
+                  onChange: (val) => onToggleVisibility(node.uuid, val),
+                  style: { marginRight: 4, padding: 0, flexShrink: 0 }
+                }
+              ),
+              /* @__PURE__ */ jsx("div", { className: "ui-tree-label", children: searchQuery && node.name.toLowerCase().includes(searchQuery.toLowerCase()) ? /* @__PURE__ */ jsx("span", { children: node.name.split(new RegExp(`(${searchQuery})`, "gi")).map(
+                (part, index) => part.toLowerCase() === searchQuery.toLowerCase() ? /* @__PURE__ */ jsx("span", { className: "ui-search-hit", children: part }, index) : part
+              ) }) : node.name })
+            ]
+          },
+          node.uuid
+        )) }) })
+      }
+    ),
+    contextMenu && /* @__PURE__ */ jsx(
+      ContextMenu,
+      {
+        x: contextMenu.x,
+        y: contextMenu.y,
+        onClose: () => setContextMenu(null),
+        items: [
+          {
+            label: t("locate_in_view") || "定位到视图",
+            onClick: () => onFocus?.(contextMenu.node.object)
+          },
+          { divider: true },
+          {
+            label: t("expand_all"),
+            onClick: expandAll
+          },
+          {
+            label: t("collapse_all"),
+            onClick: collapseAll
+          },
+          ...contextMenu.node.isFileNode ? [
+            { divider: true },
+            {
+              label: t("delete_item"),
+              onClick: () => onDelete?.(contextMenu.node.object)
+            }
+          ] : []
+        ]
+      }
+    )
   ] });
 };
 
@@ -5871,15 +7190,19 @@ const FloatingPanel = ({
   resizable = false,
   movable = true,
   storageId,
-  modal = false
+  modal = false,
   // 默认非模态模式
+  autoHeight = height === void 0
 }) => {
   const panelRef = useRef(null);
   const minWidth = storageId === "tool_measure" ? 320 : 220;
   const minHeight = storageId === "tool_measure" ? 400 : 120;
   const [pos, setPos] = useState(() => {
     if (modal) {
-      return { x: (window.innerWidth - width) / 2, y: (window.innerHeight - height) / 2 };
+      return {
+        x: Math.max(0, (window.innerWidth - width) / 2),
+        y: Math.max(0, (window.innerHeight - (height ?? minHeight)) / 2)
+      };
     }
     if (storageId) {
       try {
@@ -5898,7 +7221,7 @@ const FloatingPanel = ({
     }
     if (x === 100 && y === 100 && !storageId) {
       const centerX = (window.innerWidth - width) / 2;
-      const centerY = (window.innerHeight - height) / 2;
+      const centerY = (window.innerHeight - (height ?? minHeight)) / 2;
       return { x: Math.max(0, centerX), y: Math.max(0, centerY) };
     }
     return { x, y };
@@ -5919,13 +7242,14 @@ const FloatingPanel = ({
       } catch (e) {
       }
     }
-    return { w: width, h: height };
+    return { w: width, h: height ?? minHeight };
   });
   useEffect(() => {
     if (!modal) return;
     const centerPanel = () => {
+      const measuredHeight = autoHeight ? Math.min(window.innerHeight - 64, panelRef.current?.offsetHeight || size.h) : size.h;
       const centerX = (window.innerWidth - size.w) / 2;
-      const centerY = (window.innerHeight - size.h) / 2;
+      const centerY = (window.innerHeight - measuredHeight) / 2;
       setPos({ x: Math.max(0, centerX), y: Math.max(0, centerY) });
     };
     window.addEventListener("resize", centerPanel);
@@ -5933,7 +7257,7 @@ const FloatingPanel = ({
     return () => {
       window.removeEventListener("resize", centerPanel);
     };
-  }, [modal, size.w, size.h]);
+  }, [autoHeight, modal, size.w, size.h]);
   const isDragging = useRef(false);
   const isResizing = useRef(false);
   const dragStart = useRef({ x: 0, y: 0 });
@@ -6047,14 +7371,15 @@ const FloatingPanel = ({
           left: pos.x,
           top: pos.y,
           width: size.w,
-          height: size.h,
+          height: autoHeight ? "auto" : size.h,
+          maxHeight: autoHeight ? "calc(100vh - 64px)" : void 0,
           zIndex: modal ? 2e3 : 200
         },
         children: [
           /* @__PURE__ */ jsxs(
             "div",
             {
-              className: "ui-panel-header",
+              className: `ui-panel-header ${!movable || modal ? "ui-panel-header-static" : ""}`,
               onMouseDown: onHeaderDown,
               children: [
                 /* @__PURE__ */ jsx("span", { className: "ui-panel-title", children: title }),
@@ -6084,28 +7409,11 @@ const FloatingPanel = ({
   ] });
 };
 
-const Section = ({ title, children }) => /* @__PURE__ */ jsxs("div", { className: "mb-4", children: [
-  /* @__PURE__ */ jsx(
-    "div",
-    {
-      className: "text-xs font-semibold uppercase",
-      style: {
-        marginBottom: "10px",
-        paddingBottom: "6px",
-        color: "var(--text-secondary)",
-        borderBottom: "1px solid var(--border-color)",
-        letterSpacing: "0.5px"
-      },
-      children: title
-    }
-  ),
-  children
-] });
-const Row = ({ label, children, labelWidth = "80px", stretch = false }) => /* @__PURE__ */ jsxs(
+const Row$1 = ({ label, children, labelWidth = "80px", stretch = false }) => /* @__PURE__ */ jsxs(
   "div",
   {
     className: "flex items-center justify-between",
-    style: { marginBottom: "10px", minHeight: "28px", gap: "16px" },
+    style: { marginBottom: "6px", minHeight: "26px", gap: "12px" },
     children: [
       /* @__PURE__ */ jsx(
         "span",
@@ -6159,18 +7467,34 @@ const SettingsPanel = ({
   theme
   // 主题配置
 }) => {
+  const [activeTab, setActiveTab] = useState("general");
+  const tabOptions = [
+    { value: "general", label: t("setting_general") || "通用" },
+    { value: "viewport", label: t("st_viewport") || "视口" },
+    { value: "import", label: t("st_import_settings") || "导入" },
+    { value: "highlight", label: t("st_highlight") || "高亮" }
+  ];
   return /* @__PURE__ */ jsx(
     FloatingPanel,
     {
       title: t("settings"),
       onClose,
       width: 360,
-      height: 500,
+      height: 400,
       modal: true,
+      movable: false,
       theme,
-      children: /* @__PURE__ */ jsxs("div", { style: { padding: "12px", display: "flex", flexDirection: "column", gap: "8px", height: "100%", overflowY: "auto" }, children: [
-        /* @__PURE__ */ jsxs(Section, { title: t("setting_general"), children: [
-          /* @__PURE__ */ jsx(Row, { label: t("st_theme"), labelWidth: "70px", children: /* @__PURE__ */ jsx("div", { style: { flex: 1, display: "flex", justifyContent: "flex-end" }, children: /* @__PURE__ */ jsx(
+      children: /* @__PURE__ */ jsxs("div", { style: { padding: "10px", display: "flex", flexDirection: "column", gap: "6px", height: "100%", overflowY: "auto" }, children: [
+        /* @__PURE__ */ jsx("div", { style: { position: "sticky", top: 0, zIndex: 1, background: "var(--bg-panel)", paddingBottom: "6px" }, children: /* @__PURE__ */ jsx(
+          SegmentedControl$1,
+          {
+            options: tabOptions,
+            value: activeTab,
+            onChange: (value) => setActiveTab(value)
+          }
+        ) }),
+        activeTab === "general" && /* @__PURE__ */ jsxs("div", { className: "mb-2", style: { padding: "0 6px" }, children: [
+          /* @__PURE__ */ jsx(Row$1, { label: t("st_theme"), labelWidth: "70px", children: /* @__PURE__ */ jsx("div", { style: { flex: 1, display: "flex", justifyContent: "flex-end" }, children: /* @__PURE__ */ jsx(
             SegmentedControl$1,
             {
               options: [
@@ -6181,7 +7505,7 @@ const SettingsPanel = ({
               onChange: (v) => setThemeMode(v)
             }
           ) }) }),
-          /* @__PURE__ */ jsx(Row, { label: t("st_lang"), labelWidth: "70px", stretch: true, children: /* @__PURE__ */ jsx(
+          /* @__PURE__ */ jsx(Row$1, { label: t("st_lang"), labelWidth: "70px", stretch: true, children: /* @__PURE__ */ jsx(
             Select,
             {
               value: currentLang,
@@ -6192,14 +7516,14 @@ const SettingsPanel = ({
               onChange: (v) => setLang(v)
             }
           ) }),
-          /* @__PURE__ */ jsx(Row, { label: t("st_monitor"), labelWidth: "70px", children: /* @__PURE__ */ jsx(
+          /* @__PURE__ */ jsx(Row$1, { label: t("st_monitor"), labelWidth: "70px", children: /* @__PURE__ */ jsx(
             Switch,
             {
               checked: showStats,
               onChange: (v) => setShowStats(v)
             }
           ) }),
-          /* @__PURE__ */ jsx(Row, { label: t("st_font_size"), labelWidth: "70px", children: /* @__PURE__ */ jsx("div", { style: { flex: 1, display: "flex", justifyContent: "flex-end" }, children: /* @__PURE__ */ jsx(
+          /* @__PURE__ */ jsx(Row$1, { label: t("st_font_size"), labelWidth: "70px", children: /* @__PURE__ */ jsx("div", { style: { flex: 1, display: "flex", justifyContent: "flex-end" }, children: /* @__PURE__ */ jsx(
             SegmentedControl$1,
             {
               options: [
@@ -6212,15 +7536,15 @@ const SettingsPanel = ({
             }
           ) }) })
         ] }),
-        /* @__PURE__ */ jsxs(Section, { title: t("st_viewport"), children: [
-          /* @__PURE__ */ jsx(Row, { label: t("st_viewcube_size"), labelWidth: "90px", stretch: true, children: /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", gap: "12px", width: "100%" }, children: [
+        activeTab === "viewport" && /* @__PURE__ */ jsxs("div", { className: "mb-2", style: { padding: "0 6px" }, children: [
+          /* @__PURE__ */ jsx(Row$1, { label: t("st_viewcube_size"), labelWidth: "90px", stretch: true, children: /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", gap: "8px", width: "100%" }, children: [
             /* @__PURE__ */ jsx("div", { style: { flex: 1, minWidth: 0 }, children: /* @__PURE__ */ jsx(
               Slider,
               {
-                min: 60,
+                min: 120,
                 max: 180,
                 step: 5,
-                value: settings.viewCubeSize || 100,
+                value: settings.viewCubeSize || 120,
                 onChange: (value) => onUpdate({ viewCubeSize: value })
               }
             ) }),
@@ -6229,11 +7553,46 @@ const SettingsPanel = ({
               "px"
             ] })
           ] }) }),
-          /* @__PURE__ */ jsx(Row, { label: t("st_adaptive_quality") || "Adaptive", labelWidth: "90px", children: /* @__PURE__ */ jsx(
+          /* @__PURE__ */ jsx(Row$1, { label: t("st_adaptive_quality") || "Adaptive", labelWidth: "90px", children: /* @__PURE__ */ jsx(
             Switch,
             {
               checked: settings.adaptiveQuality !== false,
               onChange: (v) => onUpdate({ adaptiveQuality: v })
+            }
+          ) }),
+          /* @__PURE__ */ jsx(Row$1, { label: t("st_performance_profile") || "性能策略", labelWidth: "90px", children: /* @__PURE__ */ jsx("div", { style: { flex: 1, display: "flex", justifyContent: "flex-end" }, children: /* @__PURE__ */ jsx(
+            SegmentedControl$1,
+            {
+              options: [
+                { value: "smooth", label: t("st_perf_smooth") || "流畅优先" },
+                { value: "balanced", label: t("st_perf_balanced") || "平衡" },
+                { value: "quality", label: t("st_perf_quality") || "画质优先" }
+              ],
+              value: settings.performanceMode || "balanced",
+              onChange: (v) => onUpdate({ performanceMode: v })
+            }
+          ) }) })
+        ] }),
+        activeTab === "import" && /* @__PURE__ */ jsx("div", { className: "mb-2", style: { padding: "0 6px" }, children: /* @__PURE__ */ jsx(Row$1, { label: t("ifc_grid_visible") || "IFC 轴网", labelWidth: "90px", children: /* @__PURE__ */ jsx(
+          Switch,
+          {
+            checked: settings.ifcGridVisible !== false,
+            onChange: (v) => onUpdate({ ifcGridVisible: v })
+          }
+        ) }) }),
+        activeTab === "highlight" && /* @__PURE__ */ jsxs("div", { className: "mb-2", style: { padding: "0 6px" }, children: [
+          /* @__PURE__ */ jsx(Row$1, { label: t("st_highlight_color") || "高亮颜色", labelWidth: "90px", stretch: true, children: /* @__PURE__ */ jsx(
+            ColorPicker,
+            {
+              value: settings.highlightColor || "#ff9f1c",
+              onChange: (value) => onUpdate({ highlightColor: value })
+            }
+          ) }),
+          /* @__PURE__ */ jsx(Row$1, { label: t("st_highlight_box") || "显示包围盒", labelWidth: "90px", children: /* @__PURE__ */ jsx(
+            Switch,
+            {
+              checked: settings.highlightShowBox === true,
+              onChange: (value) => onUpdate({ highlightShowBox: value })
             }
           ) })
         ] })
@@ -6495,14 +7854,15 @@ const AxisSliderRow = ({ axis, label, active, value, onToggle, onChange, disable
             style: {
               fontSize: "11px",
               color: "var(--text-primary)",
-              minWidth: "45px",
+              minWidth: "66px",
               textAlign: "right",
-              flexShrink: 0
+              flexShrink: 0,
+              fontVariantNumeric: "tabular-nums"
             },
             children: [
-              Math.round(value[0]),
+              String(Math.round(value[0])).padStart(2, "0"),
               "-",
-              Math.round(value[1]),
+              String(Math.round(value[1])).padStart(2, "0"),
               "%"
             ]
           }
@@ -6519,38 +7879,71 @@ const ClipPanel = ({
   clipValues,
   setClipValues,
   clipActive,
-  setClipActive
+  setClipActive,
+  clipHelperVisible,
+  setClipHelperVisible,
+  clipHelperOpacity,
+  setClipHelperOpacity
 }) => {
+  const handleReset = () => {
+    setClipValues({ x: [0, 100], y: [0, 100], z: [0, 100] });
+  };
   return /* @__PURE__ */ jsx(
     FloatingPanel,
     {
       title: t("clip_title"),
       onClose,
-      width: 280,
-      height: 260,
+      width: 320,
+      height: 420,
       resizable: false,
       storageId: "tool_clip",
       children: /* @__PURE__ */ jsxs(
         "div",
         {
-          className: "flex flex-col p-3",
-          style: { height: "100%", gap: "12px" },
+          className: "ui-panel-stack",
+          style: { height: "100%" },
           children: [
+            /* @__PURE__ */ jsxs("div", { className: "ui-panel-section", children: [
+              /* @__PURE__ */ jsxs("div", { className: "ui-form-row", children: [
+                /* @__PURE__ */ jsx("span", { className: "ui-form-label", children: t("clip_enable") }),
+                /* @__PURE__ */ jsx("div", { className: "ui-form-value", children: /* @__PURE__ */ jsx(Switch, { checked: clipEnabled, onChange: (v) => setClipEnabled(v) }) })
+              ] }),
+              /* @__PURE__ */ jsxs("div", { className: "ui-form-row", children: [
+                /* @__PURE__ */ jsx("span", { className: "ui-form-label", children: t("clip_helper_visible") }),
+                /* @__PURE__ */ jsx("div", { className: "ui-form-value", children: /* @__PURE__ */ jsx(
+                  Switch,
+                  {
+                    checked: clipHelperVisible,
+                    onChange: (v) => setClipHelperVisible(v),
+                    disabled: !clipEnabled
+                  }
+                ) })
+              ] }),
+              /* @__PURE__ */ jsxs("div", { className: "ui-form-row", children: [
+                /* @__PURE__ */ jsx("span", { className: "ui-form-label", children: t("clip_helper_opacity") }),
+                /* @__PURE__ */ jsx("div", { className: "ui-form-value ui-form-value-stretch", children: /* @__PURE__ */ jsxs("div", { className: "ui-slider-field", children: [
+                  /* @__PURE__ */ jsx(
+                    Slider,
+                    {
+                      min: 0.05,
+                      max: 0.35,
+                      step: 0.01,
+                      value: clipHelperOpacity,
+                      onChange: (value) => setClipHelperOpacity(value),
+                      disabled: !clipEnabled || !clipHelperVisible
+                    }
+                  ),
+                  /* @__PURE__ */ jsxs("span", { className: "ui-slider-value", children: [
+                    Math.round(clipHelperOpacity * 100),
+                    "%"
+                  ] })
+                ] }) })
+              ] })
+            ] }),
             /* @__PURE__ */ jsxs(
               "div",
               {
-                className: "flex items-center justify-between p-2",
-                style: { borderBottom: "1px solid var(--border-color)" },
-                children: [
-                  /* @__PURE__ */ jsx("span", { className: "text-sm font-semibold", children: t("clip_enable") }),
-                  /* @__PURE__ */ jsx(Switch, { checked: clipEnabled, onChange: (v) => setClipEnabled(v) })
-                ]
-              }
-            ),
-            /* @__PURE__ */ jsxs(
-              "div",
-              {
-                className: "flex flex-col",
+                className: "ui-panel-section flex flex-col",
                 style: {
                   flex: 1,
                   opacity: clipEnabled ? 1 : 0.4,
@@ -6595,7 +7988,8 @@ const ClipPanel = ({
                   )
                 ]
               }
-            )
+            ),
+            /* @__PURE__ */ jsx("div", { className: "ui-panel-footer", children: /* @__PURE__ */ jsx(Button, { variant: "default", onClick: handleReset, disabled: !clipEnabled, children: t("clip_reset") || "重置范围" }) })
           ]
         }
       )
@@ -6644,6 +8038,82 @@ const ExportPanel = ({ t, onClose, onExport, theme }) => {
   ] }) });
 };
 
+const ScreenshotPanel = ({ t, onClose, onCapture, theme }) => {
+  const [mode, setMode] = useState("scene");
+  const options = [
+    {
+      id: "scene",
+      label: t("op_screenshot") || "场景截图",
+      desc: t("screenshot_scene_desc") || "保留当前背景色和界面里的场景效果"
+    },
+    {
+      id: "transparent",
+      label: t("op_screenshot_transparent") || "透明背景截图",
+      desc: t("screenshot_transparent_desc") || "导出透明背景 PNG，便于汇报和排版"
+    }
+  ];
+  return /* @__PURE__ */ jsx(
+    FloatingPanel,
+    {
+      title: t("op_screenshot") || "场景截图",
+      onClose,
+      width: 320,
+      height: 280,
+      resizable: false,
+      theme,
+      storageId: "tool_screenshot",
+      children: /* @__PURE__ */ jsxs("div", { style: { padding: 16 }, children: [
+        /* @__PURE__ */ jsxs("div", { style: { marginBottom: 10, fontSize: 12, color: theme.textMuted }, children: [
+          t("screenshot_mode") || "截图方式",
+          ":"
+        ] }),
+        options.map((opt) => /* @__PURE__ */ jsxs(
+          "label",
+          {
+            style: {
+              display: "flex",
+              alignItems: "center",
+              padding: "10px",
+              cursor: "pointer",
+              border: `1px solid ${mode === opt.id ? theme.accent : theme.border}`,
+              borderRadius: 0,
+              marginBottom: 8,
+              backgroundColor: mode === opt.id ? `${theme.accent}15` : "transparent",
+              transition: "all 0.2s"
+            },
+            children: [
+              /* @__PURE__ */ jsx(
+                "input",
+                {
+                  type: "radio",
+                  name: "screenshotMode",
+                  checked: mode === opt.id,
+                  onChange: () => setMode(opt.id),
+                  style: { marginRight: 10 }
+                }
+              ),
+              /* @__PURE__ */ jsxs("div", { children: [
+                /* @__PURE__ */ jsx("div", { style: { color: theme.text, fontWeight: "bold", fontSize: 14 }, children: opt.label }),
+                /* @__PURE__ */ jsx("div", { style: { fontSize: 11, color: theme.textMuted }, children: opt.desc })
+              ] })
+            ]
+          },
+          opt.id
+        )),
+        /* @__PURE__ */ jsx(
+          Button,
+          {
+            theme,
+            onClick: () => onCapture(mode),
+            style: { width: "100%", marginTop: 10, height: 40 },
+            children: t("btn_confirm") || "确定"
+          }
+        )
+      ] })
+    }
+  );
+};
+
 const ViewpointPanel = ({
   t,
   onClose,
@@ -6652,148 +8122,111 @@ const ViewpointPanel = ({
   onUpdateName,
   onLoad,
   onDelete,
+  onOverwrite,
   theme
 }) => {
   const [newName, setNewName] = useState("");
+  const [editingNames, setEditingNames] = useState({});
   useEffect(() => {
     setNewName(`${t("viewpoint_title") || "视点"} ${viewpoints.length + 1}`);
   }, [viewpoints.length, t]);
+  useEffect(() => {
+    setEditingNames(
+      viewpoints.reduce((acc, vp) => {
+        acc[vp.id] = vp.name;
+        return acc;
+      }, {})
+    );
+  }, [viewpoints]);
   const handleSave = () => {
-    if (newName.trim()) {
-      onSave(newName.trim());
-      setNewName(`${t("viewpoint_title") || "视点"} ${viewpoints.length + 1}`);
-    }
+    const normalized = newName.trim();
+    if (!normalized) return;
+    onSave(normalized);
+    setNewName(`${t("viewpoint_title") || "视点"} ${viewpoints.length + 1}`);
   };
-  const handleKeyDown = (e) => {
-    if (e.key === "Enter") {
-      handleSave();
+  const handleRenameCommit = (id) => {
+    const nextName = (editingNames[id] || "").trim();
+    if (!nextName) {
+      setEditingNames((prev) => ({
+        ...prev,
+        [id]: viewpoints.find((vp) => vp.id === id)?.name || ""
+      }));
+      return;
     }
+    onUpdateName(id, nextName);
   };
-  return /* @__PURE__ */ jsx(FloatingPanel, { title: t("viewpoint_title") || "视点管理", onClose, width: 360, height: 450, resizable: true, theme, storageId: "tool_viewpoint", children: /* @__PURE__ */ jsxs("div", { style: { padding: "12px", display: "flex", flexDirection: "column", height: "100%" }, children: [
-    /* @__PURE__ */ jsx("div", { style: { marginBottom: 12 }, children: /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: 4 }, children: [
-      /* @__PURE__ */ jsx(
-        "input",
-        {
-          autoFocus: true,
-          value: newName,
-          onChange: (e) => setNewName(e.target.value),
-          onKeyDown: handleKeyDown,
-          style: {
-            flex: 1,
-            height: 28,
-            padding: "0 10px",
-            backgroundColor: theme.bg,
-            color: theme.text,
-            border: `1px solid ${theme.border}`,
-            borderRadius: 3,
-            fontSize: 12,
-            outline: "none",
-            fontFamily: DEFAULT_FONT,
-            boxSizing: "border-box",
-            width: "140px"
-          },
-          placeholder: t("viewpoint_title") || "视点名称"
-        }
-      ),
-      /* @__PURE__ */ jsx(Button, { theme, onClick: handleSave, style: { height: 28, padding: "0 12px", minWidth: "60px", whiteSpace: "nowrap", fontSize: 12 }, children: t("btn_confirm") || "保存" })
-    ] }) }),
-    /* @__PURE__ */ jsx("div", { style: {
-      flex: 1,
-      overflowY: "auto",
-      border: `1px solid ${theme.border}`,
-      borderRadius: 4,
-      backgroundColor: theme.bg,
-      padding: "8px",
-      fontSize: "12px",
-      color: theme.textMuted
-    }, children: viewpoints.length === 0 ? /* @__PURE__ */ jsx("div", { style: { textAlign: "center", color: theme.textMuted, fontSize: 12, padding: "40px 0" }, children: t("viewpoint_empty") || "暂无保存的视点" }) : /* @__PURE__ */ jsx("div", { style: { display: "flex", flexDirection: "column", gap: "8px" }, children: viewpoints.map((vp) => /* @__PURE__ */ jsxs(
-      "div",
-      {
-        style: {
-          display: "flex",
-          alignItems: "center",
-          gap: "10px",
-          padding: "8px",
-          border: `1px solid ${theme.border}`,
-          borderRadius: 4,
-          cursor: "pointer",
-          backgroundColor: theme.panelBg,
-          transition: "all 0.2s"
-        },
-        onClick: () => onLoad(vp),
-        onMouseEnter: (e) => {
-          e.currentTarget.style.backgroundColor = theme.itemHover;
-          e.currentTarget.style.borderColor = theme.accent;
-        },
-        onMouseLeave: (e) => {
-          e.currentTarget.style.backgroundColor = theme.panelBg;
-          e.currentTarget.style.borderColor = theme.border;
-        },
-        children: [
-          /* @__PURE__ */ jsx("div", { style: {
-            width: 96,
-            height: 72,
-            backgroundColor: theme.bg,
-            borderRadius: 3,
-            overflow: "hidden",
-            flexShrink: 0,
-            border: `1px solid ${theme.border}`
-          }, children: vp.image ? /* @__PURE__ */ jsx(
-            "img",
-            {
-              src: vp.image,
-              alt: vp.name,
-              style: { width: "100%", height: "100%", objectFit: "cover" }
-            }
-          ) : /* @__PURE__ */ jsx("div", { style: {
-            width: "100%",
-            height: "100%",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            color: theme.textMuted,
-            fontSize: 10
-          }, children: "无图" }) }),
-          /* @__PURE__ */ jsx("div", { style: {
-            fontSize: "12px",
-            color: theme.text,
-            flex: 1,
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap"
-          }, children: vp.name }),
+  return /* @__PURE__ */ jsx(
+    FloatingPanel,
+    {
+      title: t("viewpoint_title") || "视点管理",
+      onClose,
+      width: 380,
+      height: 470,
+      resizable: true,
+      theme,
+      storageId: "tool_viewpoint",
+      children: /* @__PURE__ */ jsxs("div", { className: "ui-panel-stack", style: { height: "100%" }, children: [
+        /* @__PURE__ */ jsx("div", { className: "ui-panel-section", children: /* @__PURE__ */ jsx("div", { className: "ui-form-row ui-form-row-top", children: /* @__PURE__ */ jsx("div", { className: "ui-form-value ui-form-value-stretch", children: /* @__PURE__ */ jsxs("div", { className: "ui-inline-actions", children: [
           /* @__PURE__ */ jsx(
-            "div",
+            "input",
             {
-              onClick: (e) => {
-                e.stopPropagation();
-                onDelete(vp.id);
+              autoFocus: true,
+              value: newName,
+              onChange: (e) => setNewName(e.target.value),
+              onKeyDown: (e) => {
+                if (e.key === "Enter") handleSave();
               },
-              style: {
-                cursor: "pointer",
-                color: theme.danger,
-                opacity: 0.7,
-                padding: "4px",
-                borderRadius: 3,
-                fontSize: "11px",
-                flexShrink: 0
-              },
-              onMouseEnter: (e) => {
-                e.currentTarget.style.opacity = "1";
-                e.currentTarget.style.backgroundColor = `${theme.danger}20`;
-              },
-              onMouseLeave: (e) => {
-                e.currentTarget.style.opacity = "0.7";
-                e.currentTarget.style.backgroundColor = "transparent";
-              },
-              children: "删除"
+              className: "ui-input",
+              placeholder: t("viewpoint_title") || "视点名称"
             }
-          )
-        ]
-      },
-      vp.id
-    )) }) })
-  ] }) });
+          ),
+          /* @__PURE__ */ jsx(Button, { variant: "primary", onClick: handleSave, children: t("btn_confirm") || "保存" })
+        ] }) }) }) }),
+        /* @__PURE__ */ jsx("div", { className: "ui-panel-section ui-panel-section-fill", children: viewpoints.length === 0 ? /* @__PURE__ */ jsx("div", { className: "ui-empty-state", children: t("viewpoint_empty") || "暂无保存的视点" }) : /* @__PURE__ */ jsx("div", { className: "ui-viewpoint-list", children: viewpoints.map((vp) => /* @__PURE__ */ jsxs("div", { className: "ui-viewpoint-card", children: [
+          /* @__PURE__ */ jsx(
+            "button",
+            {
+              className: "ui-viewpoint-preview",
+              onClick: () => onLoad(vp),
+              title: t("viewpoint_load") || "恢复视点",
+              children: vp.image ? /* @__PURE__ */ jsx(
+                "img",
+                {
+                  src: vp.image,
+                  alt: vp.name,
+                  style: { width: "100%", height: "100%", objectFit: "cover" }
+                }
+              ) : /* @__PURE__ */ jsx("div", { className: "ui-empty-state", style: { minHeight: "100%" }, children: t("viewpoint_no_preview") || "无预览" })
+            }
+          ),
+          /* @__PURE__ */ jsxs("div", { className: "ui-viewpoint-main", children: [
+            /* @__PURE__ */ jsx(
+              "input",
+              {
+                className: "ui-input",
+                value: editingNames[vp.id] || "",
+                onChange: (e) => setEditingNames((prev) => ({
+                  ...prev,
+                  [vp.id]: e.target.value
+                })),
+                onBlur: () => handleRenameCommit(vp.id),
+                onKeyDown: (e) => {
+                  if (e.key === "Enter") {
+                    e.currentTarget.blur();
+                  }
+                }
+              }
+            ),
+            /* @__PURE__ */ jsxs("div", { className: "ui-inline-actions ui-inline-actions-wrap", children: [
+              /* @__PURE__ */ jsx(Button, { variant: "default", onClick: () => onLoad(vp), children: t("viewpoint_load") || "恢复" }),
+              /* @__PURE__ */ jsx(Button, { variant: "ghost", onClick: () => onOverwrite(vp.id), children: t("viewpoint_overwrite") || "覆盖" }),
+              /* @__PURE__ */ jsx(Button, { variant: "ghost", onClick: () => onDelete(vp.id), children: t("delete_item") || "删除" })
+            ] })
+          ] })
+        ] }, vp.id)) }) })
+      ] })
+    }
+  );
 };
 
 const formatTime = (val) => {
@@ -6908,6 +8341,116 @@ const SunPanel = ({ t, onClose, settings, onUpdate, theme }) => {
   ] }) });
 };
 
+const Row = ({ label, children, stretch = false }) => /* @__PURE__ */ jsxs(
+  "div",
+  {
+    className: "flex items-center justify-between",
+    style: { marginBottom: "8px", minHeight: "28px", gap: "12px" },
+    children: [
+      /* @__PURE__ */ jsx(
+        "span",
+        {
+          className: "text-sm text-secondary flex-shrink-0",
+          style: { minWidth: "84px" },
+          children: label
+        }
+      ),
+      /* @__PURE__ */ jsx(
+        "div",
+        {
+          className: "flex items-center",
+          style: {
+            flex: stretch ? 1 : "0 1 auto",
+            justifyContent: stretch ? "flex-start" : "flex-end",
+            minWidth: stretch ? 0 : void 0
+          },
+          children
+        }
+      )
+    ]
+  }
+);
+const ExplodePanel = ({
+  t,
+  onClose,
+  enabled,
+  strength,
+  mode,
+  onEnabledChange,
+  onStrengthChange,
+  onModeChange,
+  onReset,
+  theme
+}) => {
+  return /* @__PURE__ */ jsx(
+    FloatingPanel,
+    {
+      title: t("explode_title") || "爆炸图",
+      onClose,
+      width: 340,
+      storageId: "tool_explode",
+      modal: false,
+      autoHeight: true,
+      theme,
+      children: /* @__PURE__ */ jsxs(
+        "div",
+        {
+          style: {
+            padding: "12px",
+            display: "flex",
+            flexDirection: "column",
+            gap: "8px"
+          },
+          children: [
+            /* @__PURE__ */ jsx(Row, { label: t("explode_enable") || "启用", children: /* @__PURE__ */ jsx(Switch, { checked: enabled, onChange: onEnabledChange }) }),
+            /* @__PURE__ */ jsx(Row, { label: t("explode_strength") || "强度", stretch: true, children: /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", gap: "8px", width: "100%" }, children: [
+              /* @__PURE__ */ jsx("div", { style: { flex: 1, minWidth: 0 }, children: /* @__PURE__ */ jsx(
+                Slider,
+                {
+                  min: 0,
+                  max: 100,
+                  step: 1,
+                  value: strength,
+                  onChange: onStrengthChange
+                }
+              ) }),
+              /* @__PURE__ */ jsxs(
+                "div",
+                {
+                  style: {
+                    color: "var(--text-secondary)",
+                    fontSize: "12px",
+                    minWidth: "42px",
+                    textAlign: "right",
+                    fontVariantNumeric: "tabular-nums"
+                  },
+                  children: [
+                    strength,
+                    "%"
+                  ]
+                }
+              )
+            ] }) }),
+            /* @__PURE__ */ jsx(Row, { label: t("explode_mode") || "方向", stretch: true, children: /* @__PURE__ */ jsx(
+              SegmentedControl$1,
+              {
+                options: [
+                  { value: "radial", label: t("explode_mode_radial") || "四周" },
+                  { value: "horizontal", label: t("explode_mode_horizontal") || "横向" },
+                  { value: "vertical", label: t("explode_mode_vertical") || "纵向" }
+                ],
+                value: mode,
+                onChange: (value) => onModeChange(value)
+              }
+            ) }),
+            /* @__PURE__ */ jsx("div", { style: { display: "flex", justifyContent: "flex-end", paddingTop: "4px" }, children: /* @__PURE__ */ jsx(Button, { variant: "ghost", className: "ui-properties-action", onClick: onReset, children: t("explode_reset") || "重置" }) })
+          ]
+        }
+      )
+    }
+  );
+};
+
 const LoadingOverlay = ({ t, loading, status, progress, theme }) => {
   if (!loading) return null;
   return /* @__PURE__ */ jsx("div", { className: "ui-loading-overlay", children: /* @__PURE__ */ jsxs("div", { className: "ui-loading-box", children: [
@@ -6944,10 +8487,13 @@ const LoadingOverlay = ({ t, loading, status, progress, theme }) => {
   ] }) });
 };
 
-const PropertiesPanel = ({ t, selectedProps, theme }) => {
+const PropertiesPanel = ({ t, selectedProps }) => {
   const [collapsed, setCollapsed] = useState(/* @__PURE__ */ new Set());
   const [searchQuery, setSearchQuery] = useState("");
   const [copiedText, setCopiedText] = useState(null);
+  const currentGroups = useMemo(() => {
+    return selectedProps;
+  }, [selectedProps]);
   const toggleGroup = (group) => {
     const next = new Set(collapsed);
     if (next.has(group)) next.delete(group);
@@ -6963,14 +8509,17 @@ const PropertiesPanel = ({ t, selectedProps, theme }) => {
       console.error("Failed to copy", e);
     }
   };
-  const filteredProps = React.useMemo(() => {
-    if (!selectedProps || !searchQuery) return selectedProps;
+  const serializeGroups = (groups) => Object.entries(groups).map(
+    ([group, props]) => [`[${group}]`, ...Object.entries(props).map(([key, value]) => `${key}: ${value}`)].join("\n")
+  ).join("\n\n");
+  const filteredProps = useMemo(() => {
+    if (!currentGroups || !searchQuery) return currentGroups;
     const query = searchQuery.toLowerCase();
     const result = {};
-    Object.entries(selectedProps).forEach(([group, props]) => {
+    Object.entries(currentGroups).forEach(([group, props]) => {
       const filteredGroupProps = {};
       Object.entries(props).forEach(([k, v]) => {
-        if (k.toLowerCase().includes(query) || String(v).toLowerCase().includes(query)) {
+        if (group.toLowerCase().includes(query) || k.toLowerCase().includes(query) || String(v).toLowerCase().includes(query)) {
           filteredGroupProps[k] = v;
         }
       });
@@ -6979,35 +8528,59 @@ const PropertiesPanel = ({ t, selectedProps, theme }) => {
       }
     });
     return result;
-  }, [selectedProps, searchQuery]);
+  }, [currentGroups, searchQuery]);
+  const groupCount = filteredProps ? Object.keys(filteredProps).length : 0;
+  const itemCount = filteredProps ? Object.values(filteredProps).reduce((sum, props) => sum + Object.keys(props).length, 0) : 0;
   return /* @__PURE__ */ jsxs("div", { style: { flex: 1, display: "flex", flexDirection: "column", height: "100%", overflow: "hidden", position: "relative" }, children: [
-    selectedProps && /* @__PURE__ */ jsx("div", { style: { padding: "8px", borderBottom: "1px solid var(--border-color)" }, children: /* @__PURE__ */ jsx(
-      "input",
-      {
-        type: "text",
-        placeholder: t("search_props"),
-        value: searchQuery,
-        onChange: (e) => setSearchQuery(e.target.value),
-        className: "ui-input",
-        style: {
-          width: "100%",
-          borderRadius: "0px",
-          boxSizing: "border-box"
-        }
-      }
-    ) }),
-    /* @__PURE__ */ jsx("div", { className: "flex-1 overflow-y-auto", children: filteredProps ? Object.entries(filteredProps).map(([group, props]) => /* @__PURE__ */ jsxs("div", { children: [
-      /* @__PURE__ */ jsxs(
-        "div",
+    selectedProps && /* @__PURE__ */ jsxs("div", { className: "ui-properties-toolbar", children: [
+      /* @__PURE__ */ jsx("div", { className: "ui-search-input-wrap", children: /* @__PURE__ */ jsx(
+        "input",
         {
-          className: "ui-prop-group",
-          onClick: () => toggleGroup(group),
-          children: [
-            /* @__PURE__ */ jsx("span", { children: group }),
-            /* @__PURE__ */ jsx("span", { style: { opacity: 0.6, display: "flex", alignItems: "center" }, children: collapsed.has(group) ? /* @__PURE__ */ jsx(IconChevronRight, { width: 14, height: 14 }) : /* @__PURE__ */ jsx(IconChevronDown, { width: 14, height: 14 }) })
-          ]
+          type: "text",
+          placeholder: t("search_props"),
+          value: searchQuery,
+          onChange: (e) => setSearchQuery(e.target.value),
+          className: "ui-input ui-input-compact"
         }
-      ),
+      ) }),
+      /* @__PURE__ */ jsxs("div", { className: "ui-properties-subbar", children: [
+        /* @__PURE__ */ jsxs("div", { className: "ui-properties-meta", children: [
+          (searchQuery ? `${t("search_results") || "结果数"}` : `${t("prop_groups") || "分组"}`) + `: ${groupCount}`,
+          /* @__PURE__ */ jsx("span", { children: " · " }),
+          (t("prop_items") || "条目") + `: ${itemCount}`
+        ] }),
+        /* @__PURE__ */ jsx("div", { className: "ui-properties-actions", children: /* @__PURE__ */ jsx(
+          Button,
+          {
+            variant: "ghost",
+            className: "ui-properties-action",
+            onClick: () => currentGroups && handleCopy(serializeGroups(currentGroups)),
+            disabled: !currentGroups,
+            children: t("copy_all_props") || "复制全部"
+          }
+        ) })
+      ] })
+    ] }),
+    /* @__PURE__ */ jsx("div", { className: "flex-1 overflow-y-auto", children: filteredProps ? Object.entries(filteredProps).map(([group, props]) => /* @__PURE__ */ jsxs("div", { children: [
+      /* @__PURE__ */ jsxs("div", { className: "ui-prop-group", onClick: () => toggleGroup(group), children: [
+        /* @__PURE__ */ jsx("span", { children: group }),
+        /* @__PURE__ */ jsxs("div", { className: "ui-prop-group-actions", children: [
+          /* @__PURE__ */ jsx(
+            "button",
+            {
+              className: "ui-prop-copy",
+              onClick: (e) => {
+                e.stopPropagation();
+                handleCopy(
+                  [`[${group}]`, ...Object.entries(props).map(([k, v]) => `${k}: ${v}`)].join("\n")
+                );
+              },
+              children: t("copy_group_props") || "复制组"
+            }
+          ),
+          /* @__PURE__ */ jsx("span", { style: { opacity: 0.6, display: "flex", alignItems: "center" }, children: collapsed.has(group) ? /* @__PURE__ */ jsx(IconChevronRight, { width: 14, height: 14 }) : /* @__PURE__ */ jsx(IconChevronDown, { width: 14, height: 14 }) })
+        ] })
+      ] }),
       !collapsed.has(group) && Object.entries(props).map(([k, v]) => /* @__PURE__ */ jsxs("div", { className: "ui-prop-row", children: [
         /* @__PURE__ */ jsx("div", { className: "ui-prop-key", title: k, children: k }),
         /* @__PURE__ */ jsx(
@@ -7022,7 +8595,25 @@ const PropertiesPanel = ({ t, selectedProps, theme }) => {
         )
       ] }, k))
     ] }, group)) : /* @__PURE__ */ jsx("div", { style: { padding: 20, color: "var(--text-muted)", textAlign: "center", marginTop: 20 }, children: t("no_selection") }) }),
-    copiedText && /* @__PURE__ */ jsx("div", { style: { position: "absolute", bottom: "20px", left: "50%", transform: "translateX(-50%)", background: "rgba(0,0,0,0.7)", color: "white", padding: "6px 12px", borderRadius: "4px", fontSize: "12px", zIndex: 100, pointerEvents: "none" }, children: t("copied") || "已复制" })
+    copiedText && /* @__PURE__ */ jsx(
+      "div",
+      {
+        style: {
+          position: "absolute",
+          bottom: "20px",
+          left: "50%",
+          transform: "translateX(-50%)",
+          background: "rgba(0,0,0,0.7)",
+          color: "white",
+          padding: "6px 12px",
+          borderRadius: "4px",
+          fontSize: "12px",
+          zIndex: 100,
+          pointerEvents: "none"
+        },
+        children: t("copied") || "已复制"
+      }
+    )
   ] });
 };
 
@@ -7103,16 +8694,7 @@ const ConfirmModal = ({ isOpen, title, message, onConfirm, onCancel, t, theme })
 
 const AboutModal = ({ isOpen, onClose, t, theme }) => {
   if (!isOpen) return null;
-  const [showLicenseDetails, setShowLicenseDetails] = useState(false);
-  const [showThirdParty, setShowThirdParty] = useState(false);
-  const thirdPartyLibraries = [
-    { name: "three", version: "^0.181.2", description: "3D graphics library" },
-    { name: "react", version: "^19.2.0", description: "UI library" },
-    { name: "react-dom", version: "^19.2.0", description: "React DOM renderer" },
-    { name: "3d-tiles-renderer", version: "0.3.31", description: "3D Tiles rendering" },
-    { name: "web-ifc", version: "^0.0.74", description: "IFC file parser" },
-    { name: "occt-import-js", version: "^0.0.23", description: "CAD file import" }
-  ];
+  const [showLicenseDetails, setShowLicenseDetails] = useState(true);
   return /* @__PURE__ */ jsx(
     FloatingPanel,
     {
@@ -7121,6 +8703,7 @@ const AboutModal = ({ isOpen, onClose, t, theme }) => {
       width: 400,
       height: 520,
       modal: true,
+      movable: false,
       theme,
       children: /* @__PURE__ */ jsxs("div", { style: { padding: "12px", display: "flex", flexDirection: "column", gap: "10px", height: "100%", overflowY: "auto" }, children: [
         /* @__PURE__ */ jsxs("div", { style: { textAlign: "center" }, children: [
@@ -7128,6 +8711,10 @@ const AboutModal = ({ isOpen, onClose, t, theme }) => {
           /* @__PURE__ */ jsx("div", { style: { fontSize: "11px", opacity: 0.7 }, children: "Professional 3D Model Viewer" })
         ] }),
         /* @__PURE__ */ jsxs("div", { style: { width: "100%", display: "flex", flexDirection: "column", gap: "8px", fontSize: "12px" }, children: [
+          /* @__PURE__ */ jsxs("div", { style: { display: "flex", justifyContent: "space-between", borderBottom: "1px solid var(--border-color)", paddingBottom: "6px" }, children: [
+            /* @__PURE__ */ jsx("span", { style: { opacity: 0.7 }, children: t("about_version") }),
+            /* @__PURE__ */ jsx("span", { style: { fontWeight: "500" }, children: "1.5.7" })
+          ] }),
           /* @__PURE__ */ jsxs("div", { style: { display: "flex", justifyContent: "space-between", borderBottom: "1px solid var(--border-color)", paddingBottom: "6px" }, children: [
             /* @__PURE__ */ jsx("span", { style: { opacity: 0.7 }, children: t("about_author") }),
             /* @__PURE__ */ jsx("span", { style: { fontWeight: "500" }, children: "zhangly1403@163.com" })
@@ -7168,38 +8755,6 @@ const AboutModal = ({ isOpen, onClose, t, theme }) => {
               " ",
               /* @__PURE__ */ jsx("a", { href: "https://creativecommons.org/licenses/by-nc/4.0/", target: "_blank", rel: "noopener noreferrer", className: "ui-link", children: "CC BY-NC 4.0" })
             ] })
-          ] })
-        ] }),
-        /* @__PURE__ */ jsxs("div", { style: { border: "1px solid var(--border-color)", borderRadius: "4px", overflow: "hidden" }, children: [
-          /* @__PURE__ */ jsxs(
-            "div",
-            {
-              style: {
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                padding: "8px 12px",
-                backgroundColor: "var(--bg-header)",
-                cursor: "pointer",
-                userSelect: "none"
-              },
-              onClick: () => setShowThirdParty(!showThirdParty),
-              children: [
-                /* @__PURE__ */ jsx("span", { style: { fontWeight: "500", fontSize: "12px" }, children: t("third_party_libs") }),
-                showThirdParty ? /* @__PURE__ */ jsx(IconChevronUp, { width: 14, height: 14 }) : /* @__PURE__ */ jsx(IconChevronDown, { width: 14, height: 14 })
-              ]
-            }
-          ),
-          showThirdParty && /* @__PURE__ */ jsxs("div", { style: { padding: "12px", fontSize: "11px", lineHeight: "1.5", backgroundColor: "var(--bg-primary)", maxHeight: "180px", overflowY: "auto" }, children: [
-            /* @__PURE__ */ jsx("div", { style: { marginBottom: "8px", opacity: 0.8 }, children: t("third_party_desc") }),
-            /* @__PURE__ */ jsx("div", { style: { display: "flex", flexDirection: "column", gap: "6px" }, children: thirdPartyLibraries.map((lib, index) => /* @__PURE__ */ jsxs("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "flex-start" }, children: [
-              /* @__PURE__ */ jsxs("div", { style: { flex: 1 }, children: [
-                /* @__PURE__ */ jsx("div", { style: { fontWeight: "500" }, children: lib.name }),
-                /* @__PURE__ */ jsx("div", { style: { fontSize: "10px", opacity: 0.7 }, children: lib.description })
-              ] }),
-              /* @__PURE__ */ jsx("div", { style: { fontSize: "10px", opacity: 0.7, minWidth: "50px", textAlign: "right" }, children: lib.version })
-            ] }, index)) }),
-            /* @__PURE__ */ jsx("div", { style: { fontSize: "10px", opacity: 0.7, marginTop: "8px", borderTop: "1px solid var(--border-color)", paddingTop: "8px" }, children: t("view_package_json") })
           ] })
         ] }),
         /* @__PURE__ */ jsx("div", { style: { fontSize: "11px", opacity: 0.5, textAlign: "center", marginTop: "auto" }, children: "Copyright © 2026. All rights reserved." })
@@ -7505,84 +9060,6 @@ class ErrorBoundary extends Component {
   }
 }
 
-const ContextMenu = ({ x, y, items, onClose, theme }) => {
-  const menuRef = useRef(null);
-  useEffect(() => {
-    const handleClickOutside = (e) => {
-      if (menuRef.current && !menuRef.current.contains(e.target)) {
-        onClose();
-      }
-    };
-    const handleEscape = (e) => {
-      if (e.key === "Escape") {
-        onClose();
-      }
-    };
-    document.addEventListener("mousedown", handleClickOutside);
-    document.addEventListener("keydown", handleEscape);
-    return () => {
-      document.removeEventListener("mousedown", handleClickOutside);
-      document.removeEventListener("keydown", handleEscape);
-    };
-  }, [onClose]);
-  return /* @__PURE__ */ jsx(
-    "div",
-    {
-      ref: menuRef,
-      className: "ui-context-menu",
-      style: { left: x, top: y },
-      children: items.map((item, index) => {
-        if (item.divider) {
-          return /* @__PURE__ */ jsx(
-            "div",
-            {
-              className: "ui-context-menu-divider"
-            },
-            index
-          );
-        }
-        if (item.slider) {
-          return /* @__PURE__ */ jsxs("div", { className: "ui-context-menu-item", style: { display: "flex", flexDirection: "column", gap: "4px", cursor: "default" }, children: [
-            /* @__PURE__ */ jsxs("div", { style: { display: "flex", justifyContent: "space-between", fontSize: "12px" }, children: [
-              /* @__PURE__ */ jsx("span", { children: item.label }),
-              /* @__PURE__ */ jsxs("span", { children: [
-                Math.round((item.value || 0) * 100),
-                "%"
-              ] })
-            ] }),
-            /* @__PURE__ */ jsx(
-              "input",
-              {
-                type: "range",
-                min: "0",
-                max: "1",
-                step: "0.01",
-                value: item.value || 0,
-                onChange: (e) => item.onChange?.(parseFloat(e.target.value)),
-                style: { width: "100%", cursor: "pointer" }
-              }
-            )
-          ] }, index);
-        }
-        return /* @__PURE__ */ jsx(
-          "div",
-          {
-            onClick: () => {
-              if (!item.disabled && item.onClick) {
-                item.onClick();
-                onClose();
-              }
-            },
-            className: `ui-context-menu-item ${item.disabled ? "disabled" : ""}`,
-            children: item.label
-          },
-          index
-        );
-      })
-    }
-  );
-};
-
 function usePersistentState(key, initialValue, options = {}) {
   const {
     storage = typeof window !== "undefined" ? window.localStorage : void 0,
@@ -7675,6 +9152,28 @@ async function loadSceneItems({
   }
 }
 
+function buildSelectedPropertyGroups({
+  basicLabel,
+  geoLabel,
+  basicProps,
+  geoProps,
+  ifcProps,
+  nbimProps,
+  nbimLabel = "BIM 属性"
+}) {
+  const groups = {
+    [basicLabel]: basicProps,
+    [geoLabel]: geoProps
+  };
+  if (ifcProps) {
+    Object.assign(groups, ifcProps);
+  }
+  if (nbimProps) {
+    groups[nbimLabel] = nbimProps;
+  }
+  return groups;
+}
+
 const ThreeViewer = ({
   allowDragOpen = true,
   hiddenMenus = [],
@@ -7718,7 +9217,10 @@ const ThreeViewer = ({
   const [treeRoot, setTreeRoot] = useState([]);
   const [selectedUuids, setSelectedUuids] = useState([]);
   const selectedUuid = selectedUuids.length > 0 ? selectedUuids[selectedUuids.length - 1] : null;
+  const [locatedUuid, setLocatedUuid] = useState(null);
+  const [locateResultUuids, setLocateResultUuids] = useState([]);
   const [selectedProps, setSelectedProps] = useState(null);
+  const [selectedIfcStorey, setSelectedIfcStorey] = useState("");
   const [status, setStatus] = useState(getTranslation(lang, "ready"));
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -7736,6 +9238,9 @@ const ThreeViewer = ({
   });
   const [chunkProgress, setChunkProgress] = useState({ loaded: 0, total: 0 });
   const [activeTool, setActiveTool] = useState("none");
+  const [explodeEnabled, setExplodeEnabled] = useState(false);
+  const [explodeStrength, setExplodeStrength] = useState(32);
+  const [explodeMode, setExplodeMode] = useState("radial");
   const [mousePos, setMousePos] = useState(null);
   const [displayMode, setDisplayMode] = useState("solid");
   const [viewpoints, setViewpoints] = useState([]);
@@ -7746,6 +9251,25 @@ const ThreeViewer = ({
   const [clipEnabled, setClipEnabled] = useState(false);
   const [clipValues, setClipValues] = useState({ x: [0, 100], y: [0, 100], z: [0, 100] });
   const [clipActive, setClipActive] = useState({ x: false, y: false, z: false });
+  const [clipHelperVisible, setClipHelperVisible] = usePersistentState(
+    "3dbrowser_clipHelperVisible",
+    initialSettings?.clip?.helperVisible ?? false,
+    {
+      serializer: (value) => String(value),
+      parser: (raw) => raw === "true"
+    }
+  );
+  const [clipHelperOpacity, setClipHelperOpacity] = usePersistentState(
+    "3dbrowser_clipHelperOpacity",
+    initialSettings?.clip?.helperOpacity ?? 0.12,
+    {
+      serializer: (value) => String(value),
+      parser: (raw) => {
+        const parsed = Number(raw);
+        return Number.isFinite(parsed) ? parsed : 0.12;
+      }
+    }
+  );
   const [pickEnabled, setPickEnabled] = usePersistentState("3dbrowser_pickEnabled", false, {
     serializer: (value) => String(value),
     parser: (raw) => raw === "true"
@@ -7772,15 +9296,23 @@ const ThreeViewer = ({
       toneMapping: "aces",
       exposure: 1,
       shadowQuality: "medium",
+      ifcGridVisible: true,
       adaptiveQuality: true,
       minPixelRatio: 0.8,
       maxPixelRatio: 2,
       targetFps: 50,
+      performanceMode: "balanced",
       sunEnabled: false,
       sunLatitude: 0,
       sunLongitude: 0,
       sunTime: 12,
-      sunShadow: false
+      sunShadow: false,
+      highlightColor: "#ff9f1c",
+      highlightShowBox: false,
+      clip: {
+        helperVisible: initialSettings?.clip?.helperVisible ?? false,
+        helperOpacity: initialSettings?.clip?.helperOpacity ?? 0.12
+      }
     };
     const merged = initialSettings ? { ...baseSettings, ...initialSettings } : baseSettings;
     return sceneBgFollowsTheme ? { ...merged, bgColor: theme.canvasBg } : merged;
@@ -7804,8 +9336,11 @@ const ThreeViewer = ({
   const canvasRef = useRef(null);
   const viewportRef = useRef(null);
   const sceneMgr = useRef(null);
+  const ifcPropertyCacheRef = useRef(/* @__PURE__ */ new Map());
   const [mgrInstance, setMgrInstance] = useState(null);
   const pointerDownRef = useRef(null);
+  const mouseMoveRafRef = useRef(null);
+  const pendingMousePointRef = useRef(null);
   const handleThemeModeChange = useCallback((nextThemeMode) => {
     setThemeMode(nextThemeMode);
     const nextTheme = themes[nextThemeMode];
@@ -7833,6 +9368,19 @@ const ThreeViewer = ({
       return merged;
     });
   }, [sceneBgFollowsTheme, setSceneSettings, theme.canvasBg]);
+  useEffect(() => {
+    const normalizedOpacity = Math.min(0.35, Math.max(0.05, clipHelperOpacity));
+    if (normalizedOpacity !== clipHelperOpacity) {
+      setClipHelperOpacity(normalizedOpacity);
+      return;
+    }
+    if (sceneMgr.current) {
+      sceneMgr.current.setClipHelperOptions({
+        visible: clipHelperVisible,
+        opacity: normalizedOpacity
+      });
+    }
+  }, [clipHelperVisible, clipHelperOpacity, setClipHelperOpacity]);
   const hasModels = treeRoot.length > 0;
   const completedFileSetsRef = useRef(/* @__PURE__ */ new Set());
   const [errorState, setErrorState] = useState({ isOpen: false, title: "", message: "" });
@@ -7840,6 +9388,7 @@ const ThreeViewer = ({
   const [contextMenu, setContextMenu] = useState({ x: 0, y: 0, visible: false });
   const [hiddenUuids, setHiddenUuids] = useState(/* @__PURE__ */ new Set());
   const [isolatedUuids, setIsolatedUuids] = useState(/* @__PURE__ */ new Set());
+  const [ifcGridDiagnostics, setIfcGridDiagnostics] = useState([]);
   const [contextMenuOpacity, setContextMenuOpacity] = useState(1);
   const visibilityStackRef = useRef([]);
   const handleHideSelected = useCallback(() => {
@@ -7871,6 +9420,8 @@ const ThreeViewer = ({
       setIsolatedUuids(/* @__PURE__ */ new Set());
       updateTree();
     }
+    setLocatedUuid(null);
+    sceneMgr.current.clearLocateFocus();
   }, [hiddenUuids, isolatedUuids]);
   const t = useCallback((key) => getTranslation(lang, key), [lang]);
   useEffect(() => {
@@ -7963,18 +9514,17 @@ const ThreeViewer = ({
       setViewpoints([]);
     }
   }, [currentFileSetId]);
-  const handleSaveViewpoint = useCallback((customName) => {
-    if (!sceneMgr.current || !currentFileSetId) {
-      setToast({ message: t("no_models"), type: "info" });
-      return;
+  const persistViewpoints = useCallback((nextViewpoints) => {
+    if (!currentFileSetId) return;
+    setViewpoints(nextViewpoints);
+    try {
+      localStorage.setItem(`viewpoints_${currentFileSetId}`, JSON.stringify(nextViewpoints));
+    } catch (e) {
+      console.error("Failed to persist viewpoints", e);
     }
-    const hasModels2 = sceneMgr.current.contentGroup.children.length > 0;
-    if (!hasModels2) {
-      setToast({ message: t("no_models"), type: "info" });
-      return;
-    }
-    const name = customName || `${t("viewpoint_title")} ${viewpoints.length + 1}`;
-    const cameraState = sceneMgr.current.getCameraState();
+  }, [currentFileSetId]);
+  const captureViewThumbnail = useCallback(() => {
+    if (!sceneMgr.current) return "";
     let image = "";
     try {
       sceneMgr.current.renderer.render(sceneMgr.current.scene, sceneMgr.current.camera);
@@ -7989,44 +9539,59 @@ const ThreeViewer = ({
     } catch (e) {
       console.error("Failed to capture thumbnail", e);
     }
-    const newVP = {
-      id: Date.now().toString(),
-      name,
-      cameraState,
-      image
-    };
-    const nextViewpoints = [...viewpoints, newVP];
-    setViewpoints(nextViewpoints);
-    try {
-      localStorage.setItem(`viewpoints_${currentFileSetId}`, JSON.stringify(nextViewpoints));
-      setToast({ message: t("success"), type: "success" });
-    } catch (e) {
-      console.error("Failed to save viewpoints to storage", e);
+    return image;
+  }, []);
+  const handleSaveViewpoint = useCallback((customName, replaceId) => {
+    if (!sceneMgr.current || !currentFileSetId) {
+      setToast({ message: t("no_models"), type: "info" });
+      return;
     }
-  }, [viewpoints, currentFileSetId, t]);
+    const hasModels2 = sceneMgr.current.contentGroup.children.length > 0;
+    if (!hasModels2) {
+      setToast({ message: t("no_models"), type: "info" });
+      return;
+    }
+    const name = customName || `${t("viewpoint_title")} ${viewpoints.length + 1}`;
+    const cameraState = sceneMgr.current.getCameraState();
+    const image = captureViewThumbnail();
+    const nextViewpoints = replaceId ? viewpoints.map((vp) => vp.id === replaceId ? { ...vp, name, cameraState, image } : vp) : [
+      ...viewpoints,
+      {
+        id: Date.now().toString(),
+        name,
+        cameraState,
+        image
+      }
+    ];
+    persistViewpoints(nextViewpoints);
+    setToast({ message: t("success"), type: "success" });
+  }, [captureViewThumbnail, currentFileSetId, persistViewpoints, t, viewpoints]);
   const handleUpdateViewpointName = useCallback((id, newName) => {
     const nextViewpoints = viewpoints.map((v) => v.id === id ? { ...v, name: newName } : v);
-    setViewpoints(nextViewpoints);
-    try {
-      localStorage.setItem(`viewpoints_${currentFileSetId}`, JSON.stringify(nextViewpoints));
-    } catch (e) {
-      console.error("Failed to update viewpoint name", e);
-    }
-  }, [viewpoints, currentFileSetId]);
+    persistViewpoints(nextViewpoints);
+  }, [persistViewpoints, viewpoints]);
   const handleLoadViewpoint = useCallback((vp) => {
     if (!sceneMgr.current || !vp.cameraState) return;
     sceneMgr.current.setCameraState(vp.cameraState);
     setToast({ message: `${t("viewpoint_loading")}: ${vp.name}`, type: "info" });
   }, [t]);
+  const handleOverwriteViewpoint = useCallback((id) => {
+    const viewpoint = viewpoints.find((vp) => vp.id === id);
+    if (!viewpoint) return;
+    handleSaveViewpoint(viewpoint.name, id);
+  }, [handleSaveViewpoint, viewpoints]);
   const handleDeleteViewpoint = useCallback((id) => {
-    const nextViewpoints = viewpoints.filter((v) => v.id !== id);
-    setViewpoints(nextViewpoints);
-    try {
-      localStorage.setItem(`viewpoints_${currentFileSetId}`, JSON.stringify(nextViewpoints));
-    } catch (e) {
-      console.error("Failed to delete viewpoint", e);
-    }
-  }, [viewpoints, currentFileSetId]);
+    const viewpoint = viewpoints.find((vp) => vp.id === id);
+    setConfirmState({
+      isOpen: true,
+      title: t("viewpoint_title"),
+      message: `${t("confirm_delete")} "${viewpoint?.name || "Viewpoint"}"?`,
+      action: () => {
+        const nextViewpoints = viewpoints.filter((v) => v.id !== id);
+        persistViewpoints(nextViewpoints);
+      }
+    });
+  }, [persistViewpoints, t, viewpoints]);
   useEffect(() => {
     if (!viewportRef.current || !mgrInstance) return;
     const observer = new ResizeObserver((entries) => {
@@ -8114,12 +9679,16 @@ const ThreeViewer = ({
       return;
     }
     const expandedMap = /* @__PURE__ */ new Map();
+    const loadedMap = /* @__PURE__ */ new Map();
     const collectExpanded = (nodes) => {
       const stack = (nodes || []).slice();
       while (stack.length) {
         const n = stack.pop();
         if (!n) continue;
-        if (typeof n.uuid === "string") expandedMap.set(n.uuid, !!n.expanded);
+        if (typeof n.uuid === "string") {
+          expandedMap.set(n.uuid, !!n.expanded);
+          loadedMap.set(n.uuid, n.childrenLoaded !== false);
+        }
         if (Array.isArray(n.children) && n.children.length) {
           for (const child of n.children) {
             stack.push(child);
@@ -8127,41 +9696,24 @@ const ThreeViewer = ({
         }
       }
     };
-    const convertNode = (node, depth = 0, isFileNode = false) => {
-      const stack = [{ node, depth, isFileNode }];
-      const nodeMap = /* @__PURE__ */ new Map();
-      const childrenMap = /* @__PURE__ */ new Map();
-      const order = [];
-      while (stack.length) {
-        const { node: curr, depth: currDepth, isFileNode: currIsFileNode } = stack.pop();
-        if (nodeMap.has(curr)) continue;
-        const uuid = curr.id;
-        const converted = {
-          uuid,
-          name: curr.name,
-          type: curr.type === "Mesh" ? "MESH" : "GROUP",
-          depth: currDepth,
-          children: [],
-          // 暂空
-          expanded: expandedMap.get(uuid) ?? false,
-          visible: curr.visible !== false,
-          object: curr,
-          isFileNode: currIsFileNode
-        };
-        nodeMap.set(curr, converted);
-        order.push(curr);
-        const children = curr.children || [];
-        childrenMap.set(curr, children);
-        for (let i = children.length - 1; i >= 0; i--) {
-          stack.push({ node: children[i], depth: currDepth + 1, isFileNode: false });
-        }
-      }
-      for (const curr of order) {
-        const converted = nodeMap.get(curr);
-        const children = childrenMap.get(curr) || [];
-        converted.children = children.map((child) => nodeMap.get(child)).filter(Boolean);
-      }
-      return nodeMap.get(node);
+    const convertNode = (node, depth = 0, isFileNode = false, forceLoadChildren = false) => {
+      const uuid = node.id;
+      const rawChildren = Array.isArray(node.children) ? node.children : [];
+      const hasChildren = rawChildren.length > 0;
+      const shouldLoadChildren = forceLoadChildren || loadedMap.get(uuid) === true;
+      return {
+        uuid,
+        name: node.name,
+        type: node.type === "Mesh" ? "MESH" : "GROUP",
+        depth,
+        children: shouldLoadChildren ? rawChildren.map((child) => convertNode(child, depth + 1, false, false)) : [],
+        expanded: expandedMap.get(uuid) ?? false,
+        visible: node.visible !== false,
+        object: node,
+        isFileNode,
+        hasChildren,
+        childrenLoaded: shouldLoadChildren
+      };
     };
     setTreeRoot((prev) => {
       collectExpanded(prev);
@@ -8169,14 +9721,27 @@ const ThreeViewer = ({
       (root.children || []).forEach((c) => {
         if (c.name === "ImportedModels" || c.name === "Tilesets") {
           (c.children || []).forEach((child) => {
-            roots.push(convertNode(child, 0, true));
+            roots.push(convertNode(child, 0, true, true));
           });
         } else {
-          roots.push(convertNode(c, 0, true));
+          roots.push(convertNode(c, 0, true, true));
         }
       });
       return roots;
     });
+    const diagnostics = /* @__PURE__ */ new Map();
+    sceneMgr.current.contentGroup.children.forEach((child) => {
+      const items = child.userData?.ifcGridDiagnostics;
+      if (Array.isArray(items)) {
+        items.forEach((item) => {
+          if (!item) return;
+          diagnostics.set(item, (diagnostics.get(item) || 0) + 1);
+        });
+      }
+    });
+    setIfcGridDiagnostics(
+      Array.from(diagnostics.entries()).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-Hans-CN")).map(([name, count]) => `${name} x${count}`)
+    );
   }, []);
   useCallback((expanded) => {
     const update = (nodes) => {
@@ -8188,6 +9753,75 @@ const ThreeViewer = ({
     };
     setTreeRoot((prev) => update(prev));
   }, []);
+  const handleApplyIfcFiltersToViewport = useCallback((filters) => {
+    if (!sceneMgr.current) return;
+    const hasActiveFilters = Object.values(filters).some(Boolean);
+    if (!hasActiveFilters) {
+      handleShowAll();
+      return;
+    }
+    const matches = [];
+    sceneMgr.current.contentGroup.traverse((obj) => {
+      if (!obj.isMesh) return;
+      const meta = obj.userData?.ifcMetadata;
+      if (!meta) return;
+      if (filters.storey && meta.storey !== filters.storey) return;
+      if (filters.elevation && String(meta.elevation) !== filters.elevation) return;
+      if (filters.category && meta.category !== filters.category) return;
+      if (filters.system && !(meta.systems || []).includes(filters.system)) return;
+      if (filters.material && !(meta.materials || []).includes(filters.material)) return;
+      matches.push(obj.uuid);
+    });
+    if (matches.length === 0) {
+      setToast({
+        message: `${t("failed")}: ${t("no_matching_ifc_filter") || "没有匹配当前 IFC 筛选的构件"}`,
+        type: "info"
+      });
+      return;
+    }
+    sceneMgr.current.isolateObjects(matches);
+    setHiddenUuids(/* @__PURE__ */ new Set());
+    setIsolatedUuids(new Set(matches));
+    setSelectedUuids([]);
+    setSelectedProps(null);
+    setSelectedIfcStorey("");
+    updateTree();
+    setToast({
+      message: `${t("ifc_filter_applied") || "已按 IFC 筛选隔离显示"}: ${matches.length}`,
+      type: "success"
+    });
+  }, [handleShowAll, t, updateTree]);
+  const handleApplyStoreyWorkset = useCallback((storeys) => {
+    if (!sceneMgr.current || storeys.length === 0) return;
+    const storeySet = new Set(storeys.filter(Boolean));
+    if (storeySet.size === 0) return;
+    const matches = [];
+    sceneMgr.current.contentGroup.traverse((obj) => {
+      if (!obj.isMesh) return;
+      const storey = obj.userData?.ifcMetadata?.storey;
+      if (storey && storeySet.has(storey)) {
+        matches.push(obj.uuid);
+      }
+    });
+    if (matches.length === 0) {
+      setToast({
+        message: `${t("failed")}: ${t("no_matching_ifc_filter") || "没有匹配当前 IFC 筛选的构件"}`,
+        type: "info"
+      });
+      return;
+    }
+    sceneMgr.current.isolateObjects(matches);
+    setHiddenUuids(/* @__PURE__ */ new Set());
+    setIsolatedUuids(new Set(matches));
+    setSelectedUuids([]);
+    setSelectedProps(null);
+    setSelectedIfcStorey("");
+    updateTree();
+    setToast({
+      message: `${t("ifc_workset_applied") || "已按楼层工作集隔离显示"}: ${storeys.join(" / ")}`,
+      type: "success"
+    });
+  }, [t, updateTree]);
   const handleToggleVisibility = (uuid, visible) => {
     if (!sceneMgr.current) return;
     visibilityStackRef.current.push([{ uuid, visible: !visible }]);
@@ -8203,6 +9837,23 @@ const ThreeViewer = ({
     }
     updateTree();
   };
+  const handleHideObject = useCallback((uuid) => {
+    if (!sceneMgr.current) return;
+    visibilityStackRef.current.push([{ uuid, visible: true }]);
+    sceneMgr.current.setObjectVisibility(uuid, false);
+    setHiddenUuids((prev) => new Set(prev).add(uuid));
+    setSelectedUuids((prev) => prev.filter((id) => id !== uuid));
+    updateTree();
+  }, [updateTree]);
+  const handleIsolateObject = useCallback((uuid) => {
+    if (!sceneMgr.current) return;
+    sceneMgr.current.isolateObjects([uuid]);
+    setHiddenUuids(/* @__PURE__ */ new Set());
+    setIsolatedUuids(/* @__PURE__ */ new Set([uuid]));
+    setSelectedUuids([uuid]);
+    sceneMgr.current.highlightObjects([uuid]);
+    updateTree();
+  }, [updateTree]);
   const handleUndoVisibility = useCallback(() => {
     if (visibilityStackRef.current.length === 0 || !sceneMgr.current) return;
     const lastAction = visibilityStackRef.current.pop();
@@ -8255,11 +9906,11 @@ const ThreeViewer = ({
     const uuid = obj.uuid || obj.id;
     if (!uuid) return;
     sceneMgr.current.fitViewToObject(uuid);
-    sceneMgr.current.highlightObjects([uuid]);
-    setSelectedUuids([uuid]);
+    void handleSelect(obj);
   };
   const handleClearSelection = () => {
     setSelectedUuids([]);
+    setSelectedIfcStorey("");
     sceneMgr.current?.highlightObjects([]);
   };
   useEffect(() => {
@@ -8269,6 +9920,10 @@ const ThreeViewer = ({
     setMgrInstance(manager);
     if (onLoad) onLoad(manager);
     manager.updateSettings(sceneSettings);
+    manager.setClipHelperOptions({
+      visible: clipHelperVisible,
+      opacity: clipHelperOpacity
+    });
     requestAnimationFrame(() => {
       manager.resize();
     });
@@ -8330,7 +9985,7 @@ const ThreeViewer = ({
             });
             updateTree();
             setStatus(t("tileset_loaded"));
-            setTimeout(() => mgrInstance?.fitView(true), 500);
+            setTimeout(() => mgrInstance?.fitView(false), 500);
           } else {
             modelItems.push(item);
           }
@@ -8403,12 +10058,28 @@ const ThreeViewer = ({
         setMousePos(null);
         return;
       }
-      const intersect = mgr.getRayIntersects(e.clientX, e.clientY);
-      if (intersect) {
-        setMousePos(intersect.point);
-      } else {
+      if (e.buttons !== 0) {
+        pendingMousePointRef.current = null;
+        if (mouseMoveRafRef.current !== null) {
+          cancelAnimationFrame(mouseMoveRafRef.current);
+          mouseMoveRafRef.current = null;
+        }
         setMousePos(null);
+        return;
       }
+      pendingMousePointRef.current = { x: e.clientX, y: e.clientY };
+      if (mouseMoveRafRef.current !== null) return;
+      mouseMoveRafRef.current = requestAnimationFrame(() => {
+        mouseMoveRafRef.current = null;
+        const pending = pendingMousePointRef.current;
+        if (!pending) return;
+        const intersect = mgr.getRayIntersects(pending.x, pending.y);
+        if (intersect) {
+          setMousePos(intersect.point);
+        } else {
+          setMousePos(null);
+        }
+      });
     };
     const handleContextMenu = (e) => {
       e.preventDefault();
@@ -8461,6 +10132,11 @@ const ThreeViewer = ({
     canvas.addEventListener("contextmenu", handleContextMenu);
     window.addEventListener("keydown", handleKeyDown);
     return () => {
+      if (mouseMoveRafRef.current !== null) {
+        cancelAnimationFrame(mouseMoveRafRef.current);
+        mouseMoveRafRef.current = null;
+      }
+      pendingMousePointRef.current = null;
       canvas.removeEventListener("mousedown", handleMouseDown);
       canvas.removeEventListener("click", handleClick);
       canvas.removeEventListener("mousemove", handleMouseMove);
@@ -8547,11 +10223,24 @@ const ThreeViewer = ({
       sceneMgr.current.startMeasurement(measureType);
     }
   }, [measureType]);
+  useEffect(() => {
+    if (!sceneMgr.current) return;
+    sceneMgr.current.setExplodeEnabled(explodeEnabled);
+  }, [explodeEnabled]);
+  useEffect(() => {
+    if (!sceneMgr.current) return;
+    sceneMgr.current.setExplodeStrength(explodeStrength);
+  }, [explodeStrength]);
+  useEffect(() => {
+    if (!sceneMgr.current) return;
+    sceneMgr.current.setExplodeMode(explodeMode);
+  }, [explodeMode]);
   const handleSelect = async (obj, _intersect, isMultiSelect = false) => {
     if (!sceneMgr.current) return;
     if (!obj) {
       setSelectedUuids([]);
       setSelectedProps(null);
+      setSelectedIfcStorey("");
       sceneMgr.current.highlightObjects([]);
       return;
     }
@@ -8573,12 +10262,34 @@ const ThreeViewer = ({
     }
     if (!realObj && sceneMgr.current) ;
     const target = realObj || obj;
+    const targetStorey = target?.userData?.ifcMetadata?.storey || (target instanceof THREE.Object3D ? (() => {
+      let cursor = target;
+      while (cursor) {
+        const storey = cursor.userData?.ifcMetadata?.storey;
+        if (storey) return storey;
+        cursor = cursor.parent;
+      }
+      return "";
+    })() : "");
+    setSelectedIfcStorey(targetStorey || "");
+    const targetElevation = typeof target?.userData?.ifcMetadata?.elevation === "number" ? target.userData.ifcMetadata.elevation : target instanceof THREE.Object3D ? (() => {
+      let cursor = target;
+      while (cursor) {
+        const elevation = cursor.userData?.ifcMetadata?.elevation;
+        if (typeof elevation === "number" && Number.isFinite(elevation)) return elevation;
+        cursor = cursor.parent;
+      }
+      return void 0;
+    })() : void 0;
     const basicProps = {};
     const geoProps = {};
-    const ifcProps = {};
+    let ifcGroups = null;
     basicProps[t("prop_name")] = target.name || "Unnamed";
     basicProps[t("prop_type")] = target.type || (target.children ? "Group" : "Mesh");
     basicProps[t("prop_id")] = focusUuid;
+    if (typeof targetElevation === "number" && Number.isFinite(targetElevation)) {
+      basicProps[t("prop_storey_elevation") || "楼层标高"] = String(targetElevation);
+    }
     if (target.getWorldPosition) {
       const worldPos = new THREE.Vector3();
       target.getWorldPosition(worldPos);
@@ -8613,43 +10324,93 @@ const ThreeViewer = ({
       if (geometryData.volume > 0) {
         geoProps[t("prop_volume")] = geometryData.volume.toFixed(3);
       }
-      const userData = target.userData || {};
-      const parentUserData = target.parent?.userData || {};
-      if (userData.isIFC || parentUserData.isIFC) {
-        const ifcTarget = userData.isIFC ? target : target.parent;
-        if (ifcTarget && ifcTarget.userData.ifcAPI && ifcTarget.userData.modelID !== void 0) {
-          const expressID = userData.expressID;
-          if (expressID) {
-            try {
-              const ifcMgr = ifcTarget.userData.ifcManager;
-              const flatProps = await ifcMgr.getItemProperties(ifcTarget.userData.modelID, expressID);
-              if (flatProps) {
-                Object.assign(ifcProps, flatProps);
-              }
-            } catch (e) {
-              console.error("IFC Props Error", e);
-            }
-          }
-        }
-      }
     } else if (target.userData?.boundingBox) {
       const size = new THREE.Vector3();
       target.userData.boundingBox.getSize(size);
       geoProps[t("prop_dim")] = `${size.x.toFixed(2)} x ${size.y.toFixed(2)} x ${size.z.toFixed(2)}`;
     }
-    const finalProps = {
-      [t("pg_basic")]: basicProps,
-      [t("pg_geo")]: geoProps
+    const resolveIfcContext = (candidate) => {
+      let cursor = candidate instanceof THREE.Object3D ? candidate : null;
+      let expressID = candidate?.userData?.expressID;
+      while (cursor) {
+        if (cursor.userData?.expressID !== void 0 && expressID === void 0) {
+          expressID = cursor.userData.expressID;
+        }
+        if (cursor.userData?.ifcManager && cursor.userData?.modelID !== void 0) {
+          return {
+            ifcRoot: cursor,
+            expressID
+          };
+        }
+        cursor = cursor.parent;
+      }
+      return null;
     };
-    if (Object.keys(ifcProps).length > 0) {
-      finalProps["IFC Properties"] = ifcProps;
+    const ifcContext = resolveIfcContext(target);
+    if (ifcContext?.ifcRoot && ifcContext.expressID !== void 0) {
+      try {
+        const cacheKey = `${ifcContext.ifcRoot.userData.modelID}:${ifcContext.expressID}`;
+        ifcGroups = ifcPropertyCacheRef.current.get(cacheKey) || null;
+        if (!ifcGroups) {
+          const ifcMgr = ifcContext.ifcRoot.userData.ifcManager;
+          const ifcProps = await ifcMgr.getItemProperties(ifcContext.ifcRoot.userData.modelID, ifcContext.expressID);
+          ifcGroups = ifcProps?.rawGroups || ifcProps?.groups || ifcProps?.normalizedGroups || null;
+          if (ifcGroups) {
+            ifcPropertyCacheRef.current.set(cacheKey, ifcGroups);
+          }
+        }
+      } catch (e) {
+        console.error("IFC Props Error", e);
+      }
     }
     const nbimProps = sceneMgr.current.getNbimProperties(focusUuid);
-    if (nbimProps) {
-      finalProps["BIM 属性"] = nbimProps;
-    }
-    setSelectedProps(finalProps);
+    const selectedGroups = buildSelectedPropertyGroups({
+      basicLabel: t("pg_basic"),
+      geoLabel: t("pg_geo"),
+      basicProps,
+      geoProps,
+      ifcProps: ifcGroups,
+      nbimProps
+    });
+    setSelectedProps(selectedGroups);
   };
+  const handleLocateObject = useCallback((obj) => {
+    if (!sceneMgr.current || !obj) return;
+    const uuid = obj.uuid || obj.id;
+    if (!uuid) return;
+    setLocatedUuid(uuid);
+    const resultSet = locateResultUuids.length > 0 ? locateResultUuids : [uuid];
+    sceneMgr.current.setLocateResultSet(resultSet, uuid);
+    sceneMgr.current.highlightObject(uuid);
+    sceneMgr.current.fitViewToObject(uuid);
+    void handleSelect(obj);
+  }, [handleSelect, locateResultUuids]);
+  const handleLocateResultsChange = useCallback((uuids) => {
+    setLocateResultUuids((prev) => {
+      if (prev.length === uuids.length && prev.every((uuid, index) => uuid === uuids[index])) {
+        return prev;
+      }
+      return uuids;
+    });
+    if (!sceneMgr.current) return;
+    if (uuids.length === 0) {
+      sceneMgr.current.clearLocateFocus();
+      if (hiddenUuids.size === 0 && isolatedUuids.size === 0) {
+        sceneMgr.current.setAllVisibility(true);
+        updateTree();
+      }
+    }
+  }, [hiddenUuids.size, isolatedUuids.size, updateTree]);
+  const handleClearLocate = useCallback(() => {
+    setLocatedUuid(null);
+    setLocateResultUuids([]);
+    sceneMgr.current?.clearLocateFocus();
+    sceneMgr.current?.highlightObjects(selectedUuids);
+    if (hiddenUuids.size === 0 && isolatedUuids.size === 0) {
+      sceneMgr.current?.setAllVisibility(true);
+      updateTree();
+    }
+  }, [hiddenUuids, isolatedUuids, selectedUuids, updateTree]);
   const processFiles = async (items) => {
     if (!items.length || !sceneMgr.current) return;
     const setId = createFileSetId(items);
@@ -8665,7 +10426,7 @@ const ThreeViewer = ({
       updateTree();
       setStatus(t("success"));
       console.log("[ThreeViewer] processFiles completed successfully");
-      sceneMgr.current?.fitView(true);
+      sceneMgr.current?.fitView(false);
     } catch (err) {
       console.error("[ThreeViewer] processFiles error:", err);
       setStatus(t("failed"));
@@ -8753,7 +10514,7 @@ const ThreeViewer = ({
           });
           updateTree();
           setStatus(t("tileset_loaded"));
-          sceneMgr.current?.fitView(true);
+          sceneMgr.current?.fitView(false);
         }
       } else {
         await processFiles([url]);
@@ -8808,7 +10569,7 @@ const ThreeViewer = ({
         });
         updateTree();
         setStatus(t("tileset_loaded"));
-        sceneMgr.current?.fitView(true);
+        sceneMgr.current?.fitView(false);
       }
     } catch (err) {
       console.error(err);
@@ -8920,10 +10681,16 @@ const ThreeViewer = ({
         try {
           await sceneMgr.current?.clear();
           setSelectedUuids([]);
+          setLocatedUuid(null);
           setSelectedProps(null);
+          setSelectedIfcStorey("");
+          ifcPropertyCacheRef.current.clear();
           setMeasureHistory([]);
           setChunkProgress({ loaded: 0, total: 0 });
           completedFileSetsRef.current.clear();
+          setExplodeEnabled(false);
+          setExplodeStrength(32);
+          setExplodeMode("radial");
           updateTree();
           setStatus(t("ready"));
         } catch (error) {
@@ -8934,15 +10701,27 @@ const ThreeViewer = ({
       }
     });
   };
-  const handleScreenshot = () => {
+  const handleScreenshot = (mode = "scene") => {
     if (!sceneMgr.current) return;
     try {
-      sceneMgr.current.renderer.render(sceneMgr.current.scene, sceneMgr.current.camera);
+      const renderer = sceneMgr.current.renderer;
+      const scene = sceneMgr.current.scene;
+      const previousBackground = scene.background;
+      if (mode === "transparent") {
+        scene.background = null;
+        renderer.setClearAlpha(0);
+      } else {
+        renderer.setClearAlpha(1);
+      }
+      renderer.render(scene, sceneMgr.current.camera);
       const dataUrl = sceneMgr.current.canvas.toDataURL("image/png");
       const a = document.createElement("a");
       a.href = dataUrl;
-      a.download = "screenshot.png";
+      a.download = mode === "transparent" ? "screenshot-transparent.png" : "screenshot.png";
       a.click();
+      scene.background = previousBackground;
+      renderer.setClearAlpha(1);
+      renderer.render(scene, sceneMgr.current.camera);
       setToast({ message: t("success"), type: "success" });
     } catch (e) {
       console.error(e);
@@ -9001,7 +10780,7 @@ const ThreeViewer = ({
             handleOpenUrl,
             handleView,
             handleClear,
-            handleScreenshot,
+            openScreenshotPanel: () => setActiveTool("screenshot"),
             handleDisplayModeChange,
             displayMode,
             pickEnabled,
@@ -9044,13 +10823,24 @@ const ThreeViewer = ({
                 treeRoot,
                 setTreeRoot,
                 selectedUuid,
+                locatedUuid,
+                selectedStorey: selectedIfcStorey,
                 onSelect: (_uuid, obj) => handleSelect(obj),
                 onToggleVisibility: handleToggleVisibility,
                 onDelete: (obj) => {
                   const uuid = obj?.uuid || obj?.id;
                   if (uuid) handleDeleteObject(uuid);
                 },
-                onFocus: (obj) => handleFocusObject(obj)
+                onFocus: (obj) => handleFocusObject(obj),
+                onHide: handleHideObject,
+                onIsolate: handleIsolateObject,
+                onShowAll: handleShowAll,
+                onApplyIfcFiltersToViewport: handleApplyIfcFiltersToViewport,
+                onApplyStoreyWorkset: handleApplyStoreyWorkset,
+                onLocate: handleLocateObject,
+                onClearLocate: handleClearLocate,
+                onLocateResultsChange: handleLocateResultsChange,
+                locateResultUuids
               }
             ) }),
             /* @__PURE__ */ jsx(
@@ -9167,10 +10957,26 @@ const ThreeViewer = ({
                 setClipValues,
                 clipActive,
                 setClipActive,
+                clipHelperVisible,
+                setClipHelperVisible,
+                clipHelperOpacity,
+                setClipHelperOpacity,
                 theme
               }
             ),
             activeTool === "export" && /* @__PURE__ */ jsx(ExportPanel, { t, onClose: () => setActiveTool("none"), onExport: handleExport, theme }),
+            activeTool === "screenshot" && /* @__PURE__ */ jsx(
+              ScreenshotPanel,
+              {
+                t,
+                onClose: () => setActiveTool("none"),
+                onCapture: (mode) => {
+                  handleScreenshot(mode);
+                  setActiveTool("none");
+                },
+                theme
+              }
+            ),
             activeTool === "settings" && /* @__PURE__ */ jsx(
               SettingsPanel,
               {
@@ -9196,6 +11002,7 @@ const ThreeViewer = ({
                 onUpdateName: handleUpdateViewpointName,
                 onLoad: handleLoadViewpoint,
                 onDelete: handleDeleteViewpoint,
+                onOverwrite: handleOverwriteViewpoint,
                 onClose: () => setActiveTool("none"),
                 theme
               }
@@ -9209,26 +11016,39 @@ const ThreeViewer = ({
                 onClose: () => setActiveTool("none"),
                 theme
               }
+            ),
+            activeTool === "explode" && /* @__PURE__ */ jsx(
+              ExplodePanel,
+              {
+                t,
+                onClose: () => setActiveTool("none"),
+                enabled: explodeEnabled,
+                strength: explodeStrength,
+                mode: explodeMode,
+                onEnabledChange: setExplodeEnabled,
+                onStrengthChange: setExplodeStrength,
+                onModeChange: setExplodeMode,
+                onReset: () => {
+                  setExplodeEnabled(false);
+                  setExplodeStrength(32);
+                  setExplodeMode("radial");
+                  sceneMgr.current?.resetExplode();
+                },
+                theme
+              }
             )
           ] }),
-          showProps && /* @__PURE__ */ jsxs("div", { style: {
+          showProps && /* @__PURE__ */ jsxs("div", { className: "ui-sidebar", style: {
             width: `${rightWidth}px`,
-            backgroundColor: theme.panelBg,
-            borderLeft: `1px solid ${theme.border}`,
-            display: "flex",
-            flexDirection: "column",
-            zIndex: 10,
-            position: "relative"
+            borderLeft: `1px solid ${theme.border}`
           }, children: [
             /* @__PURE__ */ jsxs("div", { className: "ui-sidebar-header", children: [
               /* @__PURE__ */ jsx("span", { children: t("interface_props") }),
               /* @__PURE__ */ jsx(
-                "div",
+                "button",
                 {
+                  className: "ui-sidebar-close",
                   onClick: () => setShowProps(false),
-                  style: { cursor: "pointer", opacity: 0.6, display: "flex", padding: 2, borderRadius: "50%" },
-                  onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
-                  onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
                   children: /* @__PURE__ */ jsx(IconClose, { width: 16, height: 16 })
                 }
               )
@@ -9238,32 +11058,14 @@ const ThreeViewer = ({
               "div",
               {
                 onMouseDown: () => resizingRight.current = true,
-                style: {
-                  position: "absolute",
-                  left: -2,
-                  top: 0,
-                  bottom: 0,
-                  width: 4,
-                  cursor: "col-resize",
-                  zIndex: 20
-                }
+                className: "ui-sidebar-resize",
+                style: { left: -2 }
               }
             )
           ] })
         ] }),
-        /* @__PURE__ */ jsxs("div", { style: {
-          height: "24px",
-          backgroundColor: theme.bg,
-          color: theme.text,
-          display: "flex",
-          alignItems: "center",
-          padding: "0 12px",
-          fontSize: "11px",
-          zIndex: 1e3,
-          justifyContent: "space-between",
-          borderTop: `1px solid ${theme.border}`
-        }, children: [
-          /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", gap: "16px" }, children: [
+        /* @__PURE__ */ jsxs("div", { className: "ui-statusbar", children: [
+          /* @__PURE__ */ jsxs("div", { className: "ui-statusbar-left", children: [
             /* @__PURE__ */ jsx("span", { children: status }),
             loading && /* @__PURE__ */ jsxs("span", { children: [
               progress,
@@ -9289,9 +11091,26 @@ const ThreeViewer = ({
                   style: { width: `${chunkProgress.loaded / chunkProgress.total * 100}%` }
                 }
               ) })
-            ] })
+            ] }),
+            (hiddenUuids.size > 0 || isolatedUuids.size > 0) && /* @__PURE__ */ jsx("button", { className: "ui-statusbar-tag", onClick: handleShowAll, children: hiddenUuids.size > 0 ? `${t("hide_selected") || "隐藏选中"} ${hiddenUuids.size}` : `${t("isolate_selection") || "隔离选中"} ${isolatedUuids.size}` }),
+            ifcGridDiagnostics.length > 0 && /* @__PURE__ */ jsxs(
+              "button",
+              {
+                className: "ui-statusbar-tag",
+                title: ifcGridDiagnostics.join(", "),
+                onClick: () => setToast({
+                  message: `${t("ifc_grid_diagnostics") || "轴网诊断"}: ${ifcGridDiagnostics.slice(0, 6).join(", ")}`,
+                  type: "info"
+                }),
+                children: [
+                  t("ifc_grid_diagnostics") || "轴网诊断",
+                  " ",
+                  ifcGridDiagnostics.length
+                ]
+              }
+            )
           ] }),
-          /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: "12px", alignItems: "center" }, children: [
+          /* @__PURE__ */ jsxs("div", { className: "ui-statusbar-right", children: [
             mousePos && /* @__PURE__ */ jsxs("div", { style: { opacity: 0.85 }, children: [
               mousePos.x.toFixed(2),
               ", ",
@@ -9299,27 +11118,21 @@ const ThreeViewer = ({
               ", ",
               mousePos.z.toFixed(2)
             ] }),
-            /* @__PURE__ */ jsxs("div", { style: { display: "flex", gap: "10px", opacity: 0.85 }, children: [
+            /* @__PURE__ */ jsxs("div", { className: "ui-tips", children: [
               /* @__PURE__ */ jsx("span", { children: t("tips_rotate") }),
               /* @__PURE__ */ jsx("span", { children: t("tips_pan") }),
               /* @__PURE__ */ jsx("span", { children: t("tips_zoom") })
             ] }),
-            showStats && /* @__PURE__ */ jsxs("div", { style: {
-              display: "flex",
-              gap: "12px",
-              alignItems: "center",
-              paddingLeft: "12px",
-              borderLeft: `1px solid ${theme.border}`
-            }, children: [
-              /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", gap: "4px", opacity: 0.85 }, title: "Original Meshes", children: [
+            showStats && /* @__PURE__ */ jsxs("div", { className: "ui-stats-group", children: [
+              /* @__PURE__ */ jsxs("div", { className: "ui-stats-item", title: "Original Meshes", children: [
                 /* @__PURE__ */ jsx(IconBox, { width: 14, height: 14 }),
                 /* @__PURE__ */ jsx("span", { children: formatNumber(stats.meshes) })
               ] }),
-              /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", gap: "4px", opacity: 0.85 }, title: "Triangles", children: [
+              /* @__PURE__ */ jsxs("div", { className: "ui-stats-item", title: "Triangles", children: [
                 /* @__PURE__ */ jsx(IconGrid, { width: 14, height: 14 }),
                 /* @__PURE__ */ jsx("span", { children: formatNumber(stats.faces) })
               ] }),
-              /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", gap: "4px", opacity: 0.85 }, children: [
+              /* @__PURE__ */ jsxs("div", { className: "ui-stats-item", children: [
                 /* @__PURE__ */ jsx(IconActivity, { width: 14, height: 14 }),
                 /* @__PURE__ */ jsx("span", { children: formatMemory(stats.memory) })
               ] }),
@@ -9339,46 +11152,24 @@ const ThreeViewer = ({
               ] })
             ] }),
             /* @__PURE__ */ jsx(
-              "div",
+              "button",
               {
+                className: "ui-statusbar-btn ui-statusbar-btn-compact",
                 onClick: () => handleThemeModeChange(themeMode === "dark" ? "light" : "dark"),
-                style: {
-                  cursor: "pointer",
-                  padding: "4px",
-                  borderRadius: "4px",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  transition: "background-color 0.2s"
-                },
-                onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
-                onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
                 title: themeMode === "dark" ? t("theme_light") : t("theme_dark"),
                 children: themeMode === "dark" ? /* @__PURE__ */ jsx(IconSun, { width: 16, height: 16 }) : /* @__PURE__ */ jsx(IconMoon, { width: 16, height: 16 })
               }
             ),
             /* @__PURE__ */ jsx(
-              "div",
+              "button",
               {
+                className: "ui-statusbar-tag ui-statusbar-tag-compact",
                 onClick: () => setLang(lang === "zh" ? "en" : "zh"),
-                style: {
-                  cursor: "pointer",
-                  padding: "2px 8px",
-                  borderRadius: "4px",
-                  backgroundColor: theme.itemHover
-                },
                 children: lang === "zh" ? "EN" : "中文"
               }
             ),
-            /* @__PURE__ */ jsx("div", { style: { width: "1px", height: "12px", backgroundColor: theme.border } }),
-            /* @__PURE__ */ jsx("div", { style: {
-              display: "flex",
-              alignItems: "center",
-              gap: "8px",
-              padding: "2px 8px",
-              borderRadius: "4px",
-              backgroundColor: theme.itemHover
-            }, children: /* @__PURE__ */ jsx("span", { style: { fontWeight: "600", letterSpacing: "0.5px" }, children: "3D BROWSER" }) })
+            /* @__PURE__ */ jsx("div", { className: "ui-divider-vertical ui-divider-vertical-compact", style: { height: "12px" } }),
+            /* @__PURE__ */ jsx("div", { className: "ui-statusbar-tag ui-statusbar-tag-compact ui-statusbar-brand", children: /* @__PURE__ */ jsx("span", { style: { fontWeight: "600", letterSpacing: "0.5px" }, children: "3D BROWSER" }) })
           ] })
         ] }),
         /* @__PURE__ */ jsx(

@@ -1,6 +1,8 @@
 export declare const IconChevronRight: (props: any) => import("react/jsx-runtime").JSX.Element;
+export declare const IconChevronLeft: (props: any) => import("react/jsx-runtime").JSX.Element;
 export declare const IconChevronDown: (props: any) => import("react/jsx-runtime").JSX.Element;
 export declare const IconChevronUp: (props: any) => import("react/jsx-runtime").JSX.Element;
+export declare const IconTarget: (props: any) => import("react/jsx-runtime").JSX.Element;
 export declare const IconClear: (props: any) => import("react/jsx-runtime").JSX.Element;
 export declare const IconClose: (props: any) => import("react/jsx-runtime").JSX.Element;
 export declare const IconFolderOpen: (props: any) => import("react/jsx-runtime").JSX.Element;
@@ -26,4 +28,5 @@ export declare const IconMoon: (props: any) => import("react/jsx-runtime").JSX.E
 export declare const IconGrid: (props: any) => import("react/jsx-runtime").JSX.Element;
 export declare const IconImage: (props: any) => import("react/jsx-runtime").JSX.Element;
 export declare const IconLayers: (props: any) => import("react/jsx-runtime").JSX.Element;
+export declare const IconExplode: (props: any) => import("react/jsx-runtime").JSX.Element;
 export declare const IconSelectAll: (props: any) => import("react/jsx-runtime").JSX.Element;

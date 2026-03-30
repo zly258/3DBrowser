@@ -1,5 +1,10 @@
-import * as THREE from 'three';
+import * as THREE from "three";
 import { TFunc } from "../theme/Locales";
+declare global {
+    interface Window {
+        occtimportjs?: (moduleArg?: Record<string, unknown>) => Promise<any>;
+    }
+}
 export declare class OCCTLoader {
     private wasmUrl;
     readParameters: {

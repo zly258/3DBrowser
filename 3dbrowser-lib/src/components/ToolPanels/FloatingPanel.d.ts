@@ -12,6 +12,7 @@ interface FloatingPanelProps {
     theme?: any;
     storageId?: string;
     modal?: boolean;
+    autoHeight?: boolean;
 }
 export declare const FloatingPanel: React.FC<FloatingPanelProps>;
 export {};

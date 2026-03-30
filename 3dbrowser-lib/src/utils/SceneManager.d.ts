@@ -13,6 +13,13 @@ export interface SceneSettings {
     ambientInt: number;
     dirInt: number;
     bgColor: string;
+    ifcGridVisible?: boolean;
+    highlightColor?: string;
+    highlightShowBox?: boolean;
+    clip?: {
+        helperVisible?: boolean;
+        helperOpacity?: number;
+    };
     viewCubeSize?: number;
     frustumCulling?: boolean;
     maxRenderDistance?: number;
@@ -24,6 +31,7 @@ export interface SceneSettings {
     minPixelRatio?: number;
     maxPixelRatio?: number;
     targetFps?: number;
+    performanceMode?: 'balanced' | 'smooth' | 'quality';
     sunLatitude?: number;
     sunLongitude?: number;
     sunTime?: number;
@@ -41,6 +49,7 @@ export interface StructureTreeNode {
     visible?: boolean;
     userData?: any;
 }
+type ExplodeMode = 'radial' | 'horizontal' | 'vertical';
 export declare class SceneManager {
     canvas: HTMLCanvasElement;
     renderer: THREE.WebGLRenderer;
@@ -65,6 +74,18 @@ export declare class SceneManager {
     highlightMesh: THREE.Mesh;
     private lastSelectedUuid;
     private highlightedUuids;
+    private locateFocusUuid;
+    private locateResultSet;
+    private locateMaterialCache;
+    private locateObjectMaterialCache;
+    private locateDimmedInstances;
+    private highlightPulseColor;
+    private explodeEnabled;
+    private explodeStrength;
+    private explodeCenter;
+    private explodeMode;
+    private explodeObjectStates;
+    private explodeInstanceStates;
     raycaster: THREE.Raycaster;
     mouse: THREE.Vector2;
     measureType: MeasureType;
@@ -77,6 +98,8 @@ export declare class SceneManager {
     private boxSelectState;
     clippingPlanes: THREE.Plane[];
     clipPlaneHelpers: THREE.Mesh[];
+    clipHelperVisible: boolean;
+    clipHelperOpacity: number;
     sceneCenter: THREE.Vector3;
     globalOffset: THREE.Vector3;
     componentMap: Map<number | string, any>;
@@ -93,6 +116,7 @@ export declare class SceneManager {
     private sceneSphereValid;
     precomputedBounds: THREE.Box3;
     private chunks;
+    private chunkIdSet;
     private processingChunks;
     private cancelledChunkIds;
     private frustum;
@@ -144,6 +168,10 @@ export declare class SceneManager {
     private movingPeripheralCursor;
     private movingPeripheralLastRefreshAt;
     private postMoveRecoveryUntil;
+    private deferredStructureTimer;
+    private deferredStructureToken;
+    private fastPreviewMeshLimit;
+    private fastPreviewModels;
     private readonly chunkCullingTempSize;
     private readonly chunkCullingTempDirection;
     private readonly chunkCullingTempForward;
@@ -151,13 +179,27 @@ export declare class SceneManager {
     private boundsScanBatchSize;
     private chunkRegistrationBatchSize;
     private chunkGhostBatchSize;
+    private animationFrameId;
+    private disposed;
+    private interactionShadowDowngraded;
+    private interactionShadowRestoreAt;
+    private interactionShadowRestoreDelayMs;
+    private cullingScanCursor;
+    private cullingTimeBudgetMovingMs;
+    private cullingTimeBudgetRecoveryMs;
+    private cullingTimeBudgetIdleMs;
+    private registerChunk;
+    private rebuildChunkIdSet;
     constructor(canvas: HTMLCanvasElement);
     updateSettings(newSettings: Partial<SceneSettings>): void;
+    private setIfcGridVisibility;
     private updateSunPosition;
     private updateSunShadow;
     createCircleTexture(): any;
     animate(): void;
     private updateAdaptiveQuality;
+    private isSunShadowConfigured;
+    private updateInteractionPerformance;
     private initHardwareProfile;
     private collectObjectOverview;
     private countStructureRenderableNodes;
@@ -186,6 +228,9 @@ export declare class SceneManager {
     private reportChunkProgress;
     private getChunkRuntimeProfile;
     private isInPostMoveRecovery;
+    private applyHighlightSettings;
+    private getChunkRenderPhase;
+    private getChunkFrameBudget;
     private isMovingPeripheralChunk;
     private shouldRefreshPeripheralChunk;
     private checkCullingAndLoad;
@@ -209,16 +254,17 @@ export declare class SceneManager {
     private prepareStructureStage;
     private prepareModelBoundsStage;
     private prepareModelRuntimeStage;
+    private prepareFastVisibleStage;
     private attachModelToContentGroup;
     private prepareModelChunkStage;
     private finalizeModelStage;
+    private cancelDeferredStructureBuild;
+    private deactivateFastPreviewForModel;
     private scheduleDeferredStructureReplacement;
     addModel(object: THREE.Object3D, onProgress?: (p: number, msg: string) => void): Promise<void>;
     removeObject(uuid: string): boolean;
     removeModel(uuid: string): Promise<boolean>;
     addTileset(url: string, onProgress?: (p: number, msg: string) => void): import("3d-tiles-renderer").TilesGroup;
-    private getTypeIndex;
-    private guessType;
     private generateChunkBinaryV8;
     private reconstructBatchedMesh;
     exportNbim(): Promise<void>;
@@ -231,6 +277,21 @@ export declare class SceneManager {
     isolateObjects(uuids: string[]): void;
     setObjectVisibility(uuid: string, visible: boolean, showParents?: boolean): void;
     highlightObject(uuid: string | null): void;
+    private toLocalDirection;
+    private getExplodeWorldDirection;
+    private captureExplodeSnapshot;
+    private applyExplodeState;
+    private restoreExplodeSnapshot;
+    private refreshExplodeState;
+    setExplodeEnabled(enabled: boolean): void;
+    setExplodeStrength(value: number): void;
+    setExplodeMode(mode: ExplodeMode): void;
+    resetExplode(): void;
+    clearLocateFocus(): void;
+    private hasSameLocateResultSet;
+    private updateLocateFocusHighlight;
+    setLocateResultSet(uuids: string[], focusUuid?: string | null): void;
+    setLocateFocus(uuid: string | null): void;
     highlightObjects(uuids: string[]): void;
     pick(clientX: number, clientY: number): {
         object: THREE.Object3D;
@@ -309,6 +370,10 @@ export declare class SceneManager {
     clearAllMeasurements(): void;
     clearMeasurementPreview(): void;
     setupClipping(): void;
+    setClipHelperOptions(options: {
+        visible?: boolean;
+        opacity?: number;
+    }): void;
     setClippingEnabled(enabled: boolean): void;
     updateClippingPlanes(bounds: THREE.Box3, values: {
         x: number[];
@@ -339,3 +404,4 @@ export declare class SceneManager {
     };
     dispose(): void;
 }
+export {};

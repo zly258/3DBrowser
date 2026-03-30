@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { G as GLTFExporter } from './loaders-MBHA5ASo.js';
+import { G as GLTFExporter } from './loaders-TXHpcosE.js';
 
 function calculateGeometryMemory(geometry) {
   let bytes = 0;
@@ -118,6 +118,7 @@ function collectItems$1(root) {
           items.push({
             id,
             uuid: mesh.uuid,
+            sourceMesh: mesh,
             expressID: instancedMesh.userData.expressID,
             geometry,
             material,
@@ -130,6 +131,7 @@ function collectItems$1(root) {
         items.push({
           id,
           uuid: mesh.uuid,
+          sourceMesh: mesh,
           expressID: mesh.userData.expressID,
           geometry,
           material,
@@ -176,6 +178,7 @@ async function collectItemsBatched(root, options = {}) {
           items.push({
             id,
             uuid: mesh.uuid,
+            sourceMesh: mesh,
             expressID: instancedMesh.userData.expressID,
             geometry,
             material,
@@ -188,6 +191,7 @@ async function collectItemsBatched(root, options = {}) {
         items.push({
           id,
           uuid: mesh.uuid,
+          sourceMesh: mesh,
           expressID: mesh.userData.expressID,
           geometry,
           material,

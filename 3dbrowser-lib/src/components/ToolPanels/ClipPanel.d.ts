@@ -9,6 +9,10 @@ interface ClipPanelProps {
     setClipValues: any;
     clipActive: any;
     setClipActive: any;
+    clipHelperVisible: boolean;
+    setClipHelperVisible: (visible: boolean) => void;
+    clipHelperOpacity: number;
+    setClipHelperOpacity: (opacity: number) => void;
     theme?: any;
 }
 export declare const ClipPanel: React.FC<ClipPanelProps>;

@@ -2,6 +2,7 @@ import * as THREE from "three";
 interface OctreeItem {
     id: string;
     uuid: string;
+    sourceMesh: THREE.Mesh;
     expressID?: number;
     geometry: THREE.BufferGeometry;
     material: THREE.Material;
