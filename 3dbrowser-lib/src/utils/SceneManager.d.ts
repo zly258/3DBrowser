@@ -1,6 +1,5 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { TilesRenderer } from "3d-tiles-renderer";
 export type MeasureType = 'dist' | 'angle' | 'coord' | 'none';
 export interface MeasurementRecord {
     id: string;
@@ -69,7 +68,6 @@ export declare class SceneManager {
     structureRoot: StructureTreeNode;
     private nodeMap;
     private bimIdToNodeIds;
-    tilesRenderer: TilesRenderer | null;
     selectionBox: THREE.Box3Helper;
     highlightMesh: THREE.Mesh;
     private lastSelectedUuid;
@@ -86,6 +84,8 @@ export declare class SceneManager {
     private explodeMode;
     private explodeObjectStates;
     private explodeInstanceStates;
+    private readonly explodeScratchUniform;
+    private readonly explodeScratchMix;
     raycaster: THREE.Raycaster;
     mouse: THREE.Vector2;
     measureType: MeasureType;
@@ -129,7 +129,6 @@ export declare class SceneManager {
     private interactableList;
     private interactableListValid;
     private _needsBoundsUpdate;
-    onTilesUpdate?: () => void;
     onStructureUpdate?: () => void;
     onMeasureUpdate?: (records: MeasurementRecord[]) => void;
     onChunkProgress?: (loaded: number, total: number) => void;
@@ -151,9 +150,6 @@ export declare class SceneManager {
     private workerQueue;
     private activeWorkerCount;
     private maxWorkers;
-    private frameSampleTime;
-    private frameCounter;
-    private fps;
     private isCameraMoving;
     private activePixelRatio;
     private chunkLoadResumeAt;
@@ -180,6 +176,7 @@ export declare class SceneManager {
     private chunkRegistrationBatchSize;
     private chunkGhostBatchSize;
     private animationFrameId;
+    private animateFramePending;
     private disposed;
     private interactionShadowDowngraded;
     private interactionShadowRestoreAt;
@@ -191,6 +188,8 @@ export declare class SceneManager {
     private registerChunk;
     private rebuildChunkIdSet;
     constructor(canvas: HTMLCanvasElement);
+    /** 按需调度一帧：合并多次调用，在相机静止且无后台任务时不常驻 requestAnimationFrame */
+    requestRender(): void;
     updateSettings(newSettings: Partial<SceneSettings>): void;
     private setIfcGridVisibility;
     private updateSunPosition;
@@ -264,7 +263,6 @@ export declare class SceneManager {
     addModel(object: THREE.Object3D, onProgress?: (p: number, msg: string) => void): Promise<void>;
     removeObject(uuid: string): boolean;
     removeModel(uuid: string): Promise<boolean>;
-    addTileset(url: string, onProgress?: (p: number, msg: string) => void): import("3d-tiles-renderer").TilesGroup;
     private generateChunkBinaryV8;
     private reconstructBatchedMesh;
     exportNbim(fileName?: string): Promise<void>;
@@ -280,6 +278,8 @@ export declare class SceneManager {
     highlightObject(uuid: string | null): void;
     private toLocalDirection;
     private getExplodeWorldDirection;
+    /** 由 UUID 导出的稳定单位向量，近似均匀分布于球面（与径向方向混合后爆炸更散、更匀） */
+    private explodeStableUnitDirection;
     private captureExplodeSnapshot;
     private applyExplodeState;
     private restoreExplodeSnapshot;
@@ -302,6 +302,10 @@ export declare class SceneManager {
     computeTotalBounds(onlyVisible?: boolean, forceRecompute?: boolean): THREE.Box3;
     updateSceneBounds(): void;
     fitView(keepOrientation?: boolean): void;
+    private unionObjectBounds;
+    private unionTilesNodeBounds;
+    private unionOptimizedBounds;
+    private unionNodeBounds;
     fitViewToObject(uuid: string): void;
     fitBox(box: THREE.Box3, updateCameraPosition?: boolean): void;
     setView(view: string): void;
@@ -397,7 +401,6 @@ export declare class SceneManager {
         memory: number;
         textureMemory: number;
         drawCalls: any;
-        fps: number;
         chunksLoaded: number;
         chunksTotal: number;
         chunksQueued: number;

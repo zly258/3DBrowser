@@ -2,8 +2,7 @@ import { jsxs, jsx, Fragment } from 'react/jsx-runtime';
 import React, { useState, useEffect, useRef, useCallback, useMemo, Component } from 'react';
 import * as THREE from 'three';
 import { O as OrbitControls } from './loaders-TXHpcosE.js';
-import { TilesRenderer } from '3d-tiles-renderer';
-import { c as calculateGeometryMemory, b as buildOctree, a as collectLeafNodes, d as createBatchedMeshFromItemsAsync, e as collectItemsBatched, f as collectItems, g as convertLMBTo3DTiles, h as exportGLB, i as exportLMB } from './utils-DjWw9cMe.js';
+import { c as calculateGeometryMemory, b as buildOctree, a as collectLeafNodes, d as createBatchedMeshFromItemsAsync, e as collectItemsBatched, f as collectItems, g as exportGLB, h as exportLMB } from './utils-BDOQlmUW.js';
 
 const INVALID_DISPLAY_LABELS = /* @__PURE__ */ new Set(["", "n/a", "na", "undefined", "null", "-", "--"]);
 function sanitizeDisplayLabel(...candidates) {
@@ -20,7 +19,6 @@ class SceneManager {
     this.structureRoot = { id: "root", name: "Root", type: "Group", children: [] };
     this.nodeMap = /* @__PURE__ */ new Map();
     this.bimIdToNodeIds = /* @__PURE__ */ new Map();
-    this.tilesRenderer = null;
     this.lastSelectedUuid = null;
     this.highlightedUuids = /* @__PURE__ */ new Set();
     this.locateFocusUuid = null;
@@ -35,6 +33,8 @@ class SceneManager {
     this.explodeMode = "radial";
     this.explodeObjectStates = /* @__PURE__ */ new Map();
     this.explodeInstanceStates = /* @__PURE__ */ new Map();
+    this.explodeScratchUniform = new THREE.Vector3();
+    this.explodeScratchMix = new THREE.Vector3();
     this.measureType = "none";
     this.currentMeasurePoints = [];
     this.currentMeasureModelUuid = null;
@@ -117,9 +117,6 @@ class SceneManager {
     this.workerQueue = [];
     this.activeWorkerCount = 0;
     this.maxWorkers = 4;
-    this.frameSampleTime = performance.now();
-    this.frameCounter = 0;
-    this.fps = 0;
     this.isCameraMoving = false;
     this.activePixelRatio = 1;
     this.chunkLoadResumeAt = 0;
@@ -127,7 +124,7 @@ class SceneManager {
     this.deferredStructureThreshold = 2e4;
     this.octreeWorkerThreshold = 25e3;
     this.initialChunkLoadTarget = 18;
-    this.warmupChunkBoost = 8;
+    this.warmupChunkBoost = 12;
     this.chunkWarmupActive = false;
     this.chunkResidencyMs = 1800;
     this.chunkRuntimeProfiles = {
@@ -222,6 +219,7 @@ class SceneManager {
     this.chunkRegistrationBatchSize = 18;
     this.chunkGhostBatchSize = 24;
     this.animationFrameId = null;
+    this.animateFramePending = false;
     this.disposed = false;
     this.interactionShadowDowngraded = false;
     this.interactionShadowRestoreAt = 0;
@@ -300,6 +298,7 @@ class SceneManager {
       this.movingPeripheralLastRefreshAt = 0;
       this.movingPeripheralCursor = 0;
       this.cullingDirty = true;
+      this.requestRender();
     });
     this.controls.addEventListener("change", () => {
       const profile = this.getChunkRuntimeProfile();
@@ -308,6 +307,7 @@ class SceneManager {
       this.postMoveRecoveryUntil = 0;
       this.interactionShadowRestoreAt = 0;
       this.cullingDirty = true;
+      this.requestRender();
     });
     this.controls.addEventListener("end", () => {
       const now = performance.now();
@@ -319,6 +319,7 @@ class SceneManager {
       this.movingPeripheralLastRefreshAt = 0;
       this.movingPeripheralCursor = 0;
       this.cullingDirty = true;
+      this.requestRender();
     });
     this.ambientLight = new THREE.AmbientLight(16251131, this.settings.ambientInt);
     this.scene.add(this.ambientLight);
@@ -382,7 +383,7 @@ class SceneManager {
     this.raycaster.params.Line.threshold = 2;
     this.mouse = new THREE.Vector2();
     this.animate = this.animate.bind(this);
-    this.animationFrameId = requestAnimationFrame(this.animate);
+    this.requestRender();
   }
   registerChunk(chunk) {
     this.chunks.push(chunk);
@@ -393,6 +394,13 @@ class SceneManager {
     for (const chunk of this.chunks) {
       this.chunkIdSet.add(chunk.id);
     }
+  }
+  /** 按需调度一帧：合并多次调用，在相机静止且无后台任务时不常驻 requestAnimationFrame */
+  requestRender() {
+    if (this.disposed) return;
+    if (this.animateFramePending) return;
+    this.animateFramePending = true;
+    this.animationFrameId = requestAnimationFrame(this.animate);
   }
   updateSettings(newSettings) {
     this.settings = { ...this.settings, ...newSettings };
@@ -541,14 +549,9 @@ class SceneManager {
   }
   animate() {
     if (this.disposed) return;
-    this.animationFrameId = requestAnimationFrame(this.animate);
-    this.frameCounter++;
+    this.animateFramePending = false;
+    this.animationFrameId = null;
     const frameNow = performance.now();
-    if (frameNow - this.frameSampleTime >= 500) {
-      this.fps = this.frameCounter * 1e3 / (frameNow - this.frameSampleTime);
-      this.frameCounter = 0;
-      this.frameSampleTime = frameNow;
-    }
     if (this.controls) {
       this.controls.update();
     }
@@ -568,15 +571,11 @@ class SceneManager {
       this._lastCullingTime = now;
       this.cullingDirty = false;
     }
-    if (this.tilesRenderer) {
-      this.camera.updateMatrixWorld();
-      this.tilesRenderer.update();
-    }
     const highlightMaterial = this.highlightMesh.material;
     if (highlightMaterial) {
       if (this.locateFocusUuid && this.highlightMesh.visible) {
         const focusColor = new THREE.Color(this.settings.highlightColor || "#ff9f1c");
-        const pulseMix = 0.15 + (Math.sin(frameNow / 180) + 1) * 0.18;
+        const pulseMix = 0.22 + (Math.sin(frameNow / 125) + 1) * 0.3;
         highlightMaterial.color.copy(focusColor).lerp(this.highlightPulseColor, pulseMix);
         highlightMaterial.opacity = 1;
       } else {
@@ -584,14 +583,27 @@ class SceneManager {
         highlightMaterial.opacity = 1;
       }
     }
+    const selectionLineMat = this.selectionBox.material;
+    if (this.locateFocusUuid && this.selectionBox.visible && selectionLineMat && !Array.isArray(selectionLineMat)) {
+      const baseSel = new THREE.Color(this.settings.highlightColor || "#ff9f1c");
+      const pulseSel = 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(frameNow / 125));
+      selectionLineMat.color.copy(baseSel).lerp(this.highlightPulseColor, 0.34 * pulseSel);
+    } else if (selectionLineMat && !Array.isArray(selectionLineMat)) {
+      selectionLineMat.color.set(this.settings.highlightColor || "#ff9f1c");
+    }
     this.renderer.render(this.scene, this.camera);
+    const chunksIncomplete = this.chunkLoadingEnabled && this.chunks.length > 0 && this.chunkLoadedCount < this.chunks.length;
+    const locatingPulse = !!(this.locateFocusUuid && (this.highlightMesh.visible || this.selectionBox.visible));
+    const keepLoop = this.isCameraMoving || this.isInPostMoveRecovery(now) || this.processingChunks.size > 0 || this.chunkWarmupActive || chunksIncomplete || locatingPulse;
+    if (keepLoop) {
+      this.requestRender();
+    }
   }
   updateAdaptiveQuality() {
     if (!this.settings.adaptiveQuality) return;
     const deviceRatio = window.devicePixelRatio || 1;
     const minRatio = Math.min(deviceRatio, this.settings.minPixelRatio ?? 0.8);
     const maxRatio = Math.min(deviceRatio, this.settings.maxPixelRatio ?? 2);
-    const targetFps = this.settings.targetFps ?? 50;
     const chunkCount = this.chunks.length;
     const meshCount = this.originalStats.meshes;
     const mode = this.settings.performanceMode ?? "balanced";
@@ -599,14 +611,6 @@ class SceneManager {
     if (this.isCameraMoving) {
       const movingScale = mode === "quality" ? chunkCount > 3500 || meshCount > 25e4 ? 0.68 : chunkCount > 1600 || meshCount > 12e4 ? 0.76 : 0.84 : mode === "smooth" ? chunkCount > 3500 || meshCount > 25e4 ? 0.44 : chunkCount > 1600 || meshCount > 12e4 ? 0.52 : 0.6 : chunkCount > 3500 || meshCount > 25e4 ? 0.48 : chunkCount > 1600 || meshCount > 12e4 ? 0.56 : 0.65;
       desiredRatio = Math.max(minRatio, maxRatio * movingScale);
-      const movingPenaltyThreshold = mode === "quality" ? targetFps - 12 : targetFps - 8;
-      if (this.fps > 0 && this.fps < movingPenaltyThreshold) {
-        desiredRatio = Math.max(minRatio, desiredRatio - 0.08);
-      }
-    } else if (this.fps > 0 && this.fps < targetFps - 5) {
-      desiredRatio = Math.max(minRatio, this.activePixelRatio - 0.1);
-    } else if (this.fps > targetFps + 8) {
-      desiredRatio = Math.min(maxRatio, this.activePixelRatio + 0.05);
     }
     desiredRatio = Math.max(minRatio, Math.min(maxRatio, desiredRatio));
     if (Math.abs(desiredRatio - this.activePixelRatio) < 0.05) return;
@@ -643,8 +647,8 @@ class SceneManager {
     const cpuCount = Math.max(2, nav.hardwareConcurrency || 4);
     const memoryGb = nav.deviceMemory || 8;
     this.maxWorkers = Math.max(2, Math.min(8, Math.floor(cpuCount / 2)));
-    this.maxConcurrentChunkLoads = Math.max(16, Math.min(96, cpuCount * 8));
-    this.maxChunkLoadsPerFrame = Math.max(8, Math.min(32, cpuCount * 2));
+    this.maxConcurrentChunkLoads = Math.max(24, Math.min(112, cpuCount * 10));
+    this.maxChunkLoadsPerFrame = Math.max(12, Math.min(40, cpuCount * 3));
     this.maxLoadedChunks = memoryGb <= 4 ? 160 : memoryGb <= 8 ? 320 : 640;
     this.maxCachedChunks = memoryGb <= 4 ? 24 : memoryGb <= 8 ? 48 : 96;
   }
@@ -1907,6 +1911,7 @@ class SceneManager {
     }
     this.updateSceneBounds();
     if (this.onStructureUpdate) this.onStructureUpdate();
+    this.requestRender();
     this.measureRecords.forEach((record, recordId) => {
       let isRelated = record.modelUuid === uuid || record.modelUuid === originalUuid;
       if (!isRelated && record.modelUuid && obj) {
@@ -1924,70 +1929,6 @@ class SceneManager {
   }
   async removeModel(uuid) {
     return this.removeObject(uuid);
-  }
-  addTileset(url, onProgress) {
-    if (this.tilesRenderer) {
-      this.tilesRenderer.dispose();
-      this.contentGroup.remove(this.tilesRenderer.group);
-    }
-    if (onProgress) onProgress(10, "正在初始化 TilesRenderer...");
-    const renderer = new TilesRenderer(url);
-    renderer.setCamera(this.camera);
-    renderer.setResolutionFromRenderer(this.camera, this.renderer);
-    renderer.errorTarget = 16;
-    renderer.lruCache.maxSize = 500 * 1024 * 1024;
-    renderer.group.name = "3D Tileset";
-    let loadedTiles = 0;
-    let hasError = false;
-    renderer.onLoadTileSet = () => {
-      if (onProgress) onProgress(50, "Tileset 结构已加载");
-    };
-    renderer.onLoadModel = () => {
-      loadedTiles++;
-      if (onProgress && !hasError) {
-        onProgress(Math.min(99, 50 + loadedTiles), `已加载瓦片: ${loadedTiles}`);
-      }
-    };
-    setTimeout(() => {
-      if (!renderer.tileset && !hasError) {
-        hasError = true;
-        if (onProgress) onProgress(0, "加载失败: 无法获取 Tileset 配置文件，请检查网络或路径。");
-      }
-    }, 1e4);
-    renderer.onLoadTile = (_tile) => {
-      if (this.onTilesUpdate) this.onTilesUpdate();
-    };
-    renderer.onDisposeTile = (_tile) => {
-      if (this.onTilesUpdate) this.onTilesUpdate();
-    };
-    this.contentGroup.add(renderer.group);
-    this.tilesRenderer = renderer;
-    renderer.group.position.copy(this.globalOffset.clone().negate());
-    renderer.group.name = "3D Tileset";
-    const buildTilesTree = (tile, depth = 0) => {
-      const node = {
-        id: tile.content?.uuid || THREE.MathUtils.generateUUID(),
-        name: tile.content?.name || `Tile_${tile.level}_${tile.x || 0}_${tile.y || 0}`,
-        type: "Group",
-        children: []
-      };
-      if (tile.children) {
-        node.children = tile.children.map((c) => buildTilesTree(c, depth + 1));
-      }
-      return node;
-    };
-    const tilesNode = {
-      id: renderer.group.uuid,
-      name: "3D Tileset",
-      type: "Group",
-      children: renderer.tileset ? [buildTilesTree(renderer.tileset.root)] : []
-    };
-    if (!this.structureRoot.children) this.structureRoot.children = [];
-    this.structureRoot.children.push(tilesNode);
-    this.nodeMap.set(tilesNode.id, [tilesNode]);
-    this.updateSceneBounds();
-    this.updateSettings(this.settings);
-    return renderer.group;
   }
   // --- NBIM 导入/导出功能 ---
   generateChunkBinaryV8(items, bimIdToIndex) {
@@ -2367,7 +2308,7 @@ class SceneManager {
       const names = [];
       this.contentGroup.children.forEach((child) => {
         if (child.userData?.isOptimizedGroup) return;
-        if (child.name === "TilesRenderer" || child.name.startsWith("optimized_")) return;
+        if (child.name.startsWith("optimized_")) return;
         const rawName = (typeof child.userData?.modelName === "string" ? child.userData.modelName : "") || (child.children?.[0]?.name || "") || child.name;
         const baseName = sanitizeFileStem(stripFileExtension(rawName));
         names.push(baseName);
@@ -2518,7 +2459,7 @@ class SceneManager {
     this.reportChunkProgress();
     this.fitView(true);
     this.chunkWarmupActive = true;
-    this.initialChunkLoadTarget = this.chunks.length > 200 ? 24 : this.chunks.length > 80 ? 16 : 10;
+    this.initialChunkLoadTarget = this.chunks.length > 200 ? 44 : this.chunks.length > 80 ? 30 : 16;
     if (onProgress) onProgress(100, "NBIM 已就绪，正在按需加载...");
     this.checkCullingAndLoad();
     if (!manifest.stats && manifest.chunks?.length) {
@@ -2556,10 +2497,6 @@ class SceneManager {
       while (this.contentGroup.children.length > 0) {
         this.contentGroup.remove(this.contentGroup.children[0]);
       }
-      if (this.tilesRenderer) {
-        this.tilesRenderer.dispose();
-        this.tilesRenderer = null;
-      }
       this.ghostGroup.children.forEach(disposeObject);
       this.ghostGroup.clear();
       this.selectionBox.visible = false;
@@ -2592,6 +2529,7 @@ class SceneManager {
       this.chunkWarmupActive = false;
       this.globalOffset.set(0, 0, 0);
       console.log("场景已清空");
+      this.requestRender();
     } catch (error) {
       console.error("清空场景失败:", error);
       throw error;
@@ -2651,6 +2589,7 @@ class SceneManager {
     });
     this.updateSceneBounds();
     this.refreshExplodeState();
+    this.requestRender();
   }
   hideObjects(uuids) {
     uuids.forEach((id) => this.setObjectVisibility(id, false));
@@ -2702,6 +2641,7 @@ class SceneManager {
     this.interactableListValid = false;
     this.updateSceneBounds();
     this.refreshExplodeState();
+    this.requestRender();
   }
   setObjectVisibility(uuid, visible, showParents = true) {
     const nodes = this.nodeMap.get(uuid);
@@ -2782,6 +2722,7 @@ class SceneManager {
     });
     this.interactableListValid = false;
     this.updateSceneBounds();
+    this.requestRender();
   }
   highlightObject(uuid) {
     this.highlightObjects(uuid ? [uuid] : []);
@@ -2805,6 +2746,20 @@ class SceneManager {
     }
     return direction.normalize();
   }
+  /** 由 UUID 导出的稳定单位向量，近似均匀分布于球面（与径向方向混合后爆炸更散、更匀） */
+  explodeStableUnitDirection(seed, target) {
+    let h = 2166136261;
+    for (let i = 0; i < seed.length; i++) {
+      h ^= seed.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    const u1 = (h >>> 0) / 4294967296;
+    const u2 = (Math.imul(h ^ 2654435769, 2246822519) >>> 0) / 4294967296;
+    const phi = 2 * Math.PI * u1;
+    const z = 1 - 2 * u2;
+    const r = Math.sqrt(Math.max(0, 1 - z * z));
+    target.set(Math.cos(phi) * r, Math.sin(phi) * r, z).normalize();
+  }
   captureExplodeSnapshot() {
     this.explodeObjectStates.clear();
     this.explodeInstanceStates.clear();
@@ -2825,9 +2780,18 @@ class SceneManager {
       objectBox.setFromObject(obj);
       if (objectBox.isEmpty()) return;
       objectCenter.copy(objectBox.getCenter(new THREE.Vector3()));
-      const vectorFromCenter = objectCenter.sub(this.explodeCenter);
-      const weight = THREE.MathUtils.clamp(vectorFromCenter.length() / radius, 0.18, 1.25);
-      const directionWorld = this.getExplodeWorldDirection(vectorFromCenter);
+      const offset = objectCenter.sub(this.explodeCenter);
+      const distN = offset.length() / radius;
+      const weight = 0.14 + 0.86 * Math.pow(THREE.MathUtils.clamp(distN, 0, 2.5) / 2.5, 0.38);
+      let directionWorld;
+      if (this.explodeMode === "radial") {
+        const radial = this.getExplodeWorldDirection(offset);
+        this.explodeStableUnitDirection(obj.uuid, this.explodeScratchUniform);
+        const mix = Math.pow(1 - Math.min(distN / 1.08, 1), 1.15);
+        directionWorld = this.explodeScratchMix.copy(radial).multiplyScalar(1 - mix).addScaledVector(this.explodeScratchUniform, mix).normalize();
+      } else {
+        directionWorld = this.getExplodeWorldDirection(offset);
+      }
       const directionLocal = this.toLocalDirection(directionWorld, obj.parent?.matrixWorld || new THREE.Matrix4());
       this.explodeObjectStates.set(obj.uuid, {
         object: obj,
@@ -2853,9 +2817,18 @@ class SceneManager {
         instanceBox.copy(geometry.boundingBox).applyMatrix4(worldMatrix);
         if (instanceBox.isEmpty()) return;
         objectCenter.copy(instanceBox.getCenter(new THREE.Vector3()));
-        const vectorFromCenter = objectCenter.sub(this.explodeCenter);
-        const weight = THREE.MathUtils.clamp(vectorFromCenter.length() / radius, 0.18, 1.25);
-        const directionWorld = this.getExplodeWorldDirection(vectorFromCenter);
+        const offset = objectCenter.sub(this.explodeCenter);
+        const distN = offset.length() / radius;
+        const weight = 0.14 + 0.86 * Math.pow(THREE.MathUtils.clamp(distN, 0, 2.5) / 2.5, 0.38);
+        let directionWorld;
+        if (this.explodeMode === "radial") {
+          const radial = this.getExplodeWorldDirection(offset);
+          this.explodeStableUnitDirection(key, this.explodeScratchUniform);
+          const mix = Math.pow(1 - Math.min(distN / 1.08, 1), 1.15);
+          directionWorld = this.explodeScratchMix.copy(radial).multiplyScalar(1 - mix).addScaledVector(this.explodeScratchUniform, mix).normalize();
+        } else {
+          directionWorld = this.getExplodeWorldDirection(offset);
+        }
         this.explodeInstanceStates.set(key, {
           mesh: mapping.mesh,
           instanceId: mapping.instanceId,
@@ -2869,7 +2842,7 @@ class SceneManager {
   applyExplodeState() {
     const bounds = this.computeTotalBounds(true, true);
     const size = bounds.isEmpty() ? new THREE.Vector3(100, 100, 100) : bounds.getSize(new THREE.Vector3());
-    const magnitude = Math.max(size.length() * 0.08 * (this.explodeStrength / 100), 0);
+    const magnitude = Math.max(size.length() * 0.125 * (this.explodeStrength / 100), 0);
     this.explodeObjectStates.forEach((state) => {
       state.object.position.copy(state.basePosition).addScaledVector(state.directionLocal, magnitude * state.weight);
       state.object.updateMatrixWorld();
@@ -2877,16 +2850,18 @@ class SceneManager {
     const translation = new THREE.Vector3();
     const quaternion = new THREE.Quaternion();
     const scale = new THREE.Vector3();
+    const matrixWork = new THREE.Matrix4();
     this.explodeInstanceStates.forEach((state) => {
-      const matrix = state.baseMatrix.clone();
-      matrix.decompose(translation, quaternion, scale);
+      matrixWork.copy(state.baseMatrix);
+      matrixWork.decompose(translation, quaternion, scale);
       translation.addScaledVector(state.directionLocal, magnitude * state.weight);
-      matrix.compose(translation, quaternion, scale);
-      state.mesh.setMatrixAt(state.instanceId, matrix);
+      matrixWork.compose(translation, quaternion, scale);
+      state.mesh.setMatrixAt(state.instanceId, matrixWork);
       if (state.mesh.instanceMatrix) state.mesh.instanceMatrix.needsUpdate = true;
     });
     this.interactableListValid = false;
     this.updateSceneBounds();
+    this.requestRender();
   }
   restoreExplodeSnapshot() {
     this.explodeObjectStates.forEach((state) => {
@@ -2899,6 +2874,7 @@ class SceneManager {
     });
     this.interactableListValid = false;
     this.updateSceneBounds();
+    this.requestRender();
   }
   refreshExplodeState() {
     if (!this.explodeEnabled) return;
@@ -2985,7 +2961,8 @@ class SceneManager {
     const resultSet = new Set(normalized);
     this.locateResultSet = resultSet;
     this.locateFocusUuid = focusUuid && resultSet.has(focusUuid) ? focusUuid : normalized[0];
-    const dimmedColor = new THREE.Color("#d6d9df");
+    const focusKey = this.locateFocusUuid;
+    const dimmedColor = new THREE.Color("#cfd4dc");
     const accentColor = new THREE.Color(this.settings.highlightColor || "#ff9f1c");
     this.contentGroup.traverse((child) => {
       const mesh = child;
@@ -2995,6 +2972,7 @@ class SceneManager {
       }
       const sourceMaterials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
       const isMatched = resultSet.has(child.uuid);
+      const isFocus = isMatched && focusKey !== null && child.uuid === focusKey;
       const nextMaterials = sourceMaterials.map((material) => {
         if (!material) return material;
         const cloned = material.clone();
@@ -3004,18 +2982,23 @@ class SceneManager {
         if ("color" in cloned && cloned.color) {
           const baseColor = cloned.color.clone();
           if (isMatched) {
-            cloned.color.copy(baseColor.lerp(accentColor, 0.82));
+            const tint = isFocus ? 0.93 : 0.76;
+            cloned.color.copy(baseColor.lerp(accentColor, tint));
           } else {
             cloned.transparent = true;
-            cloned.opacity = 0.14;
+            cloned.opacity = 0.12;
             cloned.depthWrite = false;
-            cloned.color.copy(baseColor.lerp(dimmedColor, 0.72));
+            cloned.color.copy(baseColor.lerp(dimmedColor, 0.78));
           }
         }
         if ("emissive" in cloned && cloned.emissive) {
-          cloned.emissive.copy(isMatched ? accentColor.clone().multiplyScalar(0.16) : new THREE.Color(0));
+          if (isMatched) {
+            cloned.emissive.copy(accentColor.clone().multiplyScalar(isFocus ? 0.4 : 0.12));
+          } else {
+            cloned.emissive.set(0);
+          }
         }
-        if ("roughness" in cloned && !isMatched) cloned.roughness = Math.max(0.88, cloned.roughness ?? 0.88);
+        if ("roughness" in cloned && !isMatched) cloned.roughness = Math.max(0.9, cloned.roughness ?? 0.9);
         if ("metalness" in cloned && !isMatched) cloned.metalness = Math.min(0.02, cloned.metalness ?? 0.02);
         cloned.needsUpdate = true;
         return cloned;
@@ -3024,6 +3007,7 @@ class SceneManager {
     });
     this.optimizedMapping.forEach((mappings, originalUuid) => {
       const isMatched = resultSet.has(originalUuid);
+      const isFocus = isMatched && focusKey !== null && originalUuid === focusKey;
       mappings.forEach((mapping) => {
         const key = `${mapping.mesh.uuid}:${mapping.instanceId}`;
         this.locateDimmedInstances.set(key, {
@@ -3032,14 +3016,14 @@ class SceneManager {
           originalColor: mapping.originalColor
         });
         const sourceColor = new THREE.Color(mapping.originalColor);
-        mapping.mesh.setColorAt(
-          mapping.instanceId,
-          isMatched ? sourceColor.lerp(accentColor, 0.82) : sourceColor.lerp(dimmedColor, 0.82)
-        );
+        const tint = isFocus ? 0.93 : isMatched ? 0.76 : 0.82;
+        const target = isMatched ? accentColor : dimmedColor;
+        mapping.mesh.setColorAt(mapping.instanceId, sourceColor.lerp(target, tint));
         if (mapping.mesh.instanceColor) mapping.mesh.instanceColor.needsUpdate = true;
       });
     });
     this.updateLocateFocusHighlight(this.locateFocusUuid);
+    this.requestRender();
   }
   setLocateFocus(uuid) {
     if (!uuid) {
@@ -3072,17 +3056,23 @@ class SceneManager {
         });
       }
     };
-    for (const prev of this.highlightedUuids) {
-      if (!target.has(prev)) restoreOne(prev);
-    }
-    for (const next of target) {
-      if (!this.highlightedUuids.has(next)) applyOne(next);
+    const preserveLocateTint = this.locateResultSet.size > 0;
+    if (!preserveLocateTint) {
+      for (const prev of this.highlightedUuids) {
+        if (!target.has(prev)) restoreOne(prev);
+      }
+      for (const next of target) {
+        if (!this.highlightedUuids.has(next)) applyOne(next);
+      }
     }
     this.highlightedUuids = target;
     this.selectionBox.visible = false;
     this.highlightMesh.visible = false;
     this.lastSelectedUuid = uuids.length > 0 ? uuids[uuids.length - 1] : null;
-    if (target.size === 0) return;
+    if (target.size === 0) {
+      this.requestRender();
+      return;
+    }
     const union = new THREE.Box3();
     const tmpBox = new THREE.Box3();
     const tmpMat = new THREE.Matrix4();
@@ -3113,17 +3103,29 @@ class SceneManager {
     for (const id of target) addObjectBounds(id);
     if (!union.isEmpty()) {
       this.selectionBox.box.copy(union);
-      this.selectionBox.visible = !!this.settings.highlightShowBox;
+      const locatingFocus = !!(this.locateFocusUuid && target.has(this.locateFocusUuid));
+      if (locatingFocus) {
+        const pad = Math.max(union.getSize(new THREE.Vector3()).length() * 0.048, 0.22);
+        this.selectionBox.box.expandByScalar(pad);
+      }
+      this.selectionBox.visible = locatingFocus || !!this.settings.highlightShowBox;
     }
     const focusId = this.lastSelectedUuid;
-    if (!focusId) return;
+    if (!focusId) {
+      this.requestRender();
+      return;
+    }
     const focusMappings = this.optimizedMapping.get(focusId);
     if (focusMappings && focusMappings.length > 0) {
       this.highlightMesh.visible = false;
+      this.requestRender();
       return;
     }
     const focusObj = this.contentGroup.getObjectByProperty("uuid", focusId);
-    if (!focusObj) return;
+    if (!focusObj) {
+      this.requestRender();
+      return;
+    }
     if (focusObj.isMesh) {
       focusObj.updateMatrixWorld(true);
       this.highlightMesh.geometry = focusObj.geometry;
@@ -3137,6 +3139,7 @@ class SceneManager {
       this.highlightMesh.scale.copy(worldScale);
       this.highlightMesh.visible = true;
     }
+    this.requestRender();
   }
   pick(clientX, clientY) {
     const intersect = this.getRayIntersects(clientX, clientY);
@@ -3229,21 +3232,7 @@ class SceneManager {
     this.contentGroup.updateMatrixWorld(true);
     this.contentGroup.traverse((obj) => {
       if (onlyVisible && !obj.visible) return;
-      if (obj.name === "3D Tileset" && this.tilesRenderer) {
-        const tilesBox = new THREE.Box3();
-        if (this.tilesRenderer.getBounds) {
-          this.tilesRenderer.getBounds(tilesBox);
-          if (!tilesBox.isEmpty() && this.globalOffset.length() > 0) {
-            if (Math.abs(tilesBox.min.x) > 1e5 || Math.abs(tilesBox.min.y) > 1e5) {
-              tilesBox.translate(this.globalOffset.clone().negate());
-            }
-          }
-          if (!tilesBox.isEmpty()) totalBox.union(tilesBox);
-        }
-        obj.traverse((child) => {
-          if (child !== obj) child._skipTraverse = true;
-        });
-      } else if (obj.isMesh && !obj._skipTraverse) {
+      if (obj.isMesh && !obj._skipTraverse) {
         const mesh = obj;
         if (mesh.geometry) {
           const box = new THREE.Box3().setFromObject(mesh);
@@ -3300,15 +3289,60 @@ class SceneManager {
     this.sceneBounds = box.clone();
     this.fitBox(box, !keepOrientation);
   }
-  fitViewToObject(uuid) {
-    const obj = this.contentGroup.getObjectByProperty("uuid", uuid);
-    if (!obj) return;
+  unionObjectBounds(obj, targetBox) {
     const box = new THREE.Box3();
-    if (obj.userData.boundingBox) {
+    if (obj.userData?.boundingBox) {
       box.copy(obj.userData.boundingBox).applyMatrix4(obj.matrixWorld);
     } else {
       box.setFromObject(obj);
     }
+    if (!box.isEmpty()) targetBox.union(box);
+  }
+  unionTilesNodeBounds(node, targetBox) {
+    const encodedBox = node?.userData?.tilesBoundingVolumeBox;
+    if (!Array.isArray(encodedBox) || encodedBox.length < 12) return;
+    const center = new THREE.Vector3(encodedBox[0], encodedBox[1], encodedBox[2]);
+    const axisX = new THREE.Vector3(encodedBox[3], encodedBox[4], encodedBox[5]);
+    const axisY = new THREE.Vector3(encodedBox[6], encodedBox[7], encodedBox[8]);
+    const axisZ = new THREE.Vector3(encodedBox[9], encodedBox[10], encodedBox[11]);
+    const extent = new THREE.Vector3(axisX.length(), axisY.length(), axisZ.length());
+    const box = new THREE.Box3(center.clone().sub(extent), center.clone().add(extent));
+    if (!box.isEmpty()) targetBox.union(box);
+  }
+  unionOptimizedBounds(uuid, targetBox) {
+    const mappings = this.optimizedMapping.get(uuid);
+    if (!mappings || mappings.length === 0) return;
+    const instanceMatrix = new THREE.Matrix4();
+    for (const mapping of mappings) {
+      const geometry = mapping.geometry || mapping.mesh.geometry;
+      if (!geometry.boundingBox) geometry.computeBoundingBox();
+      if (!geometry.boundingBox) continue;
+      mapping.mesh.getMatrixAt(mapping.instanceId, instanceMatrix);
+      instanceMatrix.premultiply(mapping.mesh.matrixWorld);
+      const box = geometry.boundingBox.clone().applyMatrix4(instanceMatrix);
+      if (!box.isEmpty()) targetBox.union(box);
+    }
+  }
+  unionNodeBounds(uuid, targetBox, visited = /* @__PURE__ */ new Set()) {
+    if (!uuid || visited.has(uuid)) return;
+    visited.add(uuid);
+    const obj = this.contentGroup.getObjectByProperty("uuid", uuid);
+    if (obj) {
+      this.unionObjectBounds(obj, targetBox);
+    }
+    this.unionOptimizedBounds(uuid, targetBox);
+    const nodes = this.nodeMap.get(uuid) || [];
+    for (const node of nodes) {
+      this.unionTilesNodeBounds(node, targetBox);
+      const children = Array.isArray(node.children) ? node.children : [];
+      for (const child of children) {
+        this.unionNodeBounds(child.id, targetBox, visited);
+      }
+    }
+  }
+  fitViewToObject(uuid) {
+    const box = new THREE.Box3();
+    this.unionNodeBounds(uuid, box);
     if (!box.isEmpty()) this.fitBox(box, false);
   }
   fitBox(box, updateCameraPosition = true) {
@@ -3368,6 +3402,7 @@ class SceneManager {
         this.camera.bottom = this.camera.bottom + (targetBottom - this.camera.bottom) * eased;
         this.camera.updateProjectionMatrix();
         this.controls.update();
+        this.renderer.render(this.scene, this.camera);
         if (progress < 1) {
           requestAnimationFrame(animate);
         }
@@ -3422,6 +3457,7 @@ class SceneManager {
         this.camera.zoom = startZoom + (targetZoom2 - startZoom) * eased;
         this.camera.updateProjectionMatrix();
         this.controls.update();
+        this.renderer.render(this.scene, this.camera);
         if (progress < 1) {
           requestAnimationFrame(animate);
         }
@@ -3553,6 +3589,7 @@ class SceneManager {
     if (state.bottom !== void 0) this.camera.bottom = state.bottom;
     this.camera.updateProjectionMatrix();
     this.controls.update();
+    this.requestRender();
   }
   // --- 测量定位逻辑 ---
   locateMeasurement(id) {
@@ -3579,6 +3616,7 @@ class SceneManager {
     this.camera.zoom = Math.min(targetZoom, 100);
     this.camera.updateProjectionMatrix();
     this.controls.update();
+    this.requestRender();
   }
   // --- 测量逻辑 ---
   startMeasurement(type) {
@@ -3602,6 +3640,7 @@ class SceneManager {
       return this.finalizeMeasurement();
     }
     this.updateMeasurePreview();
+    this.requestRender();
     return null;
   }
   updateMeasurePreview(hoverPoint) {
@@ -3647,6 +3686,7 @@ class SceneManager {
       this.tempMarker.visible = false;
       if (this.previewLine) this.previewLine.visible = false;
     }
+    this.requestRender();
   }
   finalizeMeasurement() {
     const id = `measure_${Date.now()}`;
@@ -3701,6 +3741,7 @@ class SceneManager {
     if (this.onMeasureUpdate) {
       this.onMeasureUpdate(Array.from(this.measureRecords.values()));
     }
+    this.requestRender();
     return { id, type: typeStr, val: valStr };
   }
   createLabel(text, position) {
@@ -4195,6 +4236,7 @@ class SceneManager {
     if (!enabled) {
       this.clipPlaneHelpers.forEach((h) => h.visible = false);
     }
+    this.requestRender();
   }
   updateClippingPlanes(bounds, values, active) {
     if (bounds.isEmpty()) return;
@@ -4243,6 +4285,7 @@ class SceneManager {
       this.clipPlaneHelpers[4].visible = false;
       this.clipPlaneHelpers[5].visible = false;
     }
+    this.requestRender();
   }
   updatePlaneHelper(idx, normal, dist, center, size, isEnabled) {
     const helper = this.clipPlaneHelpers[idx];
@@ -4307,7 +4350,6 @@ class SceneManager {
       memory: parseFloat(this.originalStats.memory.toFixed(2)),
       textureMemory: parseFloat(textureMemory.toFixed(2)),
       drawCalls,
-      fps: Math.round(this.fps),
       chunksLoaded: this.chunkLoadedCount,
       chunksTotal: this.chunks.length,
       chunksQueued: this.processingChunks.size,
@@ -4317,6 +4359,7 @@ class SceneManager {
   dispose() {
     this.disposed = true;
     this.cancelDeferredStructureBuild();
+    this.animateFramePending = false;
     if (this.animationFrameId !== null) {
       cancelAnimationFrame(this.animationFrameId);
       this.animationFrameId = null;
@@ -4354,7 +4397,6 @@ class SceneManager {
     this.dotTexture.dispose();
     this.sharedMaterial.dispose();
     this.renderer.dispose();
-    if (this.tilesRenderer) this.tilesRenderer.dispose();
   }
 }
 function stripFileExtension(name) {
@@ -4364,356 +4406,6 @@ function sanitizeFileStem(name) {
   const sanitized = name.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, " ").trim();
   return sanitized || "model";
 }
-
-function normalizePath(path) {
-  return path.replace(/\\/g, "/").replace(/^(\.\/)+/, "").replace(/^\/+/, "").toLowerCase();
-}
-function candidateKeys(input) {
-  const normalized = normalizePath(input);
-  const parts = normalized.split("/");
-  const fileName = parts[parts.length - 1];
-  return Array.from(/* @__PURE__ */ new Set([
-    normalized,
-    fileName,
-    `./${normalized}`,
-    `./${fileName}`
-  ]));
-}
-function createResourceResolver(files) {
-  const localFiles = files.filter((item) => item instanceof File);
-  if (localFiles.length === 0) return null;
-  const blobUrlMap = /* @__PURE__ */ new Map();
-  const register = (key, file) => {
-    if (!key || blobUrlMap.has(key)) return;
-    blobUrlMap.set(key, URL.createObjectURL(file));
-  };
-  localFiles.forEach((file) => {
-    register(normalizePath(file.name), file);
-    const relativePath = file.webkitRelativePath;
-    if (relativePath) {
-      const trimmed = relativePath.split("/").slice(1).join("/");
-      register(normalizePath(trimmed), file);
-    }
-  });
-  return {
-    resolve: (url) => {
-      if (!url || /^(blob:|data:|https?:)/i.test(url)) return url;
-      for (const key of candidateKeys(url)) {
-        const resolved = blobUrlMap.get(key);
-        if (resolved) return resolved;
-      }
-      return url;
-    },
-    has: (url) => candidateKeys(url).some((key) => blobUrlMap.has(key)),
-    dispose: () => {
-      blobUrlMap.forEach((blobUrl) => URL.revokeObjectURL(blobUrl));
-      blobUrlMap.clear();
-    }
-  };
-}
-
-const STAGE_LABELS = {
-  fetch: "reading",
-  parse: "analyzing",
-  normalize: "processing",
-  optimize: "processing",
-  addToScene: "processing"
-};
-const STAGE_WEIGHTS = {
-  fetch: [0, 20],
-  parse: [20, 58],
-  normalize: [58, 72],
-  optimize: [72, 92],
-  addToScene: [92, 100]
-};
-const libPathCache = /* @__PURE__ */ new Map();
-function normalizeLibPath(libPath) {
-  if (!libPathCache.has(libPath)) {
-    libPathCache.set(libPath, libPath.replace(/\/$/, ""));
-  }
-  return libPathCache.get(libPath);
-}
-function createLoadingManager(files, _libPath, _settings) {
-  const resourceResolver = createResourceResolver(files);
-  const manager = new THREE.LoadingManager();
-  if (resourceResolver) {
-    manager.setURLModifier((url) => resourceResolver.resolve(url));
-  }
-  const cleanup = () => {
-    resourceResolver?.dispose();
-  };
-  return { manager, cleanup, resourceResolver };
-}
-async function createGltfLoaderRuntime(manager, libPath) {
-  const [
-    { GLTFLoader },
-    { DRACOLoader },
-    { KTX2Loader },
-    { MeshoptDecoder }
-  ] = await Promise.all([
-    import('./loaders-TXHpcosE.js').then(n => n.a),
-    import('./loaders-TXHpcosE.js').then(n => n.D),
-    import('./loaders-TXHpcosE.js').then(n => n.K),
-    import('./meshopt_decoder.module-C_9D6xwu.js')
-  ]);
-  const normalizedLibPath = normalizeLibPath(libPath);
-  const supportsCompressedTextures = typeof window !== "undefined" && !!window.createImageBitmap;
-  let probeRenderer = null;
-  const dracoLoader = new DRACOLoader(manager);
-  dracoLoader.setDecoderPath(`${normalizedLibPath}/draco/gltf/`);
-  const ktx2Loader = new KTX2Loader(manager);
-  ktx2Loader.setTranscoderPath(`${normalizedLibPath}/basis/`);
-  if (typeof document !== "undefined") {
-    try {
-      probeRenderer = new THREE.WebGLRenderer({ canvas: document.createElement("canvas") });
-      ktx2Loader.detectSupport(probeRenderer);
-    } catch (error) {
-      console.warn("[LoaderUtils] KTX2 detectSupport failed", error);
-    }
-  }
-  const loader = new GLTFLoader(manager);
-  loader.setDRACOLoader(dracoLoader);
-  loader.setMeshoptDecoder(MeshoptDecoder);
-  if (supportsCompressedTextures) {
-    loader.setKTX2Loader(ktx2Loader);
-  }
-  return {
-    loader,
-    cleanup: () => {
-      dracoLoader.dispose();
-      ktx2Loader.dispose();
-      probeRenderer?.dispose();
-    }
-  };
-}
-function createStageProgressReporter(onProgress, t, fileName, fileBaseProgress, fileWeight) {
-  return (stage, progress, msg) => {
-    const [start, end] = STAGE_WEIGHTS[stage];
-    const safeP = Math.min(100, Math.max(0, Number.isFinite(progress) ? progress : 0));
-    const stagePercent = start + safeP / 100 * (end - start);
-    const totalPercent = fileBaseProgress + stagePercent / 100 * fileWeight;
-    const label = msg || `${t(STAGE_LABELS[stage])} ${fileName}`;
-    onProgress(Math.round(totalPercent), label);
-  };
-}
-async function loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t, settings, libPath) {
-  const loaderContext = createLoadingManager(files);
-  const { manager, cleanup, resourceResolver } = loaderContext;
-  try {
-    if (ext === "lmb") {
-      const { LMBLoader } = await import('./lmbLoader-DKeiizRf.js');
-      const loader = new LMBLoader();
-      reportStage("parse", 0);
-      return await loader.loadAsync(url, (p) => reportStage("parse", p * 100));
-    }
-    if (ext === "glb" || ext === "gltf") {
-      const { loader, cleanup: cleanupGltf } = await createGltfLoaderRuntime(manager, libPath);
-      reportStage("parse", 0);
-      try {
-        const gltf = await new Promise((resolve, reject) => {
-          loader.load(
-            url,
-            resolve,
-            (e) => {
-              if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
-              else reportStage("parse", 50);
-            },
-            reject
-          );
-        });
-        return gltf.scene;
-      } finally {
-        cleanupGltf();
-      }
-    }
-    if (ext === "fbx") {
-      const { FBXLoader } = await import('./loaders-TXHpcosE.js').then(n => n.F);
-      const loader = new FBXLoader(manager);
-      reportStage("parse", 0);
-      return await new Promise((resolve, reject) => {
-        loader.load(
-          url,
-          resolve,
-          (e) => {
-            if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
-            else reportStage("parse", 50);
-          },
-          reject
-        );
-      });
-    }
-    if (ext === "ifc") {
-      const { loadIFC } = await import('./IFCLoader-ChC57y1X.js');
-      reportStage("parse", 0);
-      return await loadIFC(typeof fileOrUrl === "string" ? url : fileOrUrl, (p, msg) => reportStage("parse", p, msg), t, libPath, settings);
-    }
-    if (ext === "obj") {
-      const [{ OBJLoader }, { MTLLoader }] = await Promise.all([
-        import('./loaders-TXHpcosE.js').then(n => n.b),
-        import('./loaders-TXHpcosE.js').then(n => n.M)
-      ]);
-      const objLoader = new OBJLoader(manager);
-      const mtlName = url.replace(/\.[^.]+$/i, ".mtl");
-      if (resourceResolver?.has(mtlName)) {
-        try {
-          const materials = await new Promise((resolve, reject) => {
-            const mtlLoader = new MTLLoader(manager);
-            mtlLoader.load(mtlName, resolve, void 0, reject);
-          });
-          materials.preload();
-          objLoader.setMaterials(materials);
-        } catch (error) {
-          console.warn("[LoaderUtils] Failed to load companion MTL", error);
-        }
-      }
-      reportStage("parse", 0);
-      return await objLoader.loadAsync(url, (e) => {
-        if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
-        else reportStage("parse", 50);
-      });
-    }
-    if (ext === "stl") {
-      const { STLLoader } = await import('./loaders-TXHpcosE.js').then(n => n.S);
-      const loader = new STLLoader(manager);
-      reportStage("parse", 0);
-      const geometry = await loader.loadAsync(url, (e) => {
-        if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
-      });
-      return new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color: 8947848 }));
-    }
-    if (ext === "ply") {
-      const { PLYLoader } = await import('./loaders-TXHpcosE.js').then(n => n.P);
-      const loader = new PLYLoader(manager);
-      reportStage("parse", 0);
-      const geometry = await loader.loadAsync(url, (e) => {
-        if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
-      });
-      return new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({
-        color: 8947848,
-        vertexColors: geometry.hasAttribute("color")
-      }));
-    }
-    if (ext === "3mf") {
-      const { ThreeMFLoader } = await import('./loaders-TXHpcosE.js').then(n => n._);
-      const loader = new ThreeMFLoader(manager);
-      reportStage("parse", 0);
-      return await loader.loadAsync(url, (e) => {
-        if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
-      });
-    }
-    if (ext === "stp" || ext === "step" || ext === "igs" || ext === "iges") {
-      reportStage("fetch", 0);
-      const buffer = typeof fileOrUrl === "string" ? await fetch(url).then((r) => r.arrayBuffer()) : await fileOrUrl.arrayBuffer();
-      const wasmUrl = `${libPath}/occt-import-js/occt-import-js.wasm`;
-      const { OCCTLoader } = await import('./OCCTLoader-CiM09x_z.js');
-      const loader = new OCCTLoader(wasmUrl);
-      reportStage("parse", 0);
-      return await loader.load(buffer, t, (p, msg) => reportStage("parse", p, msg));
-    }
-    return null;
-  } finally {
-    cleanup();
-  }
-}
-function normalizeLoadedObject(object, settings) {
-  object.traverse((child) => {
-    if (child.isMesh) {
-      const mesh = child;
-      mesh.frustumCulled = settings.frustumCulling ?? true;
-      if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
-      if (!mesh.geometry.boundingSphere) mesh.geometry.computeBoundingSphere();
-      const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-      materials.forEach((material) => {
-        if (!material) return;
-        if ("wireframe" in material) {
-          material.wireframe = false;
-        }
-      });
-    }
-  });
-}
-const loadModelFiles = async (files, onProgress, t, settings, libPath = "./libs") => {
-  const loadedObjects = [];
-  const totalFiles = files.length;
-  for (let i = 0; i < totalFiles; i++) {
-    const fileOrUrl = files[i];
-    const isUrl = typeof fileOrUrl === "string";
-    let fileName = "";
-    let ext = "";
-    let url = "";
-    if (isUrl) {
-      url = fileOrUrl;
-      const urlPath = url.split("?")[0].split("#")[0];
-      fileName = urlPath.split("/").pop() || "model";
-      ext = fileName.split(".").pop()?.toLowerCase() || "";
-    } else {
-      fileName = fileOrUrl.name;
-      ext = fileName.split(".").pop()?.toLowerCase() || "";
-      url = URL.createObjectURL(fileOrUrl);
-    }
-    const fileBaseProgress = i / totalFiles * 100;
-    const fileWeight = 100 / totalFiles;
-    const reportStage = createStageProgressReporter(onProgress, t, fileName, fileBaseProgress, fileWeight);
-    try {
-      reportStage("fetch", 5);
-      const object = await loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t, settings, libPath);
-      if (!object) continue;
-      object.name = fileName;
-      reportStage("normalize", 30, `${t("processing")} ${fileName}`);
-      normalizeLoadedObject(object, settings);
-      reportStage("optimize", 100, `${t("analyzing")} ${fileName}`);
-      reportStage("addToScene", 100, `${t("success")} ${fileName}`);
-      loadedObjects.push(object);
-    } catch (error) {
-      console.error(`加载 ${fileName} 失败`, error);
-    } finally {
-      if (!isUrl) URL.revokeObjectURL(url);
-    }
-  }
-  onProgress(100, t("analyzing"));
-  return loadedObjects;
-};
-const parseTilesetFromFolder = async (files, onProgress, t) => {
-  onProgress(10, t("analyzing"));
-  const fileMap = /* @__PURE__ */ new Map();
-  let tilesetKey = "";
-  for (let i = 0; i < files.length; i++) {
-    const f = files[i];
-    const pathParts = f.webkitRelativePath.split("/");
-    const relPath = pathParts.slice(1).join("/");
-    if (relPath) {
-      fileMap.set(relPath, f);
-      if (f.name === "tileset.json") tilesetKey = relPath;
-    } else {
-      fileMap.set(f.name, f);
-      if (f.name === "tileset.json") tilesetKey = f.name;
-    }
-  }
-  if (!tilesetKey && fileMap.has("tileset.json")) tilesetKey = "tileset.json";
-  if (!tilesetKey) {
-    throw new Error("在所选文件夹中未找到tileset.json");
-  }
-  onProgress(50, t("reading"));
-  const blobUrlMap = /* @__PURE__ */ new Map();
-  fileMap.forEach((blob2, path) => {
-    blobUrlMap.set(path, URL.createObjectURL(blob2));
-  });
-  const tilesetFile = fileMap.get(tilesetKey);
-  if (!tilesetFile) return null;
-  const text = await tilesetFile.text();
-  const json = JSON.parse(text);
-  const replaceUris = (node) => {
-    if (node.content && node.content.uri) {
-      const mapped = blobUrlMap.get(node.content.uri);
-      if (mapped) node.content.uri = mapped;
-    }
-    if (node.children) node.children.forEach(replaceUris);
-  };
-  replaceUris(json.root);
-  onProgress(100, t("success"));
-  const blob = new Blob([JSON.stringify(json)], { type: "application/json" });
-  return URL.createObjectURL(blob);
-};
 
 const themes = {
   dark: {
@@ -4906,7 +4598,6 @@ const resources = {
     export_format: "Format",
     export_glb: "GLB (Standard)",
     export_lmb: "LMB (Custom Compressed)",
-    export_3dtiles: "3D Tiles (Web)",
     export_nbim: "NBIM (High Performance)",
     export_filename: "File Name",
     export_filename_placeholder: "Enter file name",
@@ -5187,7 +4878,6 @@ const resources = {
     export_format: "导出格式",
     export_glb: "GLB (标准通用)",
     export_lmb: "LMB (自定义压缩)",
-    export_3dtiles: "3D Tiles (Web大模型)",
     export_nbim: "NBIM (高性能分块模型)",
     export_filename: "文件名",
     export_filename_placeholder: "请输入文件名",
@@ -5557,7 +5247,6 @@ const Toolbar = (props) => {
   } = props;
   const isHidden = (id) => (hiddenMenus || []).includes(id);
   const fileInputRef = React.useRef(null);
-  const folderInputRef = React.useRef(null);
   const batchConvertInputRef = React.useRef(null);
   const [openMenu, setOpenMenu] = useState(null);
   const menuRef = React.useRef(null);
@@ -5618,17 +5307,6 @@ const Toolbar = (props) => {
         onChange: props.handleBatchConvert
       }
     ),
-    /* @__PURE__ */ jsx(
-      "input",
-      {
-        type: "file",
-        ref: folderInputRef,
-        style: { display: "none" },
-        ...{ webkitdirectory: "", directory: "" },
-        accept: ".lmb,.lmbz,.glb,.gltf,.ifc,.nbim,.fbx,.obj,.stl,.ply,.3ds,.dae,.stp,.step,.igs,.iges",
-        onChange: props.handleOpenFolder
-      }
-    ),
     !isHidden("file") && /* @__PURE__ */ jsx("div", { className: "ui-toolbar-group", children: /* @__PURE__ */ jsxs("div", { style: { position: "relative" }, children: [
       /* @__PURE__ */ jsx(
         ImageButton,
@@ -5652,19 +5330,6 @@ const Toolbar = (props) => {
             onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
             onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
             children: t("menu_open_file")
-          }
-        ),
-        !isHidden("open_folder") && /* @__PURE__ */ jsx(
-          "div",
-          {
-            style: { padding: "6px 16px", fontSize: "12px", color: theme.text, cursor: "pointer", backgroundColor: "transparent" },
-            onClick: () => {
-              folderInputRef.current?.click();
-              setOpenMenu(null);
-            },
-            onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
-            onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
-            children: t("menu_open_folder")
           }
         ),
         !isHidden("export") && /* @__PURE__ */ jsx(
@@ -6647,7 +6312,6 @@ const SceneTree = ({
   onSelect,
   onToggleVisibility,
   onDelete,
-  onFocus,
   onIsolate,
   onHide,
   onShowAll,
@@ -6836,15 +6500,8 @@ const SceneTree = ({
     if (!selectedUuid || !containerRef.current) return;
     const targetIndex = flatData.findIndex((node) => node.uuid === selectedUuid);
     if (targetIndex < 0) return;
-    const currentTop = containerRef.current.scrollTop;
-    const currentBottom = currentTop + containerHeight;
-    const itemTop = targetIndex * rowHeight;
-    const itemBottom = itemTop + rowHeight;
-    if (itemTop < currentTop) {
-      containerRef.current.scrollTop = itemTop;
-    } else if (itemBottom > currentBottom) {
-      containerRef.current.scrollTop = Math.max(0, itemBottom - containerHeight);
-    }
+    const itemCenter = targetIndex * rowHeight + rowHeight / 2;
+    containerRef.current.scrollTop = Math.max(0, itemCenter - containerHeight / 2);
   }, [selectedUuid, flatData, containerHeight, rowHeight]);
   const toggleNode = (nodeUuid) => {
     const toggle = (nodes) => nodes.map((node) => {
@@ -6879,7 +6536,7 @@ const SceneTree = ({
   const handleLocateFirstMatch = () => {
     if (!firstSearchMatch) return;
     onSelect(firstSearchMatch.uuid, firstSearchMatch.object);
-    onFocus?.(firstSearchMatch.object);
+    onLocate?.(firstSearchMatch.object);
   };
   const handleLocateIfcMatch = (matchIndex = 0) => {
     const target = locatorMatches[matchIndex];
@@ -7166,7 +6823,12 @@ const SceneTree = ({
             className: `ui-tree-node ${node.uuid === selectedUuid ? "selected" : ""} ${locateResultUuids.includes(node.uuid) ? "matched" : ""} ${node.uuid === locatedUuid ? "located" : ""}`,
             style: { paddingLeft: 8 },
             onClick: () => onSelect(node.uuid, node.object),
-            onDoubleClick: () => onLocate ? onLocate(node.object) : onFocus?.(node.object),
+            onDoubleClick: (e) => {
+              if (node.hasChildren) {
+                e.stopPropagation();
+                toggleNode(node.uuid);
+              }
+            },
             onContextMenu: (e) => {
               e.preventDefault();
               setContextMenu({ x: e.clientX, y: e.clientY, node });
@@ -7260,7 +6922,7 @@ const SceneTree = ({
         items: [
           {
             label: t("locate_in_view") || "定位到视图",
-            onClick: () => onFocus?.(contextMenu.node.object)
+            onClick: () => onLocate?.(contextMenu.node.object)
           },
           { divider: true },
           {
@@ -8116,7 +7778,6 @@ const ExportPanel = ({ t, onClose, onExport, getDefaultFileName, theme }) => {
     [
       { id: "glb", label: "GLB", desc: t("export_glb") },
       { id: "lmb", label: "LMB", desc: t("export_lmb") },
-      { id: "3dtiles", label: "3D Tiles", desc: t("export_3dtiles") },
       { id: "nbim", label: "NBIM", desc: t("export_nbim") }
     ].map((opt) => /* @__PURE__ */ jsxs("label", { style: {
       display: "flex",
@@ -9215,6 +8876,318 @@ function usePersistentState(key, initialValue, options = {}) {
   return [state, setState];
 }
 
+function normalizePath(path) {
+  return path.replace(/\\/g, "/").replace(/^(\.\/)+/, "").replace(/^\/+/, "").toLowerCase();
+}
+function candidateKeys(input) {
+  const normalized = normalizePath(input);
+  const parts = normalized.split("/");
+  const fileName = parts[parts.length - 1];
+  return Array.from(/* @__PURE__ */ new Set([
+    normalized,
+    fileName,
+    `./${normalized}`,
+    `./${fileName}`
+  ]));
+}
+function createResourceResolver(files) {
+  const localFiles = files.filter((item) => item instanceof File);
+  if (localFiles.length === 0) return null;
+  const blobUrlMap = /* @__PURE__ */ new Map();
+  const register = (key, file) => {
+    if (!key || blobUrlMap.has(key)) return;
+    blobUrlMap.set(key, URL.createObjectURL(file));
+  };
+  localFiles.forEach((file) => {
+    register(normalizePath(file.name), file);
+    const relativePath = file.webkitRelativePath;
+    if (relativePath) {
+      const trimmed = relativePath.split("/").slice(1).join("/");
+      register(normalizePath(trimmed), file);
+    }
+  });
+  return {
+    resolve: (url) => {
+      if (!url || /^(blob:|data:|https?:)/i.test(url)) return url;
+      for (const key of candidateKeys(url)) {
+        const resolved = blobUrlMap.get(key);
+        if (resolved) return resolved;
+      }
+      return url;
+    },
+    has: (url) => candidateKeys(url).some((key) => blobUrlMap.has(key)),
+    dispose: () => {
+      blobUrlMap.forEach((blobUrl) => URL.revokeObjectURL(blobUrl));
+      blobUrlMap.clear();
+    }
+  };
+}
+
+const STAGE_LABELS = {
+  fetch: "reading",
+  parse: "analyzing",
+  normalize: "processing",
+  optimize: "processing",
+  addToScene: "processing"
+};
+const STAGE_WEIGHTS = {
+  fetch: [0, 20],
+  parse: [20, 58],
+  normalize: [58, 72],
+  optimize: [72, 92],
+  addToScene: [92, 100]
+};
+const libPathCache = /* @__PURE__ */ new Map();
+function normalizeLibPath(libPath) {
+  if (!libPathCache.has(libPath)) {
+    const trimmed = libPath.replace(/\/$/, "");
+    const resolved = typeof window !== "undefined" ? new URL(trimmed ? `${trimmed}/` : "./", window.location.href).toString().replace(/\/$/, "") : trimmed;
+    libPathCache.set(libPath, resolved);
+  }
+  return libPathCache.get(libPath);
+}
+function createLoadingManager(files, _libPath, _settings) {
+  const resourceResolver = createResourceResolver(files);
+  const manager = new THREE.LoadingManager();
+  if (resourceResolver) {
+    manager.setURLModifier((url) => resourceResolver.resolve(url));
+  }
+  const cleanup = () => {
+    resourceResolver?.dispose();
+  };
+  return { manager, cleanup, resourceResolver };
+}
+async function createGltfLoaderRuntime(manager, libPath) {
+  const [
+    { GLTFLoader },
+    { DRACOLoader },
+    { KTX2Loader },
+    { MeshoptDecoder }
+  ] = await Promise.all([
+    import('./loaders-TXHpcosE.js').then(n => n.a),
+    import('./loaders-TXHpcosE.js').then(n => n.D),
+    import('./loaders-TXHpcosE.js').then(n => n.K),
+    import('./meshopt_decoder.module-C_9D6xwu.js')
+  ]);
+  const normalizedLibPath = normalizeLibPath(libPath);
+  const supportsCompressedTextures = typeof window !== "undefined" && !!window.createImageBitmap;
+  let probeRenderer = null;
+  const dracoLoader = new DRACOLoader(manager);
+  dracoLoader.setDecoderPath(`${normalizedLibPath}/draco/gltf/`);
+  const ktx2Loader = new KTX2Loader(manager);
+  ktx2Loader.setTranscoderPath(`${normalizedLibPath}/basis/`);
+  if (typeof document !== "undefined") {
+    try {
+      probeRenderer = new THREE.WebGLRenderer({ canvas: document.createElement("canvas") });
+      ktx2Loader.detectSupport(probeRenderer);
+    } catch (error) {
+      console.warn("[LoaderUtils] KTX2 detectSupport failed", error);
+    }
+  }
+  const loader = new GLTFLoader(manager);
+  loader.setDRACOLoader(dracoLoader);
+  loader.setMeshoptDecoder(MeshoptDecoder);
+  if (supportsCompressedTextures) {
+    loader.setKTX2Loader(ktx2Loader);
+  }
+  return {
+    loader,
+    cleanup: () => {
+      dracoLoader.dispose();
+      ktx2Loader.dispose();
+      probeRenderer?.dispose();
+    }
+  };
+}
+function createStageProgressReporter(onProgress, t, fileName, fileBaseProgress, fileWeight) {
+  return (stage, progress, msg) => {
+    const [start, end] = STAGE_WEIGHTS[stage];
+    const safeP = Math.min(100, Math.max(0, Number.isFinite(progress) ? progress : 0));
+    const stagePercent = start + safeP / 100 * (end - start);
+    const totalPercent = fileBaseProgress + stagePercent / 100 * fileWeight;
+    const label = msg || `${t(STAGE_LABELS[stage])} ${fileName}`;
+    onProgress(Math.round(totalPercent), label);
+  };
+}
+async function loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t, settings, libPath) {
+  const loaderContext = createLoadingManager(files);
+  const { manager, cleanup, resourceResolver } = loaderContext;
+  try {
+    if (ext === "lmb") {
+      const { LMBLoader } = await import('./lmbLoader-DKeiizRf.js');
+      const loader = new LMBLoader();
+      reportStage("parse", 0);
+      return await loader.loadAsync(url, (p) => reportStage("parse", p * 100));
+    }
+    if (ext === "glb" || ext === "gltf") {
+      const { loader, cleanup: cleanupGltf } = await createGltfLoaderRuntime(manager, libPath);
+      reportStage("parse", 0);
+      try {
+        const gltf = await new Promise((resolve, reject) => {
+          loader.load(
+            url,
+            resolve,
+            (e) => {
+              if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
+              else reportStage("parse", 50);
+            },
+            reject
+          );
+        });
+        return gltf.scene;
+      } finally {
+        cleanupGltf();
+      }
+    }
+    if (ext === "fbx") {
+      const { FBXLoader } = await import('./loaders-TXHpcosE.js').then(n => n.F);
+      const loader = new FBXLoader(manager);
+      reportStage("parse", 0);
+      return await new Promise((resolve, reject) => {
+        loader.load(
+          url,
+          resolve,
+          (e) => {
+            if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
+            else reportStage("parse", 50);
+          },
+          reject
+        );
+      });
+    }
+    if (ext === "ifc") {
+      const { loadIFC } = await import('./IFCLoader-DEnjPaAa.js');
+      reportStage("parse", 0);
+      return await loadIFC(typeof fileOrUrl === "string" ? url : fileOrUrl, (p, msg) => reportStage("parse", p, msg), t, libPath, settings);
+    }
+    if (ext === "obj") {
+      const [{ OBJLoader }, { MTLLoader }] = await Promise.all([
+        import('./loaders-TXHpcosE.js').then(n => n.b),
+        import('./loaders-TXHpcosE.js').then(n => n.M)
+      ]);
+      const objLoader = new OBJLoader(manager);
+      const mtlName = url.replace(/\.[^.]+$/i, ".mtl");
+      if (resourceResolver?.has(mtlName)) {
+        try {
+          const materials = await new Promise((resolve, reject) => {
+            const mtlLoader = new MTLLoader(manager);
+            mtlLoader.load(mtlName, resolve, void 0, reject);
+          });
+          materials.preload();
+          objLoader.setMaterials(materials);
+        } catch (error) {
+          console.warn("[LoaderUtils] Failed to load companion MTL", error);
+        }
+      }
+      reportStage("parse", 0);
+      return await objLoader.loadAsync(url, (e) => {
+        if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
+        else reportStage("parse", 50);
+      });
+    }
+    if (ext === "stl") {
+      const { STLLoader } = await import('./loaders-TXHpcosE.js').then(n => n.S);
+      const loader = new STLLoader(manager);
+      reportStage("parse", 0);
+      const geometry = await loader.loadAsync(url, (e) => {
+        if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
+      });
+      return new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color: 8947848 }));
+    }
+    if (ext === "ply") {
+      const { PLYLoader } = await import('./loaders-TXHpcosE.js').then(n => n.P);
+      const loader = new PLYLoader(manager);
+      reportStage("parse", 0);
+      const geometry = await loader.loadAsync(url, (e) => {
+        if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
+      });
+      return new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({
+        color: 8947848,
+        vertexColors: geometry.hasAttribute("color")
+      }));
+    }
+    if (ext === "3mf") {
+      const { ThreeMFLoader } = await import('./loaders-TXHpcosE.js').then(n => n._);
+      const loader = new ThreeMFLoader(manager);
+      reportStage("parse", 0);
+      return await loader.loadAsync(url, (e) => {
+        if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
+      });
+    }
+    if (ext === "stp" || ext === "step" || ext === "igs" || ext === "iges") {
+      reportStage("fetch", 0);
+      const buffer = typeof fileOrUrl === "string" ? await fetch(url).then((r) => r.arrayBuffer()) : await fileOrUrl.arrayBuffer();
+      const normalizedLibPath = normalizeLibPath(libPath);
+      const wasmUrl = `${normalizedLibPath}/occt-import-js/occt-import-js.wasm`;
+      const { OCCTLoader } = await import('./OCCTLoader-CiM09x_z.js');
+      const loader = new OCCTLoader(wasmUrl);
+      reportStage("parse", 0);
+      return await loader.load(buffer, t, (p, msg) => reportStage("parse", p, msg));
+    }
+    return null;
+  } finally {
+    cleanup();
+  }
+}
+function normalizeLoadedObject(object, settings) {
+  object.traverse((child) => {
+    if (child.isMesh) {
+      const mesh = child;
+      mesh.frustumCulled = settings.frustumCulling ?? true;
+      if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+      if (!mesh.geometry.boundingSphere) mesh.geometry.computeBoundingSphere();
+      const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      materials.forEach((material) => {
+        if (!material) return;
+        if ("wireframe" in material) {
+          material.wireframe = false;
+        }
+      });
+    }
+  });
+}
+const loadModelFiles = async (files, onProgress, t, settings, libPath = "./libs") => {
+  const loadedObjects = [];
+  const totalFiles = files.length;
+  for (let i = 0; i < totalFiles; i++) {
+    const fileOrUrl = files[i];
+    const isUrl = typeof fileOrUrl === "string";
+    let fileName = "";
+    let ext = "";
+    let url = "";
+    if (isUrl) {
+      url = fileOrUrl;
+      const urlPath = url.split("?")[0].split("#")[0];
+      fileName = urlPath.split("/").pop() || "model";
+      ext = fileName.split(".").pop()?.toLowerCase() || "";
+    } else {
+      fileName = fileOrUrl.name;
+      ext = fileName.split(".").pop()?.toLowerCase() || "";
+      url = URL.createObjectURL(fileOrUrl);
+    }
+    const fileBaseProgress = i / totalFiles * 100;
+    const fileWeight = 100 / totalFiles;
+    const reportStage = createStageProgressReporter(onProgress, t, fileName, fileBaseProgress, fileWeight);
+    try {
+      reportStage("fetch", 5);
+      const object = await loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t, settings, libPath);
+      if (!object) continue;
+      object.name = fileName;
+      reportStage("normalize", 30, `${t("processing")} ${fileName}`);
+      normalizeLoadedObject(object, settings);
+      reportStage("optimize", 100, `${t("analyzing")} ${fileName}`);
+      reportStage("addToScene", 100, `${t("success")} ${fileName}`);
+      loadedObjects.push(object);
+    } catch (error) {
+      console.error(`加载 ${fileName} 失败`, error);
+    } finally {
+      if (!isUrl) URL.revokeObjectURL(url);
+    }
+  }
+  onProgress(100, t("analyzing"));
+  return loadedObjects;
+};
+
 function cleanLoadingStatus(message) {
   if (!message) return "";
   return message.replace(/:\s*\d+%/g, "").replace(/\(\d+%\)/g, "").replace(/\d+%/g, "").trim();
@@ -9355,7 +9328,6 @@ const ThreeViewer = ({
     memory: 0,
     textureMemory: 0,
     drawCalls: 0,
-    fps: 0,
     chunksLoaded: 0,
     chunksTotal: 0,
     chunksQueued: 0,
@@ -10026,13 +9998,6 @@ const ThreeViewer = ({
       });
     }
   };
-  const handleFocusObject = (obj) => {
-    if (!sceneMgr.current || !obj) return;
-    const uuid = obj.uuid || obj.id;
-    if (!uuid) return;
-    sceneMgr.current.fitViewToObject(uuid);
-    void handleSelect(obj);
-  };
   const handleClearSelection = () => {
     setSelectedUuids([]);
     setSelectedIfcStorey("");
@@ -10068,13 +10033,6 @@ const ThreeViewer = ({
     manager.onStructureUpdate = () => {
       updateTree();
     };
-    let debounceTimer;
-    manager.onTilesUpdate = () => {
-      if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(() => {
-        updateTree();
-      }, 500);
-    };
     return () => {
       manager.dispose();
     };
@@ -10098,29 +10056,7 @@ const ThreeViewer = ({
     const loadInitial = async () => {
       const itemsToProcess = Array.isArray(initialFiles) ? initialFiles : [initialFiles];
       console.log("[ThreeViewer] loadInitial with items:", itemsToProcess);
-      const modelItems = [];
-      for (const item of itemsToProcess) {
-        if (typeof item === "string") {
-          const urlPath = item.split("?")[0].split("#")[0];
-          if (urlPath.toLowerCase().endsWith(".json") || urlPath.includes("tileset")) {
-            console.log("[ThreeViewer] Initial URL detected as 3D Tiles:", item);
-            mgrInstance.addTileset(item, (p, msg) => {
-              setProgress(p);
-              if (msg) setStatus(cleanLoadingStatus(msg));
-            });
-            updateTree();
-            setStatus(t("tileset_loaded"));
-            setTimeout(() => mgrInstance?.fitView(false), 500);
-          } else {
-            modelItems.push(item);
-          }
-        } else {
-          modelItems.push(item);
-        }
-      }
-      if (modelItems.length > 0) {
-        await processFiles(modelItems);
-      }
+      await processFiles(itemsToProcess);
     };
     loadInitial();
   }, [mgrInstance, initialFiles]);
@@ -10508,7 +10444,6 @@ const ThreeViewer = ({
     setLocatedUuid(uuid);
     const resultSet = locateResultUuids.length > 0 ? locateResultUuids : [uuid];
     sceneMgr.current.setLocateResultSet(resultSet, uuid);
-    sceneMgr.current.highlightObject(uuid);
     sceneMgr.current.fitViewToObject(uuid);
     void handleSelect(obj);
   }, [handleSelect, locateResultUuids]);
@@ -10630,22 +10565,7 @@ const ThreeViewer = ({
     setLoading(true);
     setStatus(t("processing") + "...");
     try {
-      const urlPath = url.split("?")[0].split("#")[0];
-      console.log("[ThreeViewer] Parsed path:", urlPath);
-      if (urlPath.toLowerCase().endsWith(".json") || urlPath.includes("tileset")) {
-        console.log("[ThreeViewer] Detected as 3D Tiles");
-        if (sceneMgr.current) {
-          sceneMgr.current.addTileset(url, (p, msg) => {
-            setProgress(p);
-            if (msg) setStatus(cleanLoadingStatus(msg));
-          });
-          updateTree();
-          setStatus(t("tileset_loaded"));
-          sceneMgr.current?.fitView(false);
-        }
-      } else {
-        await processFiles([url]);
-      }
+      await processFiles([url]);
     } catch (err) {
       console.error("[ThreeViewer] handleOpenUrl error:", err);
       setStatus(t("failed"));
@@ -10676,35 +10596,6 @@ const ThreeViewer = ({
       }
     }
   };
-  const handleOpenFolder = async (e) => {
-    if (!e.target.files?.length || !sceneMgr.current) return;
-    setLoading(true);
-    setProgress(0);
-    try {
-      const url = await parseTilesetFromFolder(
-        e.target.files,
-        (p, msg) => {
-          setProgress(p);
-          if (msg) setStatus(cleanLoadingStatus(msg));
-        },
-        t
-      );
-      if (url) {
-        sceneMgr.current.addTileset(url, (p, msg) => {
-          setProgress(p);
-          if (msg) setStatus(cleanLoadingStatus(msg));
-        });
-        updateTree();
-        setStatus(t("tileset_loaded"));
-        sceneMgr.current?.fitView(false);
-      }
-    } catch (err) {
-      console.error(err);
-      setStatus(t("failed") + ": " + err.message);
-    } finally {
-      setLoading(false);
-    }
-  };
   const stripFileExtension = (name) => name.replace(/\.[^./\\]+$/, "");
   const sanitizeFileStem = (name) => {
     const sanitized = name.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, " ").trim();
@@ -10716,7 +10607,7 @@ const ThreeViewer = ({
     const names = [];
     content.children.forEach((child) => {
       if (child.userData?.isOptimizedGroup) return;
-      if (child.name === "TilesRenderer" || child.name.startsWith("optimized_")) return;
+      if (child.name.startsWith("optimized_")) return;
       const rawName = (typeof child.userData?.modelName === "string" ? child.userData.modelName : "") || (child.children?.[0]?.name || "") || child.name;
       const baseName = sanitizeFileStem(stripFileExtension(rawName));
       names.push(baseName);
@@ -10736,7 +10627,7 @@ const ThreeViewer = ({
   const resolveExportFilename = (format, requestedName) => {
     const fallback = getDefaultExportFileName(format);
     const stem = sanitizeFileStem(stripFileExtension((requestedName || "").trim()) || fallback);
-    return format === "3dtiles" ? stem : `${stem}.${format}`;
+    return `${stem}.${format}`;
   };
   const handleExport = async (format, requestedName) => {
     if (!sceneMgr.current) return;
@@ -10764,7 +10655,7 @@ const ThreeViewer = ({
       }, 100);
       return;
     }
-    const modelsToExport = content.children.filter((c) => !c.userData.isOptimizedGroup && c.name !== "TilesRenderer");
+    const modelsToExport = content.children.filter((c) => !c.userData.isOptimizedGroup);
     if (modelsToExport.length === 0) {
       setToast({ message: t("no_models"), type: "info" });
       return;
@@ -10779,32 +10670,7 @@ const ThreeViewer = ({
       try {
         let blob = null;
         const filename = resolvedFileName;
-        if (format === "3dtiles") {
-          if (!window.showDirectoryPicker) {
-            setToast({ message: t("select_output"), type: "info" });
-            throw new Error("Browser does not support directory picker");
-          }
-          const dirHandle = await window.showDirectoryPicker({ mode: "readwrite" });
-          const filesMap = await convertLMBTo3DTiles(exportGroup, (msg) => {
-            if (msg.includes("%")) {
-              const p = parseInt(msg.match(/(\d+)%/)?.[1] || "0");
-              setProgress(p);
-            }
-            setStatus(cleanLoadingStatus(msg));
-          });
-          setStatus(t("writing"));
-          let writeCount = 0;
-          for (const [name, b] of filesMap) {
-            const fileHandle = await dirHandle.getFileHandle(name, { create: true });
-            const writable = await fileHandle.createWritable();
-            await writable.write(b);
-            await writable.close();
-            writeCount++;
-            if (writeCount % 5 === 0) setProgress(Math.floor(writeCount / filesMap.size * 100));
-          }
-          setToast({ message: t("success"), type: "success" });
-          return;
-        } else if (format === "glb") {
+        if (format === "glb") {
           blob = await exportGLB(exportGroup);
         } else if (format === "lmb") {
           blob = await exportLMB(exportGroup, (msg) => setStatus(cleanLoadingStatus(msg)));
@@ -10909,6 +10775,7 @@ const ThreeViewer = ({
         });
       }
     });
+    sceneMgr.current.requestRender();
   };
   return /* @__PURE__ */ jsx(ErrorBoundary, { t, theme, children: /* @__PURE__ */ jsxs(
     "div",
@@ -10938,7 +10805,6 @@ const ThreeViewer = ({
             setThemeType: setThemeMode,
             handleOpenFiles,
             handleBatchConvert,
-            handleOpenFolder,
             handleOpenUrl,
             handleView,
             handleClear,
@@ -10993,7 +10859,6 @@ const ThreeViewer = ({
                   const uuid = obj?.uuid || obj?.id;
                   if (uuid) handleDeleteObject(uuid);
                 },
-                onFocus: (obj) => handleFocusObject(obj),
                 onHide: handleHideObject,
                 onIsolate: handleIsolateObject,
                 onShowAll: handleShowAll,
@@ -11306,10 +11171,6 @@ const ThreeViewer = ({
               /* @__PURE__ */ jsxs("div", { className: "ui-stats-item", children: [
                 /* @__PURE__ */ jsx(IconActivity, { width: 14, height: 14 }),
                 /* @__PURE__ */ jsx("span", { children: formatMemory(stats.memory) })
-              ] }),
-              /* @__PURE__ */ jsxs("div", { style: { opacity: 0.75, fontVariantNumeric: "tabular-nums" }, title: "FPS", children: [
-                stats.fps,
-                " FPS"
               ] }),
               stats.chunksTotal > 0 && /* @__PURE__ */ jsxs("div", { style: { opacity: 0.75, fontVariantNumeric: "tabular-nums" }, title: "Chunks", children: [
                 "CH ",

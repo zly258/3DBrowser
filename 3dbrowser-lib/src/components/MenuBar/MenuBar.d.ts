@@ -7,7 +7,6 @@ interface MenuBarProps {
     setThemeType?: (type: 'dark' | 'light') => void;
     handleOpenFiles?: (e: React.ChangeEvent<HTMLInputElement>) => void;
     handleBatchConvert?: (e: React.ChangeEvent<HTMLInputElement>) => void;
-    handleOpenFolder?: (e: React.ChangeEvent<HTMLInputElement>) => void;
     handleOpenUrl?: () => void;
     handleView?: (view: string) => void;
     handleClear?: () => void;

@@ -4,7 +4,8 @@ let cachedIfcRuntimePromise = null;
 let cachedIfcRuntimePath = "";
 const ifcTypeCodeCache = /* @__PURE__ */ new Map();
 function getIfcWasmPath(libPath) {
-  return libPath.endsWith("/") ? `${libPath}web-ifc/` : `${libPath}/web-ifc/`;
+  const normalized = typeof window !== "undefined" ? new URL(libPath.endsWith("/") ? libPath : `${libPath}/`, window.location.href).toString() : libPath.endsWith("/") ? libPath : `${libPath}/`;
+  return `${normalized}web-ifc/`;
 }
 async function getIfcRuntime(libPath) {
   const wasmPath = getIfcWasmPath(libPath);

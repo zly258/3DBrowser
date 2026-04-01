@@ -90,7 +90,7 @@ function extractColor(mesh) {
 function getColorByComponentType(_name) {
   return 9741240;
 }
-function collectItems$1(root) {
+function collectItems(root) {
   const items = [];
   const _m4 = new THREE.Matrix4();
   root.updateMatrixWorld(true);
@@ -206,7 +206,7 @@ async function collectItemsBatched(root, options = {}) {
   }
   return items;
 }
-function buildOctree$1(items, bounds, config, level = 0) {
+function buildOctree(items, bounds, config, level = 0) {
   if (items.length <= config.maxItemsPerNode || level >= config.maxDepth) {
     return { bounds: bounds.clone(), children: null, items, level };
   }
@@ -226,7 +226,7 @@ function buildOctree$1(items, bounds, config, level = 0) {
       const cMin = new THREE.Vector3(i & 1 ? center.x : min.x, i & 2 ? center.y : min.y, i & 4 ? center.z : min.z);
       const cMax = new THREE.Vector3(i & 1 ? max.x : center.x, i & 2 ? max.y : center.y, i & 4 ? max.z : center.z);
       const childBounds = new THREE.Box3(cMin, cMax);
-      children.push(buildOctree$1(childrenItems[i], childBounds, config, level + 1));
+      children.push(buildOctree(childrenItems[i], childBounds, config, level + 1));
       hasChildren = true;
     }
   }
@@ -316,241 +316,6 @@ function collectLeafNodes(node, leaves = []) {
   return leaves;
 }
 
-function collectItems(root) {
-  const items = [];
-  const _v3 = new THREE.Vector3();
-  const _m4 = new THREE.Matrix4();
-  root.updateMatrixWorld(true);
-  root.traverse((obj) => {
-    if (obj.isMesh) {
-      const mesh = obj;
-      const geometry = mesh.geometry;
-      const material = mesh.material;
-      if (!geometry) return;
-      const matUuid = Array.isArray(material) ? material[0]?.uuid : material?.uuid;
-      const id = `${geometry.uuid}_${matUuid}`;
-      if (mesh.isInstancedMesh) {
-        const instancedMesh = mesh;
-        for (let i = 0; i < instancedMesh.count; i++) {
-          instancedMesh.getMatrixAt(i, _m4);
-          _m4.premultiply(instancedMesh.matrixWorld);
-          _v3.setFromMatrixPosition(_m4);
-          items.push({
-            id,
-            geometry,
-            material,
-            matrix: _m4.clone(),
-            center: _v3.clone()
-          });
-        }
-      } else {
-        _m4.copy(mesh.matrixWorld);
-        _v3.setFromMatrixPosition(_m4);
-        items.push({
-          id,
-          geometry,
-          material,
-          matrix: _m4.clone(),
-          center: _v3.clone()
-        });
-      }
-    }
-  });
-  return items;
-}
-function buildOctree(items, bounds, config, level = 0) {
-  if (items.length <= config.maxItemsPerNode || level >= config.maxDepth) {
-    return { bounds: bounds.clone(), children: null, items, level };
-  }
-  const center = bounds.getCenter(new THREE.Vector3());
-  const min = bounds.min;
-  const max = bounds.max;
-  const childrenBounds = [];
-  for (let i = 0; i < 2; i++) {
-    for (let j = 0; j < 2; j++) {
-      for (let k = 0; k < 2; k++) {
-        const bMin = new THREE.Vector3(
-          i === 0 ? min.x : center.x,
-          j === 0 ? min.y : center.y,
-          k === 0 ? min.z : center.z
-        );
-        const bMax = new THREE.Vector3(
-          i === 0 ? center.x : max.x,
-          j === 0 ? center.y : max.y,
-          k === 0 ? center.z : max.z
-        );
-        childrenBounds.push(new THREE.Box3(bMin, bMax));
-      }
-    }
-  }
-  const childrenItems = Array(8).fill(null).map(() => []);
-  for (const item of items) {
-    let found = false;
-    for (let i = 0; i < 8; i++) {
-      if (childrenBounds[i].containsPoint(item.center)) {
-        childrenItems[i].push(item);
-        found = true;
-        break;
-      }
-    }
-    if (!found) childrenItems[0].push(item);
-  }
-  const children = [];
-  let hasChildren = false;
-  for (let i = 0; i < 8; i++) {
-    if (childrenItems[i].length > 0) {
-      children.push(buildOctree(childrenItems[i], childrenBounds[i], config, level + 1));
-      hasChildren = true;
-    }
-  }
-  if (!hasChildren) {
-    return { bounds: bounds.clone(), children: null, items, level };
-  }
-  return { bounds: bounds.clone(), children, items: [], level };
-}
-function createSceneFromItems(items) {
-  const scene = new THREE.Scene();
-  const groups = /* @__PURE__ */ new Map();
-  for (const item of items) {
-    if (!groups.has(item.id)) {
-      groups.set(item.id, []);
-    }
-    groups.get(item.id).push(item);
-  }
-  for (const groupItems of groups.values()) {
-    if (groupItems.length === 0) continue;
-    const template = groupItems[0];
-    const geometry = template.geometry.clone();
-    const material = template.material;
-    const instancedMesh = new THREE.InstancedMesh(geometry, material, groupItems.length);
-    instancedMesh.name = "tile_part";
-    for (let i = 0; i < groupItems.length; i++) {
-      instancedMesh.setMatrixAt(i, groupItems[i].matrix);
-    }
-    scene.add(instancedMesh);
-  }
-  return scene;
-}
-async function convertLMBTo3DTiles(root, onProgress) {
-  onProgress("分析场景对象...");
-  const items = collectItems(root);
-  const totalItems = items.length;
-  if (totalItems === 0) throw new Error("No meshes found in scene");
-  const globalOffset = new THREE.Vector3(0, 0, 0);
-  if (root.userData.originalCenter) {
-    globalOffset.copy(root.userData.originalCenter);
-    console.log("使用全局偏移进行瓦片集变换:", globalOffset);
-  }
-  let maxItemsPerNode = 2e3;
-  if (totalItems < 5e3) maxItemsPerNode = 5e3;
-  else if (totalItems > 1e5) maxItemsPerNode = 4e3;
-  else maxItemsPerNode = 2500;
-  let maxDepth = 5;
-  if (totalItems > 2e5) maxDepth = 7;
-  else if (totalItems > 5e4) maxDepth = 6;
-  onProgress(`找到 ${totalItems} 个对象. 配置: 容量=${maxItemsPerNode}, 深度=${maxDepth}...`);
-  const bounds = new THREE.Box3();
-  for (const item of items) {
-    bounds.expandByPoint(item.center);
-  }
-  bounds.min.subScalar(1);
-  bounds.max.addScalar(1);
-  const config = { maxItemsPerNode, maxDepth };
-  const octree = buildOctree(items, bounds, config);
-  const fileBlobs = /* @__PURE__ */ new Map();
-  const exporter = new GLTFExporter();
-  let tileCount = 0;
-  const countTiles = (node) => {
-    if (node.items.length > 0) tileCount++;
-    if (node.children) node.children.forEach(countTiles);
-  };
-  countTiles(octree);
-  let processedCount = 0;
-  onProgress(`预计生成 ${tileCount} 个瓦片...`);
-  const processNode = async (node, path) => {
-    const boundingVolume = {
-      box: [
-        (node.bounds.min.x + node.bounds.max.x) / 2,
-        (node.bounds.min.y + node.bounds.max.y) / 2,
-        (node.bounds.min.z + node.bounds.max.z) / 2,
-        (node.bounds.max.x - node.bounds.min.x) / 2,
-        0,
-        0,
-        0,
-        (node.bounds.max.y - node.bounds.min.y) / 2,
-        0,
-        0,
-        0,
-        (node.bounds.max.z - node.bounds.min.z) / 2
-      ]
-    };
-    const tileObj = {
-      boundingVolume,
-      geometricError: 500 / Math.pow(2, node.level),
-      refine: "ADD"
-    };
-    if (node.items.length > 0) {
-      const scene = createSceneFromItems(node.items);
-      const glbBuffer = await new Promise((resolve, reject) => {
-        exporter.parse(
-          scene,
-          (result) => resolve(result),
-          (err) => reject(err),
-          { binary: true }
-        );
-      });
-      processedCount++;
-      const percent = Math.floor(processedCount / tileCount * 100);
-      onProgress(`生成瓦片 (${processedCount}/${tileCount}): ${percent}%`);
-      const filename = `tile_${path}.glb`;
-      fileBlobs.set(filename, new Blob([glbBuffer], { type: "model/gltf-binary" }));
-      tileObj.content = {
-        uri: filename
-      };
-    }
-    if (node.children) {
-      const childPromises = node.children.map(
-        (child, i) => processNode(child, path + "_" + i)
-      );
-      tileObj.children = await Promise.all(childPromises);
-    }
-    return tileObj;
-  };
-  onProgress("开始生成 GLB 瓦片...");
-  const rootTile = await processNode(octree, "root");
-  const transform = [
-    1,
-    0,
-    0,
-    0,
-    0,
-    1,
-    0,
-    0,
-    0,
-    0,
-    1,
-    0,
-    globalOffset.x,
-    globalOffset.y,
-    globalOffset.z,
-    1
-  ];
-  rootTile.transform = transform;
-  const tileset = {
-    asset: {
-      version: "1.1",
-      // 重要提示：GLTFExporter默认导出为Y轴向上。
-      // 我们在这里设置"Y"，这样3d-tiles-renderer会自动将其旋转到Z轴向上。
-      gltfUpAxis: "Y"
-    },
-    geometricError: 1e3,
-    root: rootTile
-  };
-  const tilesetJson = JSON.stringify(tileset, null, 2);
-  fileBlobs.set("tileset.json", new Blob([tilesetJson], { type: "application/json" }));
-  return fileBlobs;
-}
 async function exportGLB(root) {
   const exporter = new GLTFExporter();
   return new Promise((resolve, reject) => {
@@ -757,4 +522,4 @@ async function exportLMB(root, onProgress) {
   return new Blob([finalBuffer], { type: "application/octet-stream" });
 }
 
-export { collectLeafNodes as a, buildOctree$1 as b, calculateGeometryMemory as c, createBatchedMeshFromItemsAsync as d, collectItemsBatched as e, collectItems$1 as f, convertLMBTo3DTiles as g, exportGLB as h, exportLMB as i };
+export { collectLeafNodes as a, buildOctree as b, calculateGeometryMemory as c, createBatchedMeshFromItemsAsync as d, collectItemsBatched as e, collectItems as f, exportGLB as g, exportLMB as h };
