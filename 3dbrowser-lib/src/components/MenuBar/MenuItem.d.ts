@@ -10,6 +10,7 @@ interface SubItemProps {
     onClick: () => void;
     enabled?: boolean;
     checked?: boolean;
+    icon?: React.ReactNode;
 }
-export declare const ClassicSubItem: ({ label, onClick, enabled, checked }: SubItemProps) => import("react/jsx-runtime").JSX.Element;
+export declare const ClassicSubItem: ({ label, onClick, enabled, checked, icon }: SubItemProps) => import("react/jsx-runtime").JSX.Element;
 export {};

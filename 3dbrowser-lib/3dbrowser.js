@@ -1,10 +1,117 @@
-import { jsxs, jsx, Fragment } from 'react/jsx-runtime';
+import { jsx, jsxs, Fragment } from 'react/jsx-runtime';
 import React, { useState, useEffect, useRef, useCallback, useMemo, Component } from 'react';
 import * as THREE from 'three';
 import { O as OrbitControls } from './loaders-TXHpcosE.js';
-import { TilesRenderer } from '3d-tiles-renderer';
-import { c as calculateGeometryMemory, b as buildOctree, a as collectLeafNodes, d as createBatchedMeshFromItemsAsync, e as collectItemsBatched, f as collectItems, g as convertLMBTo3DTiles, h as exportGLB, i as exportLMB } from './utils-DjWw9cMe.js';
+import { c as calculateGeometryMemory, b as buildOctree, a as collectLeafNodes, d as createBatchedMeshFromItemsAsync, e as collectItemsBatched, f as collectItems, g as exportGLB, h as exportLMB } from './utils-BDOQlmUW.js';
 
+function deriveInitialRuntimeFromHardware(cpuCount, preset) {
+  const normalizedCpu = Math.max(2, cpuCount);
+  const presetFactor = preset === "smooth" ? 0.85 : preset === "quality" ? 1.15 : 1;
+  const maxConcurrentChunkLoads = Math.max(20, Math.min(128, Math.floor(normalizedCpu * 10 * presetFactor)));
+  const maxChunkLoadsPerFrame = Math.max(8, Math.min(48, Math.floor(normalizedCpu * 3 * presetFactor)));
+  return {
+    maxConcurrentChunkLoads,
+    maxChunkLoadsPerFrame
+  };
+}
+function adaptChunkRuntime(input) {
+  const targetFrameMs = 1e3 / Math.max(20, input.targetMinFps);
+  const overloaded = input.frameDeltaMs > targetFrameMs * 1.08;
+  const underLoaded = input.frameDeltaMs < targetFrameMs * 0.78;
+  let nextConcurrentLoads = input.currentConcurrentLoads;
+  let nextFrameBudget = input.currentFrameBudget;
+  if (overloaded) {
+    nextConcurrentLoads = Math.max(8, input.currentConcurrentLoads - 2);
+    nextFrameBudget = Math.max(4, input.currentFrameBudget - 1);
+  } else if (underLoaded) {
+    nextConcurrentLoads = Math.min(128, input.currentConcurrentLoads + 1);
+    nextFrameBudget = Math.min(64, input.currentFrameBudget + 1);
+  }
+  return { nextConcurrentLoads, nextFrameBudget };
+}
+
+const isDevHost = typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
+function debugLog(scope, ...args) {
+  if (!isDevHost) return;
+  console.log(`[${scope}]`, ...args);
+}
+function debugWarn(scope, ...args) {
+  if (!isDevHost) return;
+  console.warn(`[${scope}]`, ...args);
+}
+
+function stableExplodeDirection(seed, target) {
+  let hash = 2166136261;
+  for (let i = 0; i < seed.length; i++) {
+    hash ^= seed.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  const angle = (hash >>> 0) / 4294967295 * Math.PI * 2;
+  const z = (hash >>> 9 & 1023) / 1023 * 2 - 1;
+  const r = Math.sqrt(Math.max(0, 1 - z * z));
+  target.set(Math.cos(angle) * r, Math.sin(angle) * r, z).normalize();
+  return target;
+}
+
+async function readNbimHeader(file) {
+  const headerBuffer = await file.slice(0, 1024).arrayBuffer();
+  const dv = new DataView(headerBuffer);
+  return {
+    magic: dv.getUint32(0, true),
+    version: dv.getUint32(4, true),
+    manifestOffset: dv.getUint32(8, true),
+    manifestLength: dv.getUint32(12, true)
+  };
+}
+async function readNbimManifest(file, header) {
+  const manifestBlob = file.slice(header.manifestOffset, header.manifestOffset + header.manifestLength);
+  const manifestText = await manifestBlob.text();
+  return JSON.parse(manifestText);
+}
+
+function estimateTextureMemoryMb(root) {
+  let textureMemory = 0;
+  const textures = /* @__PURE__ */ new Set();
+  root.traverse((obj) => {
+    if (obj.name === "__EdgesHelper") return;
+    if (!obj.isMesh && !obj.isBatchedMesh) return;
+    const mesh = obj;
+    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    materials.forEach((material) => {
+      if (!material) return;
+      Object.values(material).forEach((value) => {
+        if (!(value instanceof THREE.Texture) || textures.has(value)) return;
+        textures.add(value);
+        const image = value.image;
+        const width = image?.width || 0;
+        const height = image?.height || 0;
+        if (width > 0 && height > 0) {
+          textureMemory += width * height * 4 / (1024 * 1024);
+        }
+      });
+    });
+  });
+  return parseFloat(textureMemory.toFixed(2));
+}
+
+const DEFAULT_SCENE_CHUNK_OPTIONS = {
+  chunkReadCacheSize: 64,
+  chunkPrefetchWindow: 8,
+  ghostMode: "visible-first",
+  targetMinFps: 32
+};
+function resolveSceneChunkOptions(options) {
+  return {
+    chunkReadCacheSize: Math.max(8, Math.min(256, Math.floor(options?.chunkReadCacheSize ?? DEFAULT_SCENE_CHUNK_OPTIONS.chunkReadCacheSize))),
+    chunkPrefetchWindow: Math.max(0, Math.min(32, Math.floor(options?.chunkPrefetchWindow ?? DEFAULT_SCENE_CHUNK_OPTIONS.chunkPrefetchWindow))),
+    ghostMode: options?.ghostMode ?? DEFAULT_SCENE_CHUNK_OPTIONS.ghostMode,
+    targetMinFps: Math.max(20, Math.min(60, Math.floor(options?.targetMinFps ?? DEFAULT_SCENE_CHUNK_OPTIONS.targetMinFps)))
+  };
+}
+
+const CHUNK_PROGRESS_REPORT_INTERVAL_MS = 48;
+const NBIM_CHUNK_REGISTRATION_BATCH = 220;
+const GHOST_VISIBLE_FIRST_BATCH = 180;
 const INVALID_DISPLAY_LABELS = /* @__PURE__ */ new Set(["", "n/a", "na", "undefined", "null", "-", "--"]);
 function sanitizeDisplayLabel(...candidates) {
   for (const candidate of candidates) {
@@ -16,11 +123,10 @@ function sanitizeDisplayLabel(...candidates) {
   return "";
 }
 class SceneManager {
-  constructor(canvas) {
+  constructor(canvas, options = {}) {
     this.structureRoot = { id: "root", name: "Root", type: "Group", children: [] };
     this.nodeMap = /* @__PURE__ */ new Map();
     this.bimIdToNodeIds = /* @__PURE__ */ new Map();
-    this.tilesRenderer = null;
     this.lastSelectedUuid = null;
     this.highlightedUuids = /* @__PURE__ */ new Set();
     this.locateFocusUuid = null;
@@ -35,6 +141,8 @@ class SceneManager {
     this.explodeMode = "radial";
     this.explodeObjectStates = /* @__PURE__ */ new Map();
     this.explodeInstanceStates = /* @__PURE__ */ new Map();
+    this.explodeScratchUniform = new THREE.Vector3();
+    this.explodeScratchMix = new THREE.Vector3();
     this.measureType = "none";
     this.currentMeasurePoints = [];
     this.currentMeasureModelUuid = null;
@@ -100,6 +208,7 @@ class SceneManager {
     this.interactableListValid = false;
     this._needsBoundsUpdate = false;
     this.lastReportedProgress = { loaded: -1, total: -1 };
+    this.lastChunkProgressReportAt = 0;
     this.chunkLoadedCount = 0;
     this.chunkPadding = 0.2;
     this.maxConcurrentChunkLoads = 128;
@@ -111,15 +220,18 @@ class SceneManager {
     this._lastCullingTime = 0;
     this.chunkMeshCache = /* @__PURE__ */ new Map();
     this.chunkCacheOrder = [];
+    this.chunkReadCache = /* @__PURE__ */ new Map();
+    this.chunkReadCacheOrder = [];
+    this.prefetchQueue = [];
+    this.prefetchInFlight = /* @__PURE__ */ new Set();
+    this.prefetchRoundRobinCursor = 0;
+    this.prefetchPaused = false;
     this.originalStats = { meshes: 0, faces: 0, memory: 0 };
     this.originalStatsByModel = /* @__PURE__ */ new Map();
     this.workers = [];
     this.workerQueue = [];
     this.activeWorkerCount = 0;
     this.maxWorkers = 4;
-    this.frameSampleTime = performance.now();
-    this.frameCounter = 0;
-    this.fps = 0;
     this.isCameraMoving = false;
     this.activePixelRatio = 1;
     this.chunkLoadResumeAt = 0;
@@ -127,7 +239,7 @@ class SceneManager {
     this.deferredStructureThreshold = 2e4;
     this.octreeWorkerThreshold = 25e3;
     this.initialChunkLoadTarget = 18;
-    this.warmupChunkBoost = 8;
+    this.warmupChunkBoost = 12;
     this.chunkWarmupActive = false;
     this.chunkResidencyMs = 1800;
     this.chunkRuntimeProfiles = {
@@ -222,6 +334,7 @@ class SceneManager {
     this.chunkRegistrationBatchSize = 18;
     this.chunkGhostBatchSize = 24;
     this.animationFrameId = null;
+    this.animateFramePending = false;
     this.disposed = false;
     this.interactionShadowDowngraded = false;
     this.interactionShadowRestoreAt = 0;
@@ -230,12 +343,22 @@ class SceneManager {
     this.cullingTimeBudgetMovingMs = 4.5;
     this.cullingTimeBudgetRecoveryMs = 6;
     this.cullingTimeBudgetIdleMs = 9;
+    this.adaptiveRuntimeAccumulatedMs = 0;
+    this.adaptiveRuntimeSampleCount = 0;
+    this.ghostMeshPool = [];
     this.canvas = canvas;
+    this.options = options;
+    this.resolvedChunkOptions = resolveSceneChunkOptions(options.chunkOptions);
+    if (options.performancePreset) {
+      this.settings.performanceMode = options.performancePreset;
+    }
     const width = canvas.clientWidth;
     const height = canvas.clientHeight;
     this.dotTexture = this.createCircleTexture();
     this.clock = new THREE.Clock();
     this.initHardwareProfile();
+    this.ghostEdgesGeometry = new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1));
+    this.ghostMaterial = new THREE.LineBasicMaterial({ color: 4674921, transparent: true, opacity: 0.3 });
     this.renderer = new THREE.WebGLRenderer({
       canvas,
       antialias: true,
@@ -294,31 +417,37 @@ class SceneManager {
     this.controls.addEventListener("start", () => {
       const profile = this.getChunkRuntimeProfile();
       this.isCameraMoving = true;
+      this.prefetchPaused = true;
       this.chunkLoadResumeAt = performance.now() + profile.resumeAfterMoveMs;
       this.postMoveRecoveryUntil = 0;
       this.interactionShadowRestoreAt = 0;
       this.movingPeripheralLastRefreshAt = 0;
       this.movingPeripheralCursor = 0;
       this.cullingDirty = true;
+      this.requestRender();
     });
     this.controls.addEventListener("change", () => {
       const profile = this.getChunkRuntimeProfile();
       this.isCameraMoving = true;
+      this.prefetchPaused = true;
       this.chunkLoadResumeAt = performance.now() + profile.resumeAfterMoveMs;
       this.postMoveRecoveryUntil = 0;
       this.interactionShadowRestoreAt = 0;
       this.cullingDirty = true;
+      this.requestRender();
     });
     this.controls.addEventListener("end", () => {
       const now = performance.now();
       const profile = this.getChunkRuntimeProfile();
       this.isCameraMoving = false;
+      this.prefetchPaused = false;
       this.chunkLoadResumeAt = now + Math.max(24, Math.floor(profile.resumeAfterMoveMs * 0.75));
       this.postMoveRecoveryUntil = now + profile.postMoveRecoveryMs;
       this.interactionShadowRestoreAt = now + this.interactionShadowRestoreDelayMs;
       this.movingPeripheralLastRefreshAt = 0;
       this.movingPeripheralCursor = 0;
       this.cullingDirty = true;
+      this.requestRender();
     });
     this.ambientLight = new THREE.AmbientLight(16251131, this.settings.ambientInt);
     this.scene.add(this.ambientLight);
@@ -382,7 +511,7 @@ class SceneManager {
     this.raycaster.params.Line.threshold = 2;
     this.mouse = new THREE.Vector2();
     this.animate = this.animate.bind(this);
-    this.animationFrameId = requestAnimationFrame(this.animate);
+    this.requestRender();
   }
   registerChunk(chunk) {
     this.chunks.push(chunk);
@@ -394,6 +523,13 @@ class SceneManager {
       this.chunkIdSet.add(chunk.id);
     }
   }
+  /** 按需调度一帧：合并多次调用，在相机静止且无后台任务时不常驻 requestAnimationFrame */
+  requestRender() {
+    if (this.disposed) return;
+    if (this.animateFramePending) return;
+    this.animateFramePending = true;
+    this.animationFrameId = requestAnimationFrame(this.animate);
+  }
   updateSettings(newSettings) {
     this.settings = { ...this.settings, ...newSettings };
     this.applyHighlightSettings();
@@ -402,9 +538,6 @@ class SceneManager {
         visible: newSettings.clip.helperVisible,
         opacity: newSettings.clip.helperOpacity
       });
-    }
-    if (newSettings.ifcGridVisible !== void 0) {
-      this.setIfcGridVisibility(newSettings.ifcGridVisible);
     }
     this.ambientLight.intensity = this.settings.ambientInt;
     this.dirLight.intensity = this.settings.dirInt;
@@ -432,13 +565,6 @@ class SceneManager {
       this.updateSunShadow();
     }
     this.renderer.render(this.scene, this.camera);
-  }
-  setIfcGridVisibility(visible) {
-    this.contentGroup.traverse((obj) => {
-      if (obj.userData?.isIfcGridHelper) {
-        obj.visible = visible;
-      }
-    });
   }
   // 根据经纬度和时间计算太阳位置
   updateSunPosition() {
@@ -541,14 +667,9 @@ class SceneManager {
   }
   animate() {
     if (this.disposed) return;
-    this.animationFrameId = requestAnimationFrame(this.animate);
-    this.frameCounter++;
+    this.animateFramePending = false;
+    this.animationFrameId = null;
     const frameNow = performance.now();
-    if (frameNow - this.frameSampleTime >= 500) {
-      this.fps = this.frameCounter * 1e3 / (frameNow - this.frameSampleTime);
-      this.frameCounter = 0;
-      this.frameSampleTime = frameNow;
-    }
     if (this.controls) {
       this.controls.update();
     }
@@ -568,15 +689,11 @@ class SceneManager {
       this._lastCullingTime = now;
       this.cullingDirty = false;
     }
-    if (this.tilesRenderer) {
-      this.camera.updateMatrixWorld();
-      this.tilesRenderer.update();
-    }
     const highlightMaterial = this.highlightMesh.material;
     if (highlightMaterial) {
       if (this.locateFocusUuid && this.highlightMesh.visible) {
         const focusColor = new THREE.Color(this.settings.highlightColor || "#ff9f1c");
-        const pulseMix = 0.15 + (Math.sin(frameNow / 180) + 1) * 0.18;
+        const pulseMix = 0.22 + (Math.sin(frameNow / 125) + 1) * 0.3;
         highlightMaterial.color.copy(focusColor).lerp(this.highlightPulseColor, pulseMix);
         highlightMaterial.opacity = 1;
       } else {
@@ -584,14 +701,27 @@ class SceneManager {
         highlightMaterial.opacity = 1;
       }
     }
+    const selectionLineMat = this.selectionBox.material;
+    if (this.locateFocusUuid && this.selectionBox.visible && selectionLineMat && !Array.isArray(selectionLineMat)) {
+      const baseSel = new THREE.Color(this.settings.highlightColor || "#ff9f1c");
+      const pulseSel = 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(frameNow / 125));
+      selectionLineMat.color.copy(baseSel).lerp(this.highlightPulseColor, 0.34 * pulseSel);
+    } else if (selectionLineMat && !Array.isArray(selectionLineMat)) {
+      selectionLineMat.color.set(this.settings.highlightColor || "#ff9f1c");
+    }
     this.renderer.render(this.scene, this.camera);
+    const chunksIncomplete = this.chunkLoadingEnabled && this.chunks.length > 0 && this.chunkLoadedCount < this.chunks.length;
+    const locatingPulse = !!(this.locateFocusUuid && (this.highlightMesh.visible || this.selectionBox.visible));
+    const keepLoop = this.isCameraMoving || this.isInPostMoveRecovery(now) || this.processingChunks.size > 0 || this.chunkWarmupActive || chunksIncomplete || locatingPulse;
+    if (keepLoop) {
+      this.requestRender();
+    }
   }
   updateAdaptiveQuality() {
     if (!this.settings.adaptiveQuality) return;
     const deviceRatio = window.devicePixelRatio || 1;
     const minRatio = Math.min(deviceRatio, this.settings.minPixelRatio ?? 0.8);
     const maxRatio = Math.min(deviceRatio, this.settings.maxPixelRatio ?? 2);
-    const targetFps = this.settings.targetFps ?? 50;
     const chunkCount = this.chunks.length;
     const meshCount = this.originalStats.meshes;
     const mode = this.settings.performanceMode ?? "balanced";
@@ -599,14 +729,6 @@ class SceneManager {
     if (this.isCameraMoving) {
       const movingScale = mode === "quality" ? chunkCount > 3500 || meshCount > 25e4 ? 0.68 : chunkCount > 1600 || meshCount > 12e4 ? 0.76 : 0.84 : mode === "smooth" ? chunkCount > 3500 || meshCount > 25e4 ? 0.44 : chunkCount > 1600 || meshCount > 12e4 ? 0.52 : 0.6 : chunkCount > 3500 || meshCount > 25e4 ? 0.48 : chunkCount > 1600 || meshCount > 12e4 ? 0.56 : 0.65;
       desiredRatio = Math.max(minRatio, maxRatio * movingScale);
-      const movingPenaltyThreshold = mode === "quality" ? targetFps - 12 : targetFps - 8;
-      if (this.fps > 0 && this.fps < movingPenaltyThreshold) {
-        desiredRatio = Math.max(minRatio, desiredRatio - 0.08);
-      }
-    } else if (this.fps > 0 && this.fps < targetFps - 5) {
-      desiredRatio = Math.max(minRatio, this.activePixelRatio - 0.1);
-    } else if (this.fps > targetFps + 8) {
-      desiredRatio = Math.min(maxRatio, this.activePixelRatio + 0.05);
     }
     desiredRatio = Math.max(minRatio, Math.min(maxRatio, desiredRatio));
     if (Math.abs(desiredRatio - this.activePixelRatio) < 0.05) return;
@@ -642,11 +764,14 @@ class SceneManager {
     const nav = navigator;
     const cpuCount = Math.max(2, nav.hardwareConcurrency || 4);
     const memoryGb = nav.deviceMemory || 8;
+    const preset = this.options.performancePreset ?? this.settings.performanceMode ?? "balanced";
+    const runtime = deriveInitialRuntimeFromHardware(cpuCount, preset);
     this.maxWorkers = Math.max(2, Math.min(8, Math.floor(cpuCount / 2)));
-    this.maxConcurrentChunkLoads = Math.max(16, Math.min(96, cpuCount * 8));
-    this.maxChunkLoadsPerFrame = Math.max(8, Math.min(32, cpuCount * 2));
+    this.maxConcurrentChunkLoads = runtime.maxConcurrentChunkLoads;
+    this.maxChunkLoadsPerFrame = runtime.maxChunkLoadsPerFrame;
     this.maxLoadedChunks = memoryGb <= 4 ? 160 : memoryGb <= 8 ? 320 : 640;
     this.maxCachedChunks = memoryGb <= 4 ? 24 : memoryGb <= 8 ? 48 : 96;
+    this.settings.targetFps = this.resolvedChunkOptions.targetMinFps;
   }
   collectObjectOverview(object) {
     let meshes = 0;
@@ -780,6 +905,86 @@ class SceneManager {
     }
     this.chunkCacheOrder = this.chunkCacheOrder.filter((chunkId) => this.chunkMeshCache.has(chunkId));
   }
+  getChunkReadCacheKey(chunk) {
+    return `${chunk.nbimFileId || "local"}:${chunk.byteOffset || 0}:${chunk.byteLength || 0}`;
+  }
+  touchChunkReadCache(cacheKey) {
+    this.chunkReadCacheOrder = this.chunkReadCacheOrder.filter((key) => key !== cacheKey);
+    this.chunkReadCacheOrder.push(cacheKey);
+  }
+  putChunkReadCache(cacheKey, buffer) {
+    this.chunkReadCache.set(cacheKey, buffer);
+    this.touchChunkReadCache(cacheKey);
+    while (this.chunkReadCacheOrder.length > this.resolvedChunkOptions.chunkReadCacheSize) {
+      const evictKey = this.chunkReadCacheOrder.shift();
+      if (!evictKey) continue;
+      this.chunkReadCache.delete(evictKey);
+    }
+  }
+  async readChunkBuffer(chunk) {
+    const cacheKey = this.getChunkReadCacheKey(chunk);
+    const cached = this.chunkReadCache.get(cacheKey);
+    if (cached) {
+      this.touchChunkReadCache(cacheKey);
+      return cached.slice(0);
+    }
+    const file = this.nbimFiles.get(chunk.nbimFileId);
+    if (!file) throw new Error(`NBIM file not found for chunk: ${chunk.id}`);
+    const buffer = await file.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength).arrayBuffer();
+    this.putChunkReadCache(cacheKey, buffer.slice(0));
+    return buffer;
+  }
+  enqueueChunkPrefetch(chunkIds) {
+    if (this.resolvedChunkOptions.chunkPrefetchWindow <= 0) return;
+    for (const chunkId of chunkIds) {
+      if (this.prefetchQueue.includes(chunkId)) continue;
+      if (this.prefetchInFlight.has(chunkId)) continue;
+      this.prefetchQueue.push(chunkId);
+    }
+  }
+  schedulePrefetchFromVisibleChunks(visibleChunks) {
+    if (this.resolvedChunkOptions.chunkPrefetchWindow <= 0) return;
+    if (this.prefetchPaused || this.isCameraMoving) return;
+    if (visibleChunks.length === 0) return;
+    const windowSize = this.resolvedChunkOptions.chunkPrefetchWindow;
+    const toPrefetch = [];
+    for (let i = 0; i < visibleChunks.length && toPrefetch.length < windowSize; i++) {
+      const pivot = visibleChunks[(this.prefetchRoundRobinCursor + i) % visibleChunks.length];
+      const pivotIndex = this.chunks.findIndex((chunk) => chunk.id === pivot.id);
+      if (pivotIndex < 0) continue;
+      const nextChunk = this.chunks[pivotIndex + 1];
+      if (!nextChunk || nextChunk.loaded || this.processingChunks.has(nextChunk.id)) continue;
+      if (!nextChunk.nbimFileId || !nextChunk.byteOffset || !nextChunk.byteLength) continue;
+      const cacheKey = this.getChunkReadCacheKey(nextChunk);
+      if (this.chunkReadCache.has(cacheKey)) continue;
+      toPrefetch.push(nextChunk.id);
+    }
+    this.prefetchRoundRobinCursor++;
+    this.enqueueChunkPrefetch(toPrefetch);
+    void this.processPrefetchQueue();
+  }
+  async processPrefetchQueue() {
+    if (this.prefetchPaused || this.isCameraMoving) return;
+    if (this.prefetchQueue.length === 0) return;
+    const maxParallel = Math.max(1, Math.min(4, Math.floor(this.maxWorkers / 2)));
+    while (!this.prefetchPaused && !this.isCameraMoving && this.prefetchQueue.length > 0 && this.prefetchInFlight.size < maxParallel) {
+      const chunkId = this.prefetchQueue.shift();
+      if (!chunkId) break;
+      const chunk = this.chunks.find((item) => item.id === chunkId);
+      if (!chunk || !chunk.nbimFileId || !chunk.byteOffset || !chunk.byteLength) continue;
+      const cacheKey = this.getChunkReadCacheKey(chunk);
+      if (this.chunkReadCache.has(cacheKey)) continue;
+      this.prefetchInFlight.add(chunkId);
+      void this.readChunkBuffer(chunk).catch((error) => {
+        debugWarn("SceneManager/prefetch", `prefetch failed for ${chunkId}`, error);
+      }).finally(() => {
+        this.prefetchInFlight.delete(chunkId);
+        if (!this.prefetchPaused && !this.isCameraMoving && this.prefetchQueue.length > 0) {
+          void this.processPrefetchQueue();
+        }
+      });
+    }
+  }
   unregisterOptimizedMeshMapping(bm) {
     const batchIdToUuid = bm.userData.batchIdToUuid;
     if (!batchIdToUuid) return;
@@ -810,19 +1015,38 @@ class SceneManager {
       });
     }
   }
-  ensureChunkGhost(chunk) {
-    if (this.ghostGroup.getObjectByName(`ghost_${chunk.id}`)) return;
+  acquireGhostLine() {
+    const reused = this.ghostMeshPool.pop();
+    if (reused) {
+      reused.visible = true;
+      return reused;
+    }
+    return new THREE.LineSegments(this.ghostEdgesGeometry, this.ghostMaterial);
+  }
+  releaseGhostLine(line) {
+    line.visible = false;
+    line.name = "";
+    line.scale.set(1, 1, 1);
+    line.position.set(0, 0, 0);
+    if (line.material instanceof THREE.LineBasicMaterial) {
+      line.material.opacity = 0.3;
+    }
+    this.ghostMeshPool.push(line);
+  }
+  createGhostLine(name, bounds) {
     const size = new THREE.Vector3();
     const center = new THREE.Vector3();
-    chunk.bounds.getSize(size);
-    chunk.bounds.getCenter(center);
-    const edges = new THREE.LineSegments(
-      new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)),
-      new THREE.LineBasicMaterial({ color: 4674921, transparent: true, opacity: 0.3 })
-    );
-    edges.name = `ghost_${chunk.id}`;
+    bounds.getSize(size);
+    bounds.getCenter(center);
+    const edges = this.acquireGhostLine();
+    edges.name = name;
     edges.scale.copy(size);
     edges.position.copy(center);
+    return edges;
+  }
+  ensureChunkGhost(chunk) {
+    if (this.ghostGroup.getObjectByName(`ghost_${chunk.id}`)) return;
+    const edges = this.createGhostLine(`ghost_${chunk.id}`, chunk.bounds);
     this.ghostGroup.add(edges);
   }
   attachStructureRoot(modelRoot) {
@@ -877,17 +1101,10 @@ class SceneManager {
     await new Promise((resolve) => requestAnimationFrame(() => resolve()));
   }
   createPreviewGhost(bounds, name) {
-    const size = new THREE.Vector3();
-    const center = new THREE.Vector3();
-    bounds.getSize(size);
-    bounds.getCenter(center);
-    const edges = new THREE.LineSegments(
-      new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)),
-      new THREE.LineBasicMaterial({ color: 9741240, transparent: true, opacity: 0.45 })
-    );
-    edges.name = name;
-    edges.scale.copy(size);
-    edges.position.copy(center);
+    const edges = this.createGhostLine(name, bounds);
+    if (edges.material instanceof THREE.LineBasicMaterial) {
+      edges.material.opacity = 0.45;
+    }
     this.ghostGroup.add(edges);
     return edges;
   }
@@ -927,11 +1144,6 @@ class SceneManager {
   }
   async createChunkGhostsProgressively(ghostSpecs) {
     if (ghostSpecs.length === 0) return;
-    const boxGeo = new THREE.BoxGeometry(1, 1, 1);
-    const edgesGeo = new THREE.EdgesGeometry(boxGeo);
-    const boxMat = new THREE.LineBasicMaterial({ color: 4674921, transparent: true, opacity: 0.3 });
-    const size = new THREE.Vector3();
-    const center = new THREE.Vector3();
     for (let start = 0; start < ghostSpecs.length; start += this.chunkGhostBatchSize) {
       const end = Math.min(ghostSpecs.length, start + this.chunkGhostBatchSize);
       for (let index = start; index < end; index++) {
@@ -939,12 +1151,7 @@ class SceneManager {
         const chunk = this.chunks.find((c) => c.id === spec.chunkId);
         if (!chunk || chunk.loaded || this.cancelledChunkIds.has(spec.chunkId)) continue;
         if (this.ghostGroup.getObjectByName(`ghost_${spec.chunkId}`)) continue;
-        spec.bounds.getSize(size);
-        spec.bounds.getCenter(center);
-        const edges = new THREE.LineSegments(edgesGeo, boxMat);
-        edges.name = `ghost_${spec.chunkId}`;
-        edges.scale.copy(size);
-        edges.position.copy(center);
+        const edges = this.createGhostLine(`ghost_${spec.chunkId}`, spec.bounds);
         this.ghostGroup.add(edges);
       }
       if (end < ghostSpecs.length) {
@@ -1096,10 +1303,15 @@ class SceneManager {
     this.renderer.render(this.scene, this.camera);
   }
   reportChunkProgress() {
+    const now = performance.now();
     const total = this.chunks.length;
     const loaded = this.chunkLoadedCount;
-    if (this.onChunkProgress && (loaded !== this.lastReportedProgress.loaded || total !== this.lastReportedProgress.total)) {
+    const changed = loaded !== this.lastReportedProgress.loaded || total !== this.lastReportedProgress.total;
+    const shouldFlush = total === 0 || total > 0 && loaded >= total;
+    const intervalReached = now - this.lastChunkProgressReportAt >= CHUNK_PROGRESS_REPORT_INTERVAL_MS;
+    if (this.onChunkProgress && changed && (intervalReached || shouldFlush)) {
       this.lastReportedProgress = { loaded, total };
+      this.lastChunkProgressReportAt = now;
       this.onChunkProgress(loaded, total);
     }
   }
@@ -1246,7 +1458,7 @@ class SceneManager {
       const dist = toChunkDirection.length();
       const inRange = dist < this.maxRenderDistance;
       if (sampleUnloadedWhileMoving && !c.loaded && chunkIndex % movingSampleStride !== movingSampleSeed) {
-        return;
+        continue;
       }
       const boxSize = c.bounds.getSize(tempSize).length();
       const pixelSize = boxSize / viewHeight * canvasHeight;
@@ -1338,6 +1550,22 @@ class SceneManager {
         this.loadChunk(toLoad[i]);
       }
     }
+    this.schedulePrefetchFromVisibleChunks(loadedChunks);
+    this.adaptiveRuntimeSampleCount++;
+    this.adaptiveRuntimeAccumulatedMs += this.clock.getDelta() * 1e3;
+    if (this.adaptiveRuntimeSampleCount >= 20) {
+      const sampleAvg = this.adaptiveRuntimeAccumulatedMs / this.adaptiveRuntimeSampleCount;
+      const adaptive = adaptChunkRuntime({
+        frameDeltaMs: sampleAvg,
+        targetMinFps: this.resolvedChunkOptions.targetMinFps,
+        currentConcurrentLoads: this.maxConcurrentChunkLoads,
+        currentFrameBudget: this.maxChunkLoadsPerFrame
+      });
+      this.maxConcurrentChunkLoads = adaptive.nextConcurrentLoads;
+      this.maxChunkLoadsPerFrame = adaptive.nextFrameBudget;
+      this.adaptiveRuntimeSampleCount = 0;
+      this.adaptiveRuntimeAccumulatedMs = 0;
+    }
     if (abortedByBudget) {
       this.cullingDirty = true;
     }
@@ -1410,8 +1638,7 @@ class SceneManager {
           yieldControl: () => this.yieldToMainThread()
         });
       } else if (chunk.nbimFileId && this.nbimFiles.has(chunk.nbimFileId) && chunk.byteOffset) {
-        const file = this.nbimFiles.get(chunk.nbimFileId);
-        const buffer = await file.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength).arrayBuffer();
+        const buffer = await this.readChunkBuffer(chunk);
         const meta = this.nbimMeta.get(chunk.nbimFileId);
         const version = meta?.version ?? 8;
         if (version !== 8) {
@@ -1424,6 +1651,21 @@ class SceneManager {
           bimIdTable: meta?.bimIdTable
         }, [buffer]);
         bm = this.reconstructBatchedMesh(workerResult, this.sharedMaterial);
+        if (!this.isCameraMoving && this.resolvedChunkOptions.chunkPrefetchWindow > 0) {
+          const chunkIndex = this.chunks.findIndex((item) => item.id === chunk.id);
+          if (chunkIndex >= 0) {
+            const candidates = [];
+            for (let i = 1; i <= this.resolvedChunkOptions.chunkPrefetchWindow; i++) {
+              const next = this.chunks[chunkIndex + i];
+              if (!next) break;
+              if (next.loaded || this.processingChunks.has(next.id)) continue;
+              if (!next.nbimFileId || !next.byteOffset || !next.byteLength) continue;
+              candidates.push(next.id);
+            }
+            this.enqueueChunkPrefetch(candidates);
+            void this.processPrefetchQueue();
+          }
+        }
       }
       if (bm) {
         if (this.cancelledChunkIds.has(chunk.id) || !this.chunkIdSet.has(chunk.id)) {
@@ -1470,7 +1712,7 @@ class SceneManager {
       const ghost = this.ghostGroup.getObjectByName(`ghost_${chunk.id}`);
       if (ghost) {
         this.ghostGroup.remove(ghost);
-        if (ghost.geometry) ghost.geometry.dispose();
+        this.releaseGhostLine(ghost);
       }
     } catch (err) {
       console.error(`加载分块 ${chunk.id} 失败:`, err);
@@ -1480,8 +1722,30 @@ class SceneManager {
   }
   setChunkLoadingEnabled(enabled) {
     this.chunkLoadingEnabled = enabled;
+    this.prefetchPaused = !enabled;
     this.cullingDirty = true;
     if (enabled) this.checkCullingAndLoad();
+  }
+  setChunkOptions(options = {}) {
+    const resolved = resolveSceneChunkOptions(options);
+    this.resolvedChunkOptions.chunkReadCacheSize = resolved.chunkReadCacheSize;
+    this.resolvedChunkOptions.chunkPrefetchWindow = resolved.chunkPrefetchWindow;
+    this.resolvedChunkOptions.ghostMode = resolved.ghostMode;
+    this.resolvedChunkOptions.targetMinFps = resolved.targetMinFps;
+    this.settings.targetFps = resolved.targetMinFps;
+    while (this.chunkReadCacheOrder.length > this.resolvedChunkOptions.chunkReadCacheSize) {
+      const evict = this.chunkReadCacheOrder.shift();
+      if (!evict) continue;
+      this.chunkReadCache.delete(evict);
+    }
+  }
+  getChunkOptions() {
+    return {
+      chunkReadCacheSize: this.resolvedChunkOptions.chunkReadCacheSize,
+      chunkPrefetchWindow: this.resolvedChunkOptions.chunkPrefetchWindow,
+      ghostMode: this.resolvedChunkOptions.ghostMode,
+      targetMinFps: this.resolvedChunkOptions.targetMinFps
+    };
   }
   setContentVisible(visible) {
     this.contentGroup.visible = visible;
@@ -1495,7 +1759,7 @@ class SceneManager {
       name: sanitizeDisplayLabel(object.name, object.userData?.name) || fallbackName,
       type: object.isMesh ? "Mesh" : "Group",
       children: [],
-      bimId: object.userData?.bimId ? String(object.userData.bimId) : object.userData?.expressID !== void 0 ? String(object.userData.expressID) : void 0,
+      bimId: object.userData?.bimId ? String(object.userData.bimId) : object.userData?.expressID !== void 0 ? String(object.userData.expressID) : object.name ? String(object.name) : void 0,
       userData: { ...object.userData }
     };
     if (!this.nodeMap.has(object.uuid)) this.nodeMap.set(object.uuid, []);
@@ -1508,9 +1772,6 @@ class SceneManager {
   /**
    * 构建基于 IFC 图层和空间结构的复合树
    */
-  /**
-   * 构建基于 IFC 图层和空间结构的复合树
-   */
   buildIFCStructure(object) {
     const buildSpatialRecursive = (obj) => {
       const fallbackName = obj.isMesh ? `Mesh_${obj.id}` : `Group_${obj.id}`;
@@ -1519,7 +1780,7 @@ class SceneManager {
         name: sanitizeDisplayLabel(obj.name, obj.userData?.name) || fallbackName,
         type: obj.isMesh ? "Mesh" : "Group",
         children: [],
-        bimId: obj.userData?.expressID !== void 0 ? String(obj.userData.expressID) : void 0,
+        bimId: obj.userData?.bimId ? String(obj.userData.bimId) : obj.userData?.expressID !== void 0 ? String(obj.userData.expressID) : obj.name ? String(obj.name) : void 0,
         userData: { ...obj.userData }
       };
       if (!this.nodeMap.has(obj.uuid)) this.nodeMap.set(obj.uuid, []);
@@ -1724,11 +1985,7 @@ class SceneManager {
     this.checkCullingAndLoad();
     if (!previewGhost) return;
     this.ghostGroup.remove(previewGhost);
-    if (previewGhost.geometry) previewGhost.geometry.dispose();
-    if (previewGhost.material) {
-      const materials = Array.isArray(previewGhost.material) ? previewGhost.material : [previewGhost.material];
-      materials.forEach((m) => m.dispose && m.dispose());
-    }
+    this.releaseGhostLine(previewGhost);
   }
   cancelDeferredStructureBuild() {
     if (this.deferredStructureTimer) {
@@ -1872,7 +2129,7 @@ class SceneManager {
         const ghost = this.ghostGroup.getObjectByName(`ghost_${c.id}`);
         if (ghost) {
           this.ghostGroup.remove(ghost);
-          if (ghost.geometry) ghost.geometry.dispose();
+          this.releaseGhostLine(ghost);
         }
         return false;
       }
@@ -1907,6 +2164,7 @@ class SceneManager {
     }
     this.updateSceneBounds();
     if (this.onStructureUpdate) this.onStructureUpdate();
+    this.requestRender();
     this.measureRecords.forEach((record, recordId) => {
       let isRelated = record.modelUuid === uuid || record.modelUuid === originalUuid;
       if (!isRelated && record.modelUuid && obj) {
@@ -1924,70 +2182,6 @@ class SceneManager {
   }
   async removeModel(uuid) {
     return this.removeObject(uuid);
-  }
-  addTileset(url, onProgress) {
-    if (this.tilesRenderer) {
-      this.tilesRenderer.dispose();
-      this.contentGroup.remove(this.tilesRenderer.group);
-    }
-    if (onProgress) onProgress(10, "正在初始化 TilesRenderer...");
-    const renderer = new TilesRenderer(url);
-    renderer.setCamera(this.camera);
-    renderer.setResolutionFromRenderer(this.camera, this.renderer);
-    renderer.errorTarget = 16;
-    renderer.lruCache.maxSize = 500 * 1024 * 1024;
-    renderer.group.name = "3D Tileset";
-    let loadedTiles = 0;
-    let hasError = false;
-    renderer.onLoadTileSet = () => {
-      if (onProgress) onProgress(50, "Tileset 结构已加载");
-    };
-    renderer.onLoadModel = () => {
-      loadedTiles++;
-      if (onProgress && !hasError) {
-        onProgress(Math.min(99, 50 + loadedTiles), `已加载瓦片: ${loadedTiles}`);
-      }
-    };
-    setTimeout(() => {
-      if (!renderer.tileset && !hasError) {
-        hasError = true;
-        if (onProgress) onProgress(0, "加载失败: 无法获取 Tileset 配置文件，请检查网络或路径。");
-      }
-    }, 1e4);
-    renderer.onLoadTile = (_tile) => {
-      if (this.onTilesUpdate) this.onTilesUpdate();
-    };
-    renderer.onDisposeTile = (_tile) => {
-      if (this.onTilesUpdate) this.onTilesUpdate();
-    };
-    this.contentGroup.add(renderer.group);
-    this.tilesRenderer = renderer;
-    renderer.group.position.copy(this.globalOffset.clone().negate());
-    renderer.group.name = "3D Tileset";
-    const buildTilesTree = (tile, depth = 0) => {
-      const node = {
-        id: tile.content?.uuid || THREE.MathUtils.generateUUID(),
-        name: tile.content?.name || `Tile_${tile.level}_${tile.x || 0}_${tile.y || 0}`,
-        type: "Group",
-        children: []
-      };
-      if (tile.children) {
-        node.children = tile.children.map((c) => buildTilesTree(c, depth + 1));
-      }
-      return node;
-    };
-    const tilesNode = {
-      id: renderer.group.uuid,
-      name: "3D Tileset",
-      type: "Group",
-      children: renderer.tileset ? [buildTilesTree(renderer.tileset.root)] : []
-    };
-    if (!this.structureRoot.children) this.structureRoot.children = [];
-    this.structureRoot.children.push(tilesNode);
-    this.nodeMap.set(tilesNode.id, [tilesNode]);
-    this.updateSceneBounds();
-    this.updateSettings(this.settings);
-    return renderer.group;
   }
   // --- NBIM 导入/导出功能 ---
   generateChunkBinaryV8(items, bimIdToIndex) {
@@ -2117,7 +2311,8 @@ class SceneManager {
       const bimId = inst.bimId;
       const key = `${originalUuid}::${bimId}`;
       const nodeIds = this.bimIdToNodeIds.get(key);
-      batchIdToUuid.set(instId, nodeIds?.[0] || `bim_${bimId}`);
+      const resolvedUuid = nodeIds?.[0] || bimId || originalUuid;
+      batchIdToUuid.set(instId, resolvedUuid);
       batchIdToBimId.set(instId, bimId);
       batchIdToColor.set(instId, inst.color);
       batchIdToGeometry.set(instId, geometries[inst.geoIdx]);
@@ -2301,9 +2496,23 @@ class SceneManager {
           if (ud.modelID !== void 0) out.modelID = ud.modelID;
           return Object.keys(out).length > 0 ? out : void 0;
         };
+        const usedIds = /* @__PURE__ */ new Set();
+        const assignId = (rawName, fallback) => {
+          const base = rawName && rawName.trim() ? rawName.trim() : fallback;
+          if (!usedIds.has(base)) {
+            usedIds.add(base);
+            return base;
+          }
+          let n = 2;
+          while (usedIds.has(`${base}_${n}`)) n++;
+          const id = `${base}_${n}`;
+          usedIds.add(id);
+          return id;
+        };
         const srcRoot = this.structureRoot;
+        const rootId = assignId(srcRoot?.name, srcRoot?.id ?? "Root");
         const rootCopy = {
-          id: srcRoot?.id,
+          id: rootId,
           name: srcRoot?.name,
           type: srcRoot?.type,
           visible: srcRoot?.visible !== false,
@@ -2318,8 +2527,9 @@ class SceneManager {
           const { src, dst } = stack2.pop();
           const children = Array.isArray(src?.children) ? src.children : [];
           for (const child of children) {
+            const childId = assignId(child?.name, child?.id ?? "Node");
             const childCopy = {
-              id: child?.id,
+              id: childId,
               name: child?.name,
               type: child?.type,
               visible: child?.visible !== false,
@@ -2367,7 +2577,7 @@ class SceneManager {
       const names = [];
       this.contentGroup.children.forEach((child) => {
         if (child.userData?.isOptimizedGroup) return;
-        if (child.name === "TilesRenderer" || child.name.startsWith("optimized_")) return;
+        if (child.name.startsWith("optimized_")) return;
         const rawName = (typeof child.userData?.modelName === "string" ? child.userData.modelName : "") || (child.children?.[0]?.name || "") || child.name;
         const baseName = sanitizeFileStem(stripFileExtension(rawName));
         names.push(baseName);
@@ -2389,20 +2599,15 @@ class SceneManager {
     const fileId = `nbim_${file.name}_${(/* @__PURE__ */ new Date()).getTime()}`;
     this.nbimFiles.set(fileId, file);
     if (onProgress) onProgress(10, "正在解析 NBIM 文件头...");
-    const headerBuffer = await file.slice(0, 1024).arrayBuffer();
-    const dv = new DataView(headerBuffer);
-    const magic = dv.getUint32(0, true);
+    const header = await readNbimHeader(file);
+    const magic = header.magic;
     if (magic !== 1296646734) throw new Error("不是有效的 NBIM 文件");
-    const version = dv.getUint32(4, true);
+    const version = header.version;
     if (version !== 8) {
       throw new Error(`不支持的 NBIM 版本: ${version}，当前仅支持 V8`);
     }
-    const manifestOffset = dv.getUint32(8, true);
-    const manifestLen = dv.getUint32(12, true);
     if (onProgress) onProgress(20, "正在读取元数据...");
-    const manifestBlob = file.slice(manifestOffset, manifestOffset + manifestLen);
-    const manifestText = await manifestBlob.text();
-    const manifest = JSON.parse(manifestText);
+    const manifest = await readNbimManifest(file, header);
     this.nbimMeta.set(fileId, { version, bimIdTable: manifest.bimIdTable });
     if (manifest.globalBounds) {
       const newBounds = new THREE.Box3(
@@ -2411,7 +2616,7 @@ class SceneManager {
       );
       if (this.globalOffset.length() === 0) {
         newBounds.getCenter(this.globalOffset);
-        console.log("初始化全局偏移 (NBIM):", this.globalOffset);
+        debugLog("SceneManager/NBIM", "初始化全局偏移", this.globalOffset);
       }
       if (this.precomputedBounds.isEmpty()) {
         this.precomputedBounds.copy(newBounds);
@@ -2431,17 +2636,26 @@ class SceneManager {
     }
     const rootId = modelRoot?.id || fileId;
     const manifestBimProperties = manifest?.bimProperties && typeof manifest.bimProperties === "object" ? manifest.bimProperties : {};
-    const groupedBimProperties = /* @__PURE__ */ new Map();
-    Object.entries(manifestBimProperties).forEach(([key, value]) => {
-      const sepIndex = key.indexOf("::");
-      const owner = sepIndex > 0 ? key.slice(0, sepIndex) : rootId;
-      if (!groupedBimProperties.has(owner)) groupedBimProperties.set(owner, {});
-      groupedBimProperties.get(owner)[key] = value;
+    const propKeys = Object.keys(manifestBimProperties);
+    const ownerSet = /* @__PURE__ */ new Set();
+    propKeys.forEach((k) => {
+      const i = k.indexOf("::");
+      if (i > 0) ownerSet.add(k.slice(0, i));
     });
-    if (groupedBimProperties.size > 0) {
-      groupedBimProperties.forEach((props, owner) => {
-        this.nbimPropsByOriginalUuid.set(owner, props);
-      });
+    const defaultOwner = ownerSet.size === 1 ? [...ownerSet][0] : rootId;
+    if (ownerSet.size >= 1) {
+      if (ownerSet.size === 1) {
+        this.nbimPropsByOriginalUuid.set(defaultOwner, manifestBimProperties);
+      } else {
+        const grouped = /* @__PURE__ */ new Map();
+        propKeys.forEach((k) => {
+          const i = k.indexOf("::");
+          const owner = i > 0 ? k.slice(0, i) : rootId;
+          if (!grouped.has(owner)) grouped.set(owner, {});
+          grouped.get(owner)[k] = manifestBimProperties[k];
+        });
+        grouped.forEach((props, owner) => this.nbimPropsByOriginalUuid.set(owner, props));
+      }
     } else {
       this.nbimPropsByOriginalUuid.set(rootId, manifestBimProperties);
     }
@@ -2462,7 +2676,7 @@ class SceneManager {
     if (modelRoot) {
       const traverse = (node) => {
         if (!node.userData) node.userData = {};
-        const nodeOriginalUuid = node.userData?.originalUuid ? String(node.userData.originalUuid) : rootId;
+        const nodeOriginalUuid = node.userData?.originalUuid ? String(node.userData.originalUuid) : defaultOwner;
         node.userData.originalUuid = nodeOriginalUuid;
         if (!this.nodeMap.has(node.id)) this.nodeMap.set(node.id, []);
         this.nodeMap.get(node.id).push(node);
@@ -2476,15 +2690,18 @@ class SceneManager {
       traverse(modelRoot);
     }
     if (onProgress) onProgress(30, "正在初始化分块...");
-    const boxGeo = new THREE.BoxGeometry(1, 1, 1);
-    const boxMat = new THREE.LineBasicMaterial({ color: 4674921, transparent: true, opacity: 0.3 });
-    manifest.chunks.forEach((c) => {
+    const chunkOffset = this.globalOffset.lengthSq() > 0 ? this.globalOffset.clone().negate() : null;
+    const chunkEntries = Array.isArray(manifest.chunks) ? manifest.chunks : [];
+    const deferredGhostSpecs = [];
+    const immediateGhostLimit = this.resolvedChunkOptions.ghostMode === "all" ? Number.MAX_SAFE_INTEGER : GHOST_VISIBLE_FIRST_BATCH;
+    for (let i = 0; i < chunkEntries.length; i++) {
+      const c = chunkEntries[i];
       const bounds = new THREE.Box3(
         new THREE.Vector3(c.bounds.min.x, c.bounds.min.y, c.bounds.min.z),
         new THREE.Vector3(c.bounds.max.x, c.bounds.max.y, c.bounds.max.z)
       );
-      if (this.globalOffset.length() > 0) {
-        bounds.translate(this.globalOffset.clone().negate());
+      if (chunkOffset) {
+        bounds.translate(chunkOffset);
       }
       const chunkId = c.id;
       const center = bounds.getCenter(new THREE.Vector3());
@@ -2504,21 +2721,28 @@ class SceneManager {
         groupName: `optimized_${rootId}`,
         originalUuid: c.originalUuid ? String(c.originalUuid) : rootId
       });
-      const size = new THREE.Vector3();
-      bounds.getSize(size);
-      const edges = new THREE.LineSegments(
-        new THREE.EdgesGeometry(boxGeo),
-        boxMat
-      );
-      edges.name = `ghost_${chunkId}`;
-      edges.scale.copy(size);
-      edges.position.copy(center);
-      this.ghostGroup.add(edges);
-    });
+      if (i < immediateGhostLimit) {
+        const edges = this.createGhostLine(`ghost_${chunkId}`, bounds);
+        this.ghostGroup.add(edges);
+      } else {
+        deferredGhostSpecs.push({ chunkId, bounds });
+      }
+      if ((i + 1) % NBIM_CHUNK_REGISTRATION_BATCH === 0) {
+        if (onProgress) {
+          const ratio = Math.max(0, Math.min(1, (i + 1) / chunkEntries.length));
+          const progress = 30 + Math.round(ratio * 40);
+          onProgress(progress, "正在初始化分块...");
+        }
+        await this.yieldToMainThread();
+      }
+    }
+    if (deferredGhostSpecs.length > 0) {
+      void this.createChunkGhostsProgressively(deferredGhostSpecs);
+    }
     this.reportChunkProgress();
     this.fitView(true);
     this.chunkWarmupActive = true;
-    this.initialChunkLoadTarget = this.chunks.length > 200 ? 24 : this.chunks.length > 80 ? 16 : 10;
+    this.initialChunkLoadTarget = this.chunks.length > 200 ? 44 : this.chunks.length > 80 ? 30 : 16;
     if (onProgress) onProgress(100, "NBIM 已就绪，正在按需加载...");
     this.checkCullingAndLoad();
     if (!manifest.stats && manifest.chunks?.length) {
@@ -2531,7 +2755,7 @@ class SceneManager {
     }
   }
   async clear() {
-    console.log("开始清空场景...");
+    debugLog("SceneManager", "开始清空场景...");
     this.cancelDeferredStructureBuild();
     this.resetExplode();
     try {
@@ -2556,12 +2780,12 @@ class SceneManager {
       while (this.contentGroup.children.length > 0) {
         this.contentGroup.remove(this.contentGroup.children[0]);
       }
-      if (this.tilesRenderer) {
-        this.tilesRenderer.dispose();
-        this.tilesRenderer = null;
+      while (this.ghostGroup.children.length > 0) {
+        const ghost = this.ghostGroup.children[0];
+        this.ghostGroup.remove(ghost);
+        this.releaseGhostLine(ghost);
       }
-      this.ghostGroup.children.forEach(disposeObject);
-      this.ghostGroup.clear();
+      this.ghostMeshPool.length = 0;
       this.selectionBox.visible = false;
       this.highlightMesh.visible = false;
       this.clearAllMeasurements();
@@ -2579,10 +2803,14 @@ class SceneManager {
       this.lastReportedProgress = { loaded: -1, total: -1 };
       this.processingChunks.clear();
       this.cancelledChunkIds.clear();
+      this.prefetchQueue = [];
+      this.prefetchInFlight.clear();
       this.chunkLoadedCount = 0;
       this.reportChunkProgress();
       this.componentMap.clear();
       this.clearChunkCache();
+      this.chunkReadCache.clear();
+      this.chunkReadCacheOrder = [];
       this.originalStats = { meshes: 0, faces: 0, memory: 0 };
       this.originalStatsByModel.clear();
       this.fastPreviewModels.clear();
@@ -2591,7 +2819,8 @@ class SceneManager {
       this.ghostGroup.visible = true;
       this.chunkWarmupActive = false;
       this.globalOffset.set(0, 0, 0);
-      console.log("场景已清空");
+      debugLog("SceneManager", "场景已清空");
+      this.requestRender();
     } catch (error) {
       console.error("清空场景失败:", error);
       throw error;
@@ -2600,8 +2829,39 @@ class SceneManager {
   getStructureNodes(id) {
     return this.nodeMap.get(id);
   }
+  getBimIdByUuid(uuid) {
+    const nodes = this.nodeMap.get(uuid);
+    if (nodes && nodes.length > 0 && nodes[0].bimId) {
+      return nodes[0].bimId;
+    }
+    for (const [key, nodeIds] of this.bimIdToNodeIds.entries()) {
+      if (nodeIds.includes(uuid)) {
+        const parts = key.split("::");
+        return parts.length > 1 ? parts[1] : null;
+      }
+    }
+    return null;
+  }
+  resolveNodeUuidByBimId(bimId) {
+    for (const [key, nodeIds] of this.bimIdToNodeIds.entries()) {
+      if (key.endsWith(`::${bimId}`) && nodeIds.length > 0) {
+        return nodeIds[0];
+      }
+    }
+    return null;
+  }
+  resolveSelectionUuid(rawUuid) {
+    if (this.nodeMap.has(rawUuid)) return rawUuid;
+    const mapped = this.resolveNodeUuidByBimId(rawUuid);
+    return mapped || rawUuid;
+  }
+  resolveNbimNode(id) {
+    const direct = this.nodeMap.get(id);
+    if (direct && direct.length > 0) return direct[0];
+    return null;
+  }
   getNbimProperties(id) {
-    const node = this.nodeMap.get(id)?.[0];
+    const node = this.resolveNbimNode(id);
     if (!node || !node.bimId) return null;
     const originalUuid = node.userData?.originalUuid ? String(node.userData.originalUuid) : "";
     if (!originalUuid) return null;
@@ -2614,7 +2874,7 @@ class SceneManager {
     return flatProps;
   }
   getNbimIfcPropertyGroups(id, mode = "raw") {
-    const node = this.nodeMap.get(id)?.[0];
+    const node = this.resolveNbimNode(id);
     if (!node || !node.bimId) return null;
     const originalUuid = node.userData?.originalUuid ? String(node.userData.originalUuid) : "";
     if (!originalUuid) return null;
@@ -2651,6 +2911,7 @@ class SceneManager {
     });
     this.updateSceneBounds();
     this.refreshExplodeState();
+    this.requestRender();
   }
   hideObjects(uuids) {
     uuids.forEach((id) => this.setObjectVisibility(id, false));
@@ -2702,6 +2963,7 @@ class SceneManager {
     this.interactableListValid = false;
     this.updateSceneBounds();
     this.refreshExplodeState();
+    this.requestRender();
   }
   setObjectVisibility(uuid, visible, showParents = true) {
     const nodes = this.nodeMap.get(uuid);
@@ -2782,6 +3044,7 @@ class SceneManager {
     });
     this.interactableListValid = false;
     this.updateSceneBounds();
+    this.requestRender();
   }
   highlightObject(uuid) {
     this.highlightObjects(uuid ? [uuid] : []);
@@ -2805,6 +3068,10 @@ class SceneManager {
     }
     return direction.normalize();
   }
+  /** 由 UUID 导出的稳定单位向量，近似均匀分布于球面（与径向方向混合后爆炸更散、更匀） */
+  explodeStableUnitDirection(seed, target) {
+    stableExplodeDirection(seed, target);
+  }
   captureExplodeSnapshot() {
     this.explodeObjectStates.clear();
     this.explodeInstanceStates.clear();
@@ -2825,9 +3092,18 @@ class SceneManager {
       objectBox.setFromObject(obj);
       if (objectBox.isEmpty()) return;
       objectCenter.copy(objectBox.getCenter(new THREE.Vector3()));
-      const vectorFromCenter = objectCenter.sub(this.explodeCenter);
-      const weight = THREE.MathUtils.clamp(vectorFromCenter.length() / radius, 0.18, 1.25);
-      const directionWorld = this.getExplodeWorldDirection(vectorFromCenter);
+      const offset = objectCenter.sub(this.explodeCenter);
+      const distN = offset.length() / radius;
+      const weight = 0.14 + 0.86 * Math.pow(THREE.MathUtils.clamp(distN, 0, 2.5) / 2.5, 0.38);
+      let directionWorld;
+      if (this.explodeMode === "radial") {
+        const radial = this.getExplodeWorldDirection(offset);
+        this.explodeStableUnitDirection(obj.uuid, this.explodeScratchUniform);
+        const mix = Math.pow(1 - Math.min(distN / 1.08, 1), 1.15);
+        directionWorld = this.explodeScratchMix.copy(radial).multiplyScalar(1 - mix).addScaledVector(this.explodeScratchUniform, mix).normalize();
+      } else {
+        directionWorld = this.getExplodeWorldDirection(offset);
+      }
       const directionLocal = this.toLocalDirection(directionWorld, obj.parent?.matrixWorld || new THREE.Matrix4());
       this.explodeObjectStates.set(obj.uuid, {
         object: obj,
@@ -2853,9 +3129,18 @@ class SceneManager {
         instanceBox.copy(geometry.boundingBox).applyMatrix4(worldMatrix);
         if (instanceBox.isEmpty()) return;
         objectCenter.copy(instanceBox.getCenter(new THREE.Vector3()));
-        const vectorFromCenter = objectCenter.sub(this.explodeCenter);
-        const weight = THREE.MathUtils.clamp(vectorFromCenter.length() / radius, 0.18, 1.25);
-        const directionWorld = this.getExplodeWorldDirection(vectorFromCenter);
+        const offset = objectCenter.sub(this.explodeCenter);
+        const distN = offset.length() / radius;
+        const weight = 0.14 + 0.86 * Math.pow(THREE.MathUtils.clamp(distN, 0, 2.5) / 2.5, 0.38);
+        let directionWorld;
+        if (this.explodeMode === "radial") {
+          const radial = this.getExplodeWorldDirection(offset);
+          this.explodeStableUnitDirection(key, this.explodeScratchUniform);
+          const mix = Math.pow(1 - Math.min(distN / 1.08, 1), 1.15);
+          directionWorld = this.explodeScratchMix.copy(radial).multiplyScalar(1 - mix).addScaledVector(this.explodeScratchUniform, mix).normalize();
+        } else {
+          directionWorld = this.getExplodeWorldDirection(offset);
+        }
         this.explodeInstanceStates.set(key, {
           mesh: mapping.mesh,
           instanceId: mapping.instanceId,
@@ -2869,7 +3154,7 @@ class SceneManager {
   applyExplodeState() {
     const bounds = this.computeTotalBounds(true, true);
     const size = bounds.isEmpty() ? new THREE.Vector3(100, 100, 100) : bounds.getSize(new THREE.Vector3());
-    const magnitude = Math.max(size.length() * 0.08 * (this.explodeStrength / 100), 0);
+    const magnitude = Math.max(size.length() * 0.125 * (this.explodeStrength / 100), 0);
     this.explodeObjectStates.forEach((state) => {
       state.object.position.copy(state.basePosition).addScaledVector(state.directionLocal, magnitude * state.weight);
       state.object.updateMatrixWorld();
@@ -2877,16 +3162,18 @@ class SceneManager {
     const translation = new THREE.Vector3();
     const quaternion = new THREE.Quaternion();
     const scale = new THREE.Vector3();
+    const matrixWork = new THREE.Matrix4();
     this.explodeInstanceStates.forEach((state) => {
-      const matrix = state.baseMatrix.clone();
-      matrix.decompose(translation, quaternion, scale);
+      matrixWork.copy(state.baseMatrix);
+      matrixWork.decompose(translation, quaternion, scale);
       translation.addScaledVector(state.directionLocal, magnitude * state.weight);
-      matrix.compose(translation, quaternion, scale);
-      state.mesh.setMatrixAt(state.instanceId, matrix);
+      matrixWork.compose(translation, quaternion, scale);
+      state.mesh.setMatrixAt(state.instanceId, matrixWork);
       if (state.mesh.instanceMatrix) state.mesh.instanceMatrix.needsUpdate = true;
     });
     this.interactableListValid = false;
     this.updateSceneBounds();
+    this.requestRender();
   }
   restoreExplodeSnapshot() {
     this.explodeObjectStates.forEach((state) => {
@@ -2899,6 +3186,7 @@ class SceneManager {
     });
     this.interactableListValid = false;
     this.updateSceneBounds();
+    this.requestRender();
   }
   refreshExplodeState() {
     if (!this.explodeEnabled) return;
@@ -2945,7 +3233,7 @@ class SceneManager {
   clearLocateFocus() {
     this.locateObjectMaterialCache.forEach((material, uuid) => {
       const obj = this.contentGroup.getObjectByProperty("uuid", uuid);
-      if (!obj || !obj.isMesh) return;
+      if (!obj || !obj.isMesh && !obj.isBatchedMesh) return;
       obj.material = material;
     });
     this.locateObjectMaterialCache.clear();
@@ -2966,6 +3254,26 @@ class SceneManager {
     }
     return true;
   }
+  expandLocateTargets(ids) {
+    const expanded = /* @__PURE__ */ new Set();
+    const queue = [...ids];
+    const visited = /* @__PURE__ */ new Set();
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (!current || visited.has(current)) continue;
+      visited.add(current);
+      expanded.add(current);
+      const nodes = this.nodeMap.get(current);
+      if (!nodes || nodes.length === 0) continue;
+      for (const node of nodes) {
+        if (!node.children || node.children.length === 0) continue;
+        for (const child of node.children) {
+          if (!visited.has(child.id)) queue.push(child.id);
+        }
+      }
+    }
+    return expanded;
+  }
   updateLocateFocusHighlight(uuid) {
     this.locateFocusUuid = uuid;
     this.highlightObject(uuid);
@@ -2976,16 +3284,20 @@ class SceneManager {
       this.clearLocateFocus();
       return;
     }
-    if (this.hasSameLocateResultSet(normalized)) {
-      const nextFocus = focusUuid && this.locateResultSet.has(focusUuid) ? focusUuid : normalized[0];
+    const selectedSet = new Set(normalized);
+    const expandedTargets = this.expandLocateTargets(normalized);
+    const expandedList = Array.from(expandedTargets);
+    if (this.hasSameLocateResultSet(expandedList)) {
+      const nextFocus = focusUuid && this.locateResultSet.has(focusUuid) ? focusUuid : expandedList[0];
       this.updateLocateFocusHighlight(nextFocus);
       return;
     }
     this.clearLocateFocus();
-    const resultSet = new Set(normalized);
+    const resultSet = expandedTargets;
     this.locateResultSet = resultSet;
-    this.locateFocusUuid = focusUuid && resultSet.has(focusUuid) ? focusUuid : normalized[0];
-    const dimmedColor = new THREE.Color("#d6d9df");
+    this.locateFocusUuid = focusUuid && resultSet.has(focusUuid) ? focusUuid : expandedList[0];
+    const focusKey = this.locateFocusUuid;
+    const dimmedColor = new THREE.Color("#b7bec9");
     const accentColor = new THREE.Color(this.settings.highlightColor || "#ff9f1c");
     this.contentGroup.traverse((child) => {
       const mesh = child;
@@ -2995,6 +3307,7 @@ class SceneManager {
       }
       const sourceMaterials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
       const isMatched = resultSet.has(child.uuid);
+      const isFocus = isMatched && focusKey !== null && child.uuid === focusKey;
       const nextMaterials = sourceMaterials.map((material) => {
         if (!material) return material;
         const cloned = material.clone();
@@ -3004,26 +3317,85 @@ class SceneManager {
         if ("color" in cloned && cloned.color) {
           const baseColor = cloned.color.clone();
           if (isMatched) {
-            cloned.color.copy(baseColor.lerp(accentColor, 0.82));
+            const tint = isFocus ? 0.93 : 0.76;
+            cloned.color.copy(baseColor.lerp(accentColor, tint));
           } else {
             cloned.transparent = true;
-            cloned.opacity = 0.14;
+            cloned.opacity = 0.18;
             cloned.depthWrite = false;
-            cloned.color.copy(baseColor.lerp(dimmedColor, 0.72));
+            cloned.color.copy(baseColor.lerp(dimmedColor, 0.84));
           }
         }
         if ("emissive" in cloned && cloned.emissive) {
-          cloned.emissive.copy(isMatched ? accentColor.clone().multiplyScalar(0.16) : new THREE.Color(0));
+          if (isMatched) {
+            cloned.emissive.copy(accentColor.clone().multiplyScalar(isFocus ? 0.4 : 0.12));
+          } else {
+            cloned.emissive.set(0);
+          }
         }
-        if ("roughness" in cloned && !isMatched) cloned.roughness = Math.max(0.88, cloned.roughness ?? 0.88);
+        if ("roughness" in cloned && !isMatched) cloned.roughness = Math.max(0.9, cloned.roughness ?? 0.9);
         if ("metalness" in cloned && !isMatched) cloned.metalness = Math.min(0.02, cloned.metalness ?? 0.02);
         cloned.needsUpdate = true;
         return cloned;
       });
       mesh.material = Array.isArray(mesh.material) ? nextMaterials : nextMaterials[0];
     });
+    this.contentGroup.traverse((child) => {
+      const batched = child;
+      if (!batched.isBatchedMesh || !batched.material) return;
+      if (!this.locateObjectMaterialCache.has(child.uuid)) {
+        this.locateObjectMaterialCache.set(child.uuid, batched.material);
+      }
+      const owner = batched.userData?.originalUuid ? String(batched.userData.originalUuid) : "";
+      const batchIdToUuid = batched.userData?.batchIdToUuid;
+      let hasMatchedInstance = false;
+      let hasFocusInstance = false;
+      if (batchIdToUuid && batchIdToUuid.size > 0) {
+        for (const instanceUuid of batchIdToUuid.values()) {
+          if (!hasMatchedInstance && resultSet.has(instanceUuid)) hasMatchedInstance = true;
+          if (!hasFocusInstance && focusKey !== null && instanceUuid === focusKey) hasFocusInstance = true;
+          if (hasMatchedInstance && hasFocusInstance) break;
+        }
+      }
+      const ownerExplicitSelected = owner ? selectedSet.has(owner) : false;
+      const isMatched = resultSet.has(child.uuid) || hasMatchedInstance || ownerExplicitSelected;
+      const isFocus = this.locateFocusUuid !== null && this.locateFocusUuid === child.uuid || hasFocusInstance || ownerExplicitSelected && this.locateFocusUuid !== null && this.locateFocusUuid === owner;
+      const sourceMaterials = Array.isArray(batched.material) ? batched.material : [batched.material];
+      const nextMaterials = sourceMaterials.map((material) => {
+        if (!material) return material;
+        const cloned = material.clone();
+        if ("transparent" in cloned) cloned.transparent = false;
+        if ("opacity" in cloned) cloned.opacity = 1;
+        if ("depthWrite" in cloned) cloned.depthWrite = true;
+        if ("color" in cloned && cloned.color) {
+          const baseColor = cloned.color.clone();
+          if (isMatched) {
+            const tint = isFocus ? 0.92 : 0.7;
+            cloned.color.copy(baseColor.lerp(accentColor, tint));
+          } else {
+            cloned.transparent = true;
+            cloned.opacity = 0.16;
+            cloned.depthWrite = false;
+            cloned.color.copy(baseColor.lerp(dimmedColor, 0.86));
+          }
+        }
+        if ("emissive" in cloned && cloned.emissive) {
+          if (isMatched) {
+            cloned.emissive.copy(accentColor.clone().multiplyScalar(isFocus ? 0.36 : 0.12));
+          } else {
+            cloned.emissive.set(0);
+          }
+        }
+        if ("roughness" in cloned && !isMatched) cloned.roughness = Math.max(0.9, cloned.roughness ?? 0.9);
+        if ("metalness" in cloned && !isMatched) cloned.metalness = Math.min(0.02, cloned.metalness ?? 0.02);
+        cloned.needsUpdate = true;
+        return cloned;
+      });
+      batched.material = Array.isArray(batched.material) ? nextMaterials : nextMaterials[0];
+    });
     this.optimizedMapping.forEach((mappings, originalUuid) => {
       const isMatched = resultSet.has(originalUuid);
+      const isFocus = isMatched && focusKey !== null && originalUuid === focusKey;
       mappings.forEach((mapping) => {
         const key = `${mapping.mesh.uuid}:${mapping.instanceId}`;
         this.locateDimmedInstances.set(key, {
@@ -3032,14 +3404,14 @@ class SceneManager {
           originalColor: mapping.originalColor
         });
         const sourceColor = new THREE.Color(mapping.originalColor);
-        mapping.mesh.setColorAt(
-          mapping.instanceId,
-          isMatched ? sourceColor.lerp(accentColor, 0.82) : sourceColor.lerp(dimmedColor, 0.82)
-        );
+        const tint = isFocus ? 0.93 : isMatched ? 0.76 : 0.82;
+        const target = isMatched ? accentColor : dimmedColor;
+        mapping.mesh.setColorAt(mapping.instanceId, sourceColor.lerp(target, tint));
         if (mapping.mesh.instanceColor) mapping.mesh.instanceColor.needsUpdate = true;
       });
     });
     this.updateLocateFocusHighlight(this.locateFocusUuid);
+    this.requestRender();
   }
   setLocateFocus(uuid) {
     if (!uuid) {
@@ -3065,24 +3437,31 @@ class SceneManager {
       const mappings = this.optimizedMapping.get(id);
       if (mappings) {
         mappings.forEach((m) => {
-          m.mesh.setColorAt(m.instanceId, new THREE.Color(16755200));
+          const highlightColor = new THREE.Color(this.settings.highlightColor || "#ff9f1c");
+          m.mesh.setColorAt(m.instanceId, highlightColor);
           if (m.mesh.instanceColor) {
             m.mesh.instanceColor.needsUpdate = true;
           }
         });
       }
     };
-    for (const prev of this.highlightedUuids) {
-      if (!target.has(prev)) restoreOne(prev);
-    }
-    for (const next of target) {
-      if (!this.highlightedUuids.has(next)) applyOne(next);
+    const preserveLocateTint = this.locateResultSet.size > 0;
+    if (!preserveLocateTint) {
+      for (const prev of this.highlightedUuids) {
+        if (!target.has(prev)) restoreOne(prev);
+      }
+      for (const next of target) {
+        if (!this.highlightedUuids.has(next)) applyOne(next);
+      }
     }
     this.highlightedUuids = target;
     this.selectionBox.visible = false;
     this.highlightMesh.visible = false;
     this.lastSelectedUuid = uuids.length > 0 ? uuids[uuids.length - 1] : null;
-    if (target.size === 0) return;
+    if (target.size === 0) {
+      this.requestRender();
+      return;
+    }
     const union = new THREE.Box3();
     const tmpBox = new THREE.Box3();
     const tmpMat = new THREE.Matrix4();
@@ -3113,17 +3492,29 @@ class SceneManager {
     for (const id of target) addObjectBounds(id);
     if (!union.isEmpty()) {
       this.selectionBox.box.copy(union);
-      this.selectionBox.visible = !!this.settings.highlightShowBox;
+      const locatingFocus = !!(this.locateFocusUuid && target.has(this.locateFocusUuid));
+      if (locatingFocus) {
+        const pad = Math.max(union.getSize(new THREE.Vector3()).length() * 0.048, 0.22);
+        this.selectionBox.box.expandByScalar(pad);
+      }
+      this.selectionBox.visible = locatingFocus || !!this.settings.highlightShowBox;
     }
     const focusId = this.lastSelectedUuid;
-    if (!focusId) return;
+    if (!focusId) {
+      this.requestRender();
+      return;
+    }
     const focusMappings = this.optimizedMapping.get(focusId);
     if (focusMappings && focusMappings.length > 0) {
       this.highlightMesh.visible = false;
+      this.requestRender();
       return;
     }
     const focusObj = this.contentGroup.getObjectByProperty("uuid", focusId);
-    if (!focusObj) return;
+    if (!focusObj) {
+      this.requestRender();
+      return;
+    }
     if (focusObj.isMesh) {
       focusObj.updateMatrixWorld(true);
       this.highlightMesh.geometry = focusObj.geometry;
@@ -3137,6 +3528,7 @@ class SceneManager {
       this.highlightMesh.scale.copy(worldScale);
       this.highlightMesh.visible = true;
     }
+    this.requestRender();
   }
   pick(clientX, clientY) {
     const intersect = this.getRayIntersects(clientX, clientY);
@@ -3229,21 +3621,7 @@ class SceneManager {
     this.contentGroup.updateMatrixWorld(true);
     this.contentGroup.traverse((obj) => {
       if (onlyVisible && !obj.visible) return;
-      if (obj.name === "3D Tileset" && this.tilesRenderer) {
-        const tilesBox = new THREE.Box3();
-        if (this.tilesRenderer.getBounds) {
-          this.tilesRenderer.getBounds(tilesBox);
-          if (!tilesBox.isEmpty() && this.globalOffset.length() > 0) {
-            if (Math.abs(tilesBox.min.x) > 1e5 || Math.abs(tilesBox.min.y) > 1e5) {
-              tilesBox.translate(this.globalOffset.clone().negate());
-            }
-          }
-          if (!tilesBox.isEmpty()) totalBox.union(tilesBox);
-        }
-        obj.traverse((child) => {
-          if (child !== obj) child._skipTraverse = true;
-        });
-      } else if (obj.isMesh && !obj._skipTraverse) {
+      if (obj.isMesh && !obj._skipTraverse) {
         const mesh = obj;
         if (mesh.geometry) {
           const box = new THREE.Box3().setFromObject(mesh);
@@ -3300,18 +3678,63 @@ class SceneManager {
     this.sceneBounds = box.clone();
     this.fitBox(box, !keepOrientation);
   }
-  fitViewToObject(uuid) {
-    const obj = this.contentGroup.getObjectByProperty("uuid", uuid);
-    if (!obj) return;
+  unionObjectBounds(obj, targetBox) {
     const box = new THREE.Box3();
-    if (obj.userData.boundingBox) {
+    if (obj.userData?.boundingBox) {
       box.copy(obj.userData.boundingBox).applyMatrix4(obj.matrixWorld);
     } else {
       box.setFromObject(obj);
     }
-    if (!box.isEmpty()) this.fitBox(box, false);
+    if (!box.isEmpty()) targetBox.union(box);
   }
-  fitBox(box, updateCameraPosition = true) {
+  unionTilesNodeBounds(node, targetBox) {
+    const encodedBox = node?.userData?.tilesBoundingVolumeBox;
+    if (!Array.isArray(encodedBox) || encodedBox.length < 12) return;
+    const center = new THREE.Vector3(encodedBox[0], encodedBox[1], encodedBox[2]);
+    const axisX = new THREE.Vector3(encodedBox[3], encodedBox[4], encodedBox[5]);
+    const axisY = new THREE.Vector3(encodedBox[6], encodedBox[7], encodedBox[8]);
+    const axisZ = new THREE.Vector3(encodedBox[9], encodedBox[10], encodedBox[11]);
+    const extent = new THREE.Vector3(axisX.length(), axisY.length(), axisZ.length());
+    const box = new THREE.Box3(center.clone().sub(extent), center.clone().add(extent));
+    if (!box.isEmpty()) targetBox.union(box);
+  }
+  unionOptimizedBounds(uuid, targetBox) {
+    const mappings = this.optimizedMapping.get(uuid);
+    if (!mappings || mappings.length === 0) return;
+    const instanceMatrix = new THREE.Matrix4();
+    for (const mapping of mappings) {
+      const geometry = mapping.geometry || mapping.mesh.geometry;
+      if (!geometry.boundingBox) geometry.computeBoundingBox();
+      if (!geometry.boundingBox) continue;
+      mapping.mesh.getMatrixAt(mapping.instanceId, instanceMatrix);
+      instanceMatrix.premultiply(mapping.mesh.matrixWorld);
+      const box = geometry.boundingBox.clone().applyMatrix4(instanceMatrix);
+      if (!box.isEmpty()) targetBox.union(box);
+    }
+  }
+  unionNodeBounds(uuid, targetBox, visited = /* @__PURE__ */ new Set()) {
+    if (!uuid || visited.has(uuid)) return;
+    visited.add(uuid);
+    const obj = this.contentGroup.getObjectByProperty("uuid", uuid);
+    if (obj) {
+      this.unionObjectBounds(obj, targetBox);
+    }
+    this.unionOptimizedBounds(uuid, targetBox);
+    const nodes = this.nodeMap.get(uuid) || [];
+    for (const node of nodes) {
+      this.unionTilesNodeBounds(node, targetBox);
+      const children = Array.isArray(node.children) ? node.children : [];
+      for (const child of children) {
+        this.unionNodeBounds(child.id, targetBox, visited);
+      }
+    }
+  }
+  fitViewToObject(uuid) {
+    const box = new THREE.Box3();
+    this.unionNodeBounds(uuid, box);
+    if (!box.isEmpty()) this.fitBox(box, false, 1.14);
+  }
+  fitBox(box, updateCameraPosition = true, paddingOverride) {
     if (box.isEmpty()) {
       this.camera.zoom = 1;
       this.camera.position.set(1e3, 1e3, 1e3);
@@ -3325,7 +3748,7 @@ class SceneManager {
     const size = box.getSize(new THREE.Vector3());
     const maxDim = Math.max(size.x, size.y, size.z);
     const extent = maxDim > 0 ? maxDim : 100;
-    const padding = 1.02;
+    const padding = paddingOverride ?? 1.02;
     const w = this.canvas.clientWidth;
     const h = this.canvas.clientHeight;
     const aspect = w / h;
@@ -3368,6 +3791,7 @@ class SceneManager {
         this.camera.bottom = this.camera.bottom + (targetBottom - this.camera.bottom) * eased;
         this.camera.updateProjectionMatrix();
         this.controls.update();
+        this.renderer.render(this.scene, this.camera);
         if (progress < 1) {
           requestAnimationFrame(animate);
         }
@@ -3422,6 +3846,7 @@ class SceneManager {
         this.camera.zoom = startZoom + (targetZoom2 - startZoom) * eased;
         this.camera.updateProjectionMatrix();
         this.controls.update();
+        this.renderer.render(this.scene, this.camera);
         if (progress < 1) {
           requestAnimationFrame(animate);
         }
@@ -3553,6 +3978,7 @@ class SceneManager {
     if (state.bottom !== void 0) this.camera.bottom = state.bottom;
     this.camera.updateProjectionMatrix();
     this.controls.update();
+    this.requestRender();
   }
   // --- 测量定位逻辑 ---
   locateMeasurement(id) {
@@ -3579,6 +4005,7 @@ class SceneManager {
     this.camera.zoom = Math.min(targetZoom, 100);
     this.camera.updateProjectionMatrix();
     this.controls.update();
+    this.requestRender();
   }
   // --- 测量逻辑 ---
   startMeasurement(type) {
@@ -3602,6 +4029,7 @@ class SceneManager {
       return this.finalizeMeasurement();
     }
     this.updateMeasurePreview();
+    this.requestRender();
     return null;
   }
   updateMeasurePreview(hoverPoint) {
@@ -3647,6 +4075,7 @@ class SceneManager {
       this.tempMarker.visible = false;
       if (this.previewLine) this.previewLine.visible = false;
     }
+    this.requestRender();
   }
   finalizeMeasurement() {
     const id = `measure_${Date.now()}`;
@@ -3701,6 +4130,7 @@ class SceneManager {
     if (this.onMeasureUpdate) {
       this.onMeasureUpdate(Array.from(this.measureRecords.values()));
     }
+    this.requestRender();
     return { id, type: typeStr, val: valStr };
   }
   createLabel(text, position) {
@@ -4102,6 +4532,7 @@ class SceneManager {
     if (this.onMeasureUpdate) {
       this.onMeasureUpdate([]);
     }
+    this.requestRender();
   }
   clearMeasurementPreview() {
     this.currentMeasurePoints = [];
@@ -4195,6 +4626,7 @@ class SceneManager {
     if (!enabled) {
       this.clipPlaneHelpers.forEach((h) => h.visible = false);
     }
+    this.requestRender();
   }
   updateClippingPlanes(bounds, values, active) {
     if (bounds.isEmpty()) return;
@@ -4243,6 +4675,7 @@ class SceneManager {
       this.clipPlaneHelpers[4].visible = false;
       this.clipPlaneHelpers[5].visible = false;
     }
+    this.requestRender();
   }
   updatePlaneHelper(idx, normal, dist, center, size, isEnabled) {
     const helper = this.clipPlaneHelpers[idx];
@@ -4277,37 +4710,14 @@ class SceneManager {
     return false;
   }
   getStats() {
-    let textureMemory = 0;
-    const textures = /* @__PURE__ */ new Set();
-    this.contentGroup.traverse((obj) => {
-      if (obj.name === "__EdgesHelper") return;
-      if (obj.isMesh || obj.isBatchedMesh) {
-        const mesh = obj;
-        const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-        materials.forEach((material) => {
-          if (!material) return;
-          Object.values(material).forEach((value) => {
-            if (value instanceof THREE.Texture && !textures.has(value)) {
-              textures.add(value);
-              const image = value.image;
-              const width = image?.width || 0;
-              const height = image?.height || 0;
-              if (width > 0 && height > 0) {
-                textureMemory += width * height * 4 / (1024 * 1024);
-              }
-            }
-          });
-        });
-      }
-    });
     const drawCalls = this.renderer.info.render.calls;
+    const textureMemory = estimateTextureMemoryMb(this.contentGroup);
     return {
       meshes: this.originalStats.meshes,
       faces: this.originalStats.faces,
       memory: parseFloat(this.originalStats.memory.toFixed(2)),
-      textureMemory: parseFloat(textureMemory.toFixed(2)),
+      textureMemory,
       drawCalls,
-      fps: Math.round(this.fps),
       chunksLoaded: this.chunkLoadedCount,
       chunksTotal: this.chunks.length,
       chunksQueued: this.processingChunks.size,
@@ -4317,6 +4727,7 @@ class SceneManager {
   dispose() {
     this.disposed = true;
     this.cancelDeferredStructureBuild();
+    this.animateFramePending = false;
     if (this.animationFrameId !== null) {
       cancelAnimationFrame(this.animationFrameId);
       this.animationFrameId = null;
@@ -4337,10 +4748,20 @@ class SceneManager {
     this.activeWorkerCount = 0;
     this.processingChunks.clear();
     this.cancelledChunkIds.clear();
+    this.prefetchQueue = [];
+    this.prefetchInFlight.clear();
+    this.chunkReadCache.clear();
+    this.chunkReadCacheOrder = [];
     this.highlightedUuids.clear();
     this.locateResultSet.clear();
     this.fastPreviewModels.clear();
     this.clearChunkCache();
+    while (this.ghostGroup.children.length > 0) {
+      const ghost = this.ghostGroup.children[0];
+      this.ghostGroup.remove(ghost);
+      this.releaseGhostLine(ghost);
+    }
+    this.ghostMeshPool.length = 0;
     this.controls.dispose();
     if (this.selectionBox.geometry) this.selectionBox.geometry.dispose();
     const selectionMat = this.selectionBox.material;
@@ -4353,8 +4774,9 @@ class SceneManager {
     (Array.isArray(tempMarkerMat) ? tempMarkerMat : [tempMarkerMat]).forEach((m) => m?.dispose?.());
     this.dotTexture.dispose();
     this.sharedMaterial.dispose();
+    this.ghostEdgesGeometry.dispose();
+    this.ghostMaterial.dispose();
     this.renderer.dispose();
-    if (this.tilesRenderer) this.tilesRenderer.dispose();
   }
 }
 function stripFileExtension(name) {
@@ -4365,399 +4787,43 @@ function sanitizeFileStem(name) {
   return sanitized || "model";
 }
 
-function normalizePath(path) {
-  return path.replace(/\\/g, "/").replace(/^(\.\/)+/, "").replace(/^\/+/, "").toLowerCase();
-}
-function candidateKeys(input) {
-  const normalized = normalizePath(input);
-  const parts = normalized.split("/");
-  const fileName = parts[parts.length - 1];
-  return Array.from(/* @__PURE__ */ new Set([
-    normalized,
-    fileName,
-    `./${normalized}`,
-    `./${fileName}`
-  ]));
-}
-function createResourceResolver(files) {
-  const localFiles = files.filter((item) => item instanceof File);
-  if (localFiles.length === 0) return null;
-  const blobUrlMap = /* @__PURE__ */ new Map();
-  const register = (key, file) => {
-    if (!key || blobUrlMap.has(key)) return;
-    blobUrlMap.set(key, URL.createObjectURL(file));
-  };
-  localFiles.forEach((file) => {
-    register(normalizePath(file.name), file);
-    const relativePath = file.webkitRelativePath;
-    if (relativePath) {
-      const trimmed = relativePath.split("/").slice(1).join("/");
-      register(normalizePath(trimmed), file);
-    }
-  });
-  return {
-    resolve: (url) => {
-      if (!url || /^(blob:|data:|https?:)/i.test(url)) return url;
-      for (const key of candidateKeys(url)) {
-        const resolved = blobUrlMap.get(key);
-        if (resolved) return resolved;
-      }
-      return url;
-    },
-    has: (url) => candidateKeys(url).some((key) => blobUrlMap.has(key)),
-    dispose: () => {
-      blobUrlMap.forEach((blobUrl) => URL.revokeObjectURL(blobUrl));
-      blobUrlMap.clear();
-    }
-  };
-}
-
-const STAGE_LABELS = {
-  fetch: "reading",
-  parse: "analyzing",
-  normalize: "processing",
-  optimize: "processing",
-  addToScene: "processing"
-};
-const STAGE_WEIGHTS = {
-  fetch: [0, 20],
-  parse: [20, 58],
-  normalize: [58, 72],
-  optimize: [72, 92],
-  addToScene: [92, 100]
-};
-const libPathCache = /* @__PURE__ */ new Map();
-function normalizeLibPath(libPath) {
-  if (!libPathCache.has(libPath)) {
-    libPathCache.set(libPath, libPath.replace(/\/$/, ""));
-  }
-  return libPathCache.get(libPath);
-}
-function createLoadingManager(files, _libPath, _settings) {
-  const resourceResolver = createResourceResolver(files);
-  const manager = new THREE.LoadingManager();
-  if (resourceResolver) {
-    manager.setURLModifier((url) => resourceResolver.resolve(url));
-  }
-  const cleanup = () => {
-    resourceResolver?.dispose();
-  };
-  return { manager, cleanup, resourceResolver };
-}
-async function createGltfLoaderRuntime(manager, libPath) {
-  const [
-    { GLTFLoader },
-    { DRACOLoader },
-    { KTX2Loader },
-    { MeshoptDecoder }
-  ] = await Promise.all([
-    import('./loaders-TXHpcosE.js').then(n => n.a),
-    import('./loaders-TXHpcosE.js').then(n => n.D),
-    import('./loaders-TXHpcosE.js').then(n => n.K),
-    import('./meshopt_decoder.module-C_9D6xwu.js')
-  ]);
-  const normalizedLibPath = normalizeLibPath(libPath);
-  const supportsCompressedTextures = typeof window !== "undefined" && !!window.createImageBitmap;
-  let probeRenderer = null;
-  const dracoLoader = new DRACOLoader(manager);
-  dracoLoader.setDecoderPath(`${normalizedLibPath}/draco/gltf/`);
-  const ktx2Loader = new KTX2Loader(manager);
-  ktx2Loader.setTranscoderPath(`${normalizedLibPath}/basis/`);
-  if (typeof document !== "undefined") {
-    try {
-      probeRenderer = new THREE.WebGLRenderer({ canvas: document.createElement("canvas") });
-      ktx2Loader.detectSupport(probeRenderer);
-    } catch (error) {
-      console.warn("[LoaderUtils] KTX2 detectSupport failed", error);
-    }
-  }
-  const loader = new GLTFLoader(manager);
-  loader.setDRACOLoader(dracoLoader);
-  loader.setMeshoptDecoder(MeshoptDecoder);
-  if (supportsCompressedTextures) {
-    loader.setKTX2Loader(ktx2Loader);
-  }
-  return {
-    loader,
-    cleanup: () => {
-      dracoLoader.dispose();
-      ktx2Loader.dispose();
-      probeRenderer?.dispose();
-    }
-  };
-}
-function createStageProgressReporter(onProgress, t, fileName, fileBaseProgress, fileWeight) {
-  return (stage, progress, msg) => {
-    const [start, end] = STAGE_WEIGHTS[stage];
-    const safeP = Math.min(100, Math.max(0, Number.isFinite(progress) ? progress : 0));
-    const stagePercent = start + safeP / 100 * (end - start);
-    const totalPercent = fileBaseProgress + stagePercent / 100 * fileWeight;
-    const label = msg || `${t(STAGE_LABELS[stage])} ${fileName}`;
-    onProgress(Math.round(totalPercent), label);
-  };
-}
-async function loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t, settings, libPath) {
-  const loaderContext = createLoadingManager(files);
-  const { manager, cleanup, resourceResolver } = loaderContext;
-  try {
-    if (ext === "lmb") {
-      const { LMBLoader } = await import('./lmbLoader-DKeiizRf.js');
-      const loader = new LMBLoader();
-      reportStage("parse", 0);
-      return await loader.loadAsync(url, (p) => reportStage("parse", p * 100));
-    }
-    if (ext === "glb" || ext === "gltf") {
-      const { loader, cleanup: cleanupGltf } = await createGltfLoaderRuntime(manager, libPath);
-      reportStage("parse", 0);
-      try {
-        const gltf = await new Promise((resolve, reject) => {
-          loader.load(
-            url,
-            resolve,
-            (e) => {
-              if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
-              else reportStage("parse", 50);
-            },
-            reject
-          );
-        });
-        return gltf.scene;
-      } finally {
-        cleanupGltf();
-      }
-    }
-    if (ext === "fbx") {
-      const { FBXLoader } = await import('./loaders-TXHpcosE.js').then(n => n.F);
-      const loader = new FBXLoader(manager);
-      reportStage("parse", 0);
-      return await new Promise((resolve, reject) => {
-        loader.load(
-          url,
-          resolve,
-          (e) => {
-            if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
-            else reportStage("parse", 50);
-          },
-          reject
-        );
-      });
-    }
-    if (ext === "ifc") {
-      const { loadIFC } = await import('./IFCLoader-ChC57y1X.js');
-      reportStage("parse", 0);
-      return await loadIFC(typeof fileOrUrl === "string" ? url : fileOrUrl, (p, msg) => reportStage("parse", p, msg), t, libPath, settings);
-    }
-    if (ext === "obj") {
-      const [{ OBJLoader }, { MTLLoader }] = await Promise.all([
-        import('./loaders-TXHpcosE.js').then(n => n.b),
-        import('./loaders-TXHpcosE.js').then(n => n.M)
-      ]);
-      const objLoader = new OBJLoader(manager);
-      const mtlName = url.replace(/\.[^.]+$/i, ".mtl");
-      if (resourceResolver?.has(mtlName)) {
-        try {
-          const materials = await new Promise((resolve, reject) => {
-            const mtlLoader = new MTLLoader(manager);
-            mtlLoader.load(mtlName, resolve, void 0, reject);
-          });
-          materials.preload();
-          objLoader.setMaterials(materials);
-        } catch (error) {
-          console.warn("[LoaderUtils] Failed to load companion MTL", error);
-        }
-      }
-      reportStage("parse", 0);
-      return await objLoader.loadAsync(url, (e) => {
-        if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
-        else reportStage("parse", 50);
-      });
-    }
-    if (ext === "stl") {
-      const { STLLoader } = await import('./loaders-TXHpcosE.js').then(n => n.S);
-      const loader = new STLLoader(manager);
-      reportStage("parse", 0);
-      const geometry = await loader.loadAsync(url, (e) => {
-        if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
-      });
-      return new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color: 8947848 }));
-    }
-    if (ext === "ply") {
-      const { PLYLoader } = await import('./loaders-TXHpcosE.js').then(n => n.P);
-      const loader = new PLYLoader(manager);
-      reportStage("parse", 0);
-      const geometry = await loader.loadAsync(url, (e) => {
-        if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
-      });
-      return new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({
-        color: 8947848,
-        vertexColors: geometry.hasAttribute("color")
-      }));
-    }
-    if (ext === "3mf") {
-      const { ThreeMFLoader } = await import('./loaders-TXHpcosE.js').then(n => n._);
-      const loader = new ThreeMFLoader(manager);
-      reportStage("parse", 0);
-      return await loader.loadAsync(url, (e) => {
-        if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
-      });
-    }
-    if (ext === "stp" || ext === "step" || ext === "igs" || ext === "iges") {
-      reportStage("fetch", 0);
-      const buffer = typeof fileOrUrl === "string" ? await fetch(url).then((r) => r.arrayBuffer()) : await fileOrUrl.arrayBuffer();
-      const wasmUrl = `${libPath}/occt-import-js/occt-import-js.wasm`;
-      const { OCCTLoader } = await import('./OCCTLoader-CiM09x_z.js');
-      const loader = new OCCTLoader(wasmUrl);
-      reportStage("parse", 0);
-      return await loader.load(buffer, t, (p, msg) => reportStage("parse", p, msg));
-    }
-    return null;
-  } finally {
-    cleanup();
-  }
-}
-function normalizeLoadedObject(object, settings) {
-  object.traverse((child) => {
-    if (child.isMesh) {
-      const mesh = child;
-      mesh.frustumCulled = settings.frustumCulling ?? true;
-      if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
-      if (!mesh.geometry.boundingSphere) mesh.geometry.computeBoundingSphere();
-      const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-      materials.forEach((material) => {
-        if (!material) return;
-        if ("wireframe" in material) {
-          material.wireframe = false;
-        }
-      });
-    }
-  });
-}
-const loadModelFiles = async (files, onProgress, t, settings, libPath = "./libs") => {
-  const loadedObjects = [];
-  const totalFiles = files.length;
-  for (let i = 0; i < totalFiles; i++) {
-    const fileOrUrl = files[i];
-    const isUrl = typeof fileOrUrl === "string";
-    let fileName = "";
-    let ext = "";
-    let url = "";
-    if (isUrl) {
-      url = fileOrUrl;
-      const urlPath = url.split("?")[0].split("#")[0];
-      fileName = urlPath.split("/").pop() || "model";
-      ext = fileName.split(".").pop()?.toLowerCase() || "";
-    } else {
-      fileName = fileOrUrl.name;
-      ext = fileName.split(".").pop()?.toLowerCase() || "";
-      url = URL.createObjectURL(fileOrUrl);
-    }
-    const fileBaseProgress = i / totalFiles * 100;
-    const fileWeight = 100 / totalFiles;
-    const reportStage = createStageProgressReporter(onProgress, t, fileName, fileBaseProgress, fileWeight);
-    try {
-      reportStage("fetch", 5);
-      const object = await loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t, settings, libPath);
-      if (!object) continue;
-      object.name = fileName;
-      reportStage("normalize", 30, `${t("processing")} ${fileName}`);
-      normalizeLoadedObject(object, settings);
-      reportStage("optimize", 100, `${t("analyzing")} ${fileName}`);
-      reportStage("addToScene", 100, `${t("success")} ${fileName}`);
-      loadedObjects.push(object);
-    } catch (error) {
-      console.error(`加载 ${fileName} 失败`, error);
-    } finally {
-      if (!isUrl) URL.revokeObjectURL(url);
-    }
-  }
-  onProgress(100, t("analyzing"));
-  return loadedObjects;
-};
-const parseTilesetFromFolder = async (files, onProgress, t) => {
-  onProgress(10, t("analyzing"));
-  const fileMap = /* @__PURE__ */ new Map();
-  let tilesetKey = "";
-  for (let i = 0; i < files.length; i++) {
-    const f = files[i];
-    const pathParts = f.webkitRelativePath.split("/");
-    const relPath = pathParts.slice(1).join("/");
-    if (relPath) {
-      fileMap.set(relPath, f);
-      if (f.name === "tileset.json") tilesetKey = relPath;
-    } else {
-      fileMap.set(f.name, f);
-      if (f.name === "tileset.json") tilesetKey = f.name;
-    }
-  }
-  if (!tilesetKey && fileMap.has("tileset.json")) tilesetKey = "tileset.json";
-  if (!tilesetKey) {
-    throw new Error("在所选文件夹中未找到tileset.json");
-  }
-  onProgress(50, t("reading"));
-  const blobUrlMap = /* @__PURE__ */ new Map();
-  fileMap.forEach((blob2, path) => {
-    blobUrlMap.set(path, URL.createObjectURL(blob2));
-  });
-  const tilesetFile = fileMap.get(tilesetKey);
-  if (!tilesetFile) return null;
-  const text = await tilesetFile.text();
-  const json = JSON.parse(text);
-  const replaceUris = (node) => {
-    if (node.content && node.content.uri) {
-      const mapped = blobUrlMap.get(node.content.uri);
-      if (mapped) node.content.uri = mapped;
-    }
-    if (node.children) node.children.forEach(replaceUris);
-  };
-  replaceUris(json.root);
-  onProgress(100, t("success"));
-  const blob = new Blob([JSON.stringify(json)], { type: "application/json" });
-  return URL.createObjectURL(blob);
-};
-
 const themes = {
   dark: {
-    bg: "#1f2227",
-    panelBg: "#282c31",
-    headerBg: "#32363d",
+    bg: "#1A1C1E",
+    panelBg: "#222427",
+    headerBg: "#282A2D",
     border: "#444b55",
-    text: "#f1f1f1",
-    textLight: "#ffffff",
-    textMuted: "#999999",
-    accent: "#007acc",
-    highlight: "#3e3e42",
-    itemHover: "rgba(255, 255, 255, 0.1)",
-    success: "#4ec9b0",
-    warning: "#ce9178",
-    danger: "#f48771",
-    canvasBg: "#2a2f36",
+    text: "#E6E1E5",
+    textLight: "#FFFFFF",
+    textMuted: "#938F99",
+    accent: "#A1C9FF",
+    highlight: "#49454F",
+    itemHover: "rgba(161, 201, 255, 0.08)",
+    success: "#B4E197",
+    warning: "#F2C94C",
+    danger: "#F2B8B5",
+    canvasBg: "#121416",
     shadow: "rgba(0, 0, 0, 0.5)"
   },
   light: {
-    bg: "#ffffff",
-    // 办公风格白色
-    panelBg: "#ffffff",
-    headerBg: "#f4f5f7",
-    // 标签区域浅灰
+    bg: "#F8FAFF",
+    panelBg: "#FFFFFF",
+    headerBg: "#E0E2EC",
     border: "#d2d2d2",
-    // 办公风格边框色
-    text: "#444444",
+    text: "#1C1B1F",
     textLight: "#000000",
-    textMuted: "#666666",
-    accent: "#2b579a",
-    // 办公风格蓝（文字应用风格）
-    highlight: "#cfe3ff",
-    itemHover: "#e1e1e1",
+    textMuted: "#49454F",
+    accent: "#0061A4",
+    highlight: "#E0E2EC",
+    itemHover: "rgba(0, 97, 164, 0.08)",
     success: "#217346",
-    // 成功绿
-    warning: "#d24726",
-    // 警告橙
-    danger: "#a4262c",
-    canvasBg: "#eef1f4",
+    warning: "#CA8A04",
+    danger: "#B3261E",
+    canvasBg: "#FFFFFF",
     shadow: "rgba(0, 0, 0, 0.15)"
   }
 };
-const DEFAULT_FONT = "'Segoe UI', 'Microsoft YaHei', sans-serif";
+const DEFAULT_FONT = "'Roboto', 'Inter', 'Segoe UI', 'Microsoft YaHei', sans-serif";
 
 const resources = {
   en: {
@@ -4827,8 +4893,6 @@ const resources = {
     ifc_workset_current: "Current Storey",
     ifc_workset_adjacent: "Adjacent Storeys",
     ifc_workset_applied: "Storey workset isolated",
-    ifc_grid_diagnostics: "Grid Diagnostics",
-    ifc_grid_visible: "IFC Grid",
     expand_all: "Expand All",
     collapse_all: "Collapse All",
     isolate_selection: "Isolate Selection",
@@ -4906,7 +4970,6 @@ const resources = {
     export_format: "Format",
     export_glb: "GLB (Standard)",
     export_lmb: "LMB (Custom Compressed)",
-    export_3dtiles: "3D Tiles (Web)",
     export_nbim: "NBIM (High Performance)",
     export_filename: "File Name",
     export_filename_placeholder: "Enter file name",
@@ -4930,12 +4993,7 @@ const resources = {
     st_sun_shadow: "Show Shadows",
     st_bg: "Background",
     st_lang: "Language",
-    st_import_settings: "Import Settings",
     st_theme: "Theme",
-    st_font_size: "Font Size",
-    st_font_compact: "Compact",
-    st_font_medium: "Medium",
-    st_font_loose: "Loose",
     st_menu_mode: "Menu Mode",
     menu_mode_menu: "Menu",
     menu_mode_toolbar: "Toolbar",
@@ -5008,6 +5066,7 @@ const resources = {
     viewpoint_empty: "No saved viewpoints",
     viewpoint_loading: "Restoring viewpoint",
     viewpoint_load: "Restore",
+    viewpoint_load_hint: "Double click to restore",
     viewpoint_overwrite: "Overwrite",
     viewpoint_no_preview: "No preview",
     chunk_loading: "Chunks",
@@ -5109,8 +5168,6 @@ const resources = {
     ifc_workset_current: "当前楼层",
     ifc_workset_adjacent: "上下楼层",
     ifc_workset_applied: "已按楼层工作集隔离显示",
-    ifc_grid_diagnostics: "轴网诊断",
-    ifc_grid_visible: "IFC 轴网",
     expand_all: "全部展开",
     collapse_all: "全部折叠",
     isolate_selection: "隔离选择",
@@ -5187,7 +5244,6 @@ const resources = {
     export_format: "导出格式",
     export_glb: "GLB (标准通用)",
     export_lmb: "LMB (自定义压缩)",
-    export_3dtiles: "3D Tiles (Web大模型)",
     export_nbim: "NBIM (高性能分块模型)",
     export_filename: "文件名",
     export_filename_placeholder: "请输入文件名",
@@ -5211,12 +5267,7 @@ const resources = {
     st_sun_shadow: "显示阴影",
     st_bg: "背景颜色",
     st_lang: "界面语言",
-    st_import_settings: "导入设置",
     st_theme: "界面主题",
-    st_font_size: "界面字号",
-    st_font_compact: "紧凑",
-    st_font_medium: "中等",
-    st_font_loose: "宽松",
     st_menu_mode: "菜单模式",
     menu_mode_menu: "菜单",
     menu_mode_toolbar: "工具栏",
@@ -5289,6 +5340,7 @@ const resources = {
     viewpoint_empty: "暂无保存的视点",
     viewpoint_loading: "恢复视点",
     viewpoint_load: "恢复",
+    viewpoint_load_hint: "双击恢复视点",
     viewpoint_overwrite: "覆盖",
     viewpoint_no_preview: "无预览",
     chunk_loading: "分片加载",
@@ -5327,29 +5379,6 @@ const getTranslation = (lang, key) => {
   return resources[lang][key] || key;
 };
 
-const ImageButton = ({
-  icon,
-  label,
-  active,
-  theme,
-  style,
-  className = "",
-  ...props
-}) => {
-  return /* @__PURE__ */ jsxs(
-    "button",
-    {
-      style,
-      className: `ui-toolbar-btn ${active ? "active" : ""} ${className}`,
-      ...props,
-      children: [
-        /* @__PURE__ */ jsx("div", { className: "flex items-center justify-center w-[18px] h-[18px] overflow-hidden", children: icon }),
-        label && /* @__PURE__ */ jsx("div", { className: "text-[10px] leading-none font-medium whitespace-nowrap overflow-hidden text-ellipsis max-w-full mt-[2px]", children: label })
-      ]
-    }
-  );
-};
-
 const iconSize = 24;
 const iconStrokeWidth = 1.5;
 const createIcon = (paths, props = {}) => {
@@ -5382,6 +5411,15 @@ const IconTarget = (props) => createIcon(
     /* @__PURE__ */ jsx("line", { x1: "12", y1: "19", x2: "12", y2: "22" }),
     /* @__PURE__ */ jsx("line", { x1: "2", y1: "12", x2: "5", y2: "12" }),
     /* @__PURE__ */ jsx("line", { x1: "19", y1: "12", x2: "22", y2: "12" })
+  ] }),
+  props
+);
+const IconClear = (props) => createIcon(
+  /* @__PURE__ */ jsxs(Fragment, { children: [
+    /* @__PURE__ */ jsx("polyline", { points: "3 6 5 6 21 6" }),
+    /* @__PURE__ */ jsx("path", { d: "M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" }),
+    /* @__PURE__ */ jsx("line", { x1: "10", y1: "11", x2: "10", y2: "17" }),
+    /* @__PURE__ */ jsx("line", { x1: "14", y1: "11", x2: "14", y2: "17" })
   ] }),
   props
 );
@@ -5434,6 +5472,15 @@ const IconInfo = (props) => createIcon(
     /* @__PURE__ */ jsx("circle", { cx: "12", cy: "12", r: "10" }),
     /* @__PURE__ */ jsx("line", { x1: "12", y1: "16", x2: "12", y2: "12" }),
     /* @__PURE__ */ jsx("line", { x1: "12", y1: "8", x2: "12.01", y2: "8" })
+  ] }),
+  props
+);
+const IconTrash2 = (props) => createIcon(
+  /* @__PURE__ */ jsxs(Fragment, { children: [
+    /* @__PURE__ */ jsx("polyline", { points: "3 6 5 6 21 6" }),
+    /* @__PURE__ */ jsx("path", { d: "M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" }),
+    /* @__PURE__ */ jsx("line", { x1: "10", y1: "11", x2: "10", y2: "17" }),
+    /* @__PURE__ */ jsx("line", { x1: "14", y1: "11", x2: "14", y2: "17" })
   ] }),
   props
 );
@@ -5548,6 +5595,208 @@ const IconSelectAll = (props) => createIcon(
   ] }),
   props
 );
+const IconViewTop = (props) => createIcon(
+  /* @__PURE__ */ jsxs(Fragment, { children: [
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 12,13 3,8", fill: "currentColor", fillOpacity: "0.55" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  ] }),
+  props
+);
+const IconViewBottom = (props) => createIcon(
+  /* @__PURE__ */ jsxs(Fragment, { children: [
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
+    /* @__PURE__ */ jsx("polygon", { points: "3,16 12,13 21,16 12,21", fill: "currentColor", fillOpacity: "0.55" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  ] }),
+  props
+);
+const IconViewFront = (props) => createIcon(
+  /* @__PURE__ */ jsxs(Fragment, { children: [
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
+    /* @__PURE__ */ jsx("polygon", { points: "3,8 12,13 12,21 3,16", fill: "currentColor", fillOpacity: "0.45" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  ] }),
+  props
+);
+const IconViewBack = (props) => createIcon(
+  /* @__PURE__ */ jsxs(Fragment, { children: [
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
+    /* @__PURE__ */ jsx("polygon", { points: "21,8 12,13 12,21 21,16", fill: "currentColor", fillOpacity: "0.45" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  ] }),
+  props
+);
+const IconViewLeft = (props) => createIcon(
+  /* @__PURE__ */ jsxs(Fragment, { children: [
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
+    /* @__PURE__ */ jsx("polygon", { points: "3,8 12,3 12,13 3,8", fill: "currentColor", fillOpacity: "0.45" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  ] }),
+  props
+);
+const IconViewRight = (props) => createIcon(
+  /* @__PURE__ */ jsxs(Fragment, { children: [
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
+    /* @__PURE__ */ jsx("polygon", { points: "21,8 12,3 12,13 21,8", fill: "currentColor", fillOpacity: "0.45" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  ] }),
+  props
+);
+const IconViewSW = (props) => createIcon(
+  /* @__PURE__ */ jsxs(Fragment, { children: [
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
+    /* @__PURE__ */ jsx("polygon", { points: "3,8 12,13 12,21 3,16", fill: "currentColor", fillOpacity: "0.45" }),
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 12,13 3,8", fill: "currentColor", fillOpacity: "0.25" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  ] }),
+  props
+);
+const IconViewSE = (props) => createIcon(
+  /* @__PURE__ */ jsxs(Fragment, { children: [
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
+    /* @__PURE__ */ jsx("polygon", { points: "21,8 12,13 12,21 21,16", fill: "currentColor", fillOpacity: "0.45" }),
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 12,13 3,8", fill: "currentColor", fillOpacity: "0.25" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  ] }),
+  props
+);
+const IconViewNE = (props) => createIcon(
+  /* @__PURE__ */ jsxs(Fragment, { children: [
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
+    /* @__PURE__ */ jsx("polygon", { points: "21,8 12,13 12,21 21,16", fill: "currentColor", fillOpacity: "0.25" }),
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 12,13 3,8", fill: "currentColor", fillOpacity: "0.45" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  ] }),
+  props
+);
+const IconViewNW = (props) => createIcon(
+  /* @__PURE__ */ jsxs(Fragment, { children: [
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
+    /* @__PURE__ */ jsx("polygon", { points: "3,8 12,13 12,21 3,16", fill: "currentColor", fillOpacity: "0.25" }),
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 12,13 3,8", fill: "currentColor", fillOpacity: "0.45" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  ] }),
+  props
+);
+const IconSolid = (props) => createIcon(
+  /* @__PURE__ */ jsxs(Fragment, { children: [
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.35" }),
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  ] }),
+  props
+);
+const IconTransparent = (props) => createIcon(
+  /* @__PURE__ */ jsxs(Fragment, { children: [
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "none" }),
+    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", strokeDasharray: "2 2" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21", strokeDasharray: "2 2" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  ] }),
+  props
+);
+const IconOpenFile = (props) => createIcon(
+  /* @__PURE__ */ jsx(Fragment, { children: /* @__PURE__ */ jsx("path", { d: "M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" }) }),
+  props
+);
+const IconExportScene = (props) => createIcon(
+  /* @__PURE__ */ jsxs(Fragment, { children: [
+    /* @__PURE__ */ jsx("path", { d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" }),
+    /* @__PURE__ */ jsx("polyline", { points: "7 10 12 15 17 10" }),
+    /* @__PURE__ */ jsx("line", { x1: "12", y1: "15", x2: "12", y2: "3" })
+  ] }),
+  props
+);
+const IconCopy = (props) => createIcon(
+  /* @__PURE__ */ jsxs(Fragment, { children: [
+    /* @__PURE__ */ jsx("rect", { x: "9", y: "9", width: "13", height: "13", rx: "2", ry: "2" }),
+    /* @__PURE__ */ jsx("path", { d: "M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" })
+  ] }),
+  props
+);
+
+const ImageButton = ({
+  icon,
+  label,
+  active,
+  theme,
+  style,
+  className = "",
+  ...props
+}) => {
+  return /* @__PURE__ */ jsxs(
+    "button",
+    {
+      style,
+      className: `ui-toolbar-btn ${active ? "active" : ""} ${className}`,
+      ...props,
+      children: [
+        /* @__PURE__ */ jsx("div", { style: { display: "flex", alignItems: "center", justifyContent: "center", width: 18, height: 18, overflow: "visible" }, children: icon }),
+        label && /* @__PURE__ */ jsx(
+          "div",
+          {
+            style: {
+              fontSize: 11,
+              lineHeight: 1,
+              fontWeight: 500,
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              maxWidth: "100%"
+            },
+            children: label
+          }
+        )
+      ]
+    }
+  );
+};
 
 const Toolbar = (props) => {
   const {
@@ -5557,7 +5806,6 @@ const Toolbar = (props) => {
   } = props;
   const isHidden = (id) => (hiddenMenus || []).includes(id);
   const fileInputRef = React.useRef(null);
-  const folderInputRef = React.useRef(null);
   const batchConvertInputRef = React.useRef(null);
   const [openMenu, setOpenMenu] = useState(null);
   const menuRef = React.useRef(null);
@@ -5595,6 +5843,20 @@ const Toolbar = (props) => {
       }
     );
   };
+  const menuItem = (icon, label, onClick) => /* @__PURE__ */ jsxs(
+    "div",
+    {
+      style: { display: "flex", alignItems: "center", gap: "8px", padding: "5px 14px", fontSize: "12px", color: theme.text, cursor: "pointer", backgroundColor: "transparent" },
+      onClick,
+      onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
+      onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
+      children: [
+        /* @__PURE__ */ jsx("span", { style: { width: 18, height: 18, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, opacity: 0.8 }, children: icon }),
+        label
+      ]
+    }
+  );
+  const menuDivider = () => /* @__PURE__ */ jsx("div", { style: { height: "1px", backgroundColor: theme.border, margin: "4px 0" } });
   return /* @__PURE__ */ jsxs("div", { className: "ui-toolbar", children: [
     /* @__PURE__ */ jsx(
       "input",
@@ -5618,17 +5880,6 @@ const Toolbar = (props) => {
         onChange: props.handleBatchConvert
       }
     ),
-    /* @__PURE__ */ jsx(
-      "input",
-      {
-        type: "file",
-        ref: folderInputRef,
-        style: { display: "none" },
-        ...{ webkitdirectory: "", directory: "" },
-        accept: ".lmb,.lmbz,.glb,.gltf,.ifc,.nbim,.fbx,.obj,.stl,.ply,.3ds,.dae,.stp,.step,.igs,.iges",
-        onChange: props.handleOpenFolder
-      }
-    ),
     !isHidden("file") && /* @__PURE__ */ jsx("div", { className: "ui-toolbar-group", children: /* @__PURE__ */ jsxs("div", { style: { position: "relative" }, children: [
       /* @__PURE__ */ jsx(
         ImageButton,
@@ -5641,58 +5892,21 @@ const Toolbar = (props) => {
         }
       ),
       renderDropdown("file", /* @__PURE__ */ jsxs(Fragment, { children: [
-        !isHidden("open_file") && /* @__PURE__ */ jsx(
-          "div",
-          {
-            style: { padding: "6px 16px", fontSize: "12px", color: theme.text, cursor: "pointer", backgroundColor: "transparent" },
-            onClick: () => {
-              fileInputRef.current?.click();
-              setOpenMenu(null);
-            },
-            onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
-            onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
-            children: t("menu_open_file")
-          }
-        ),
-        !isHidden("open_folder") && /* @__PURE__ */ jsx(
-          "div",
-          {
-            style: { padding: "6px 16px", fontSize: "12px", color: theme.text, cursor: "pointer", backgroundColor: "transparent" },
-            onClick: () => {
-              folderInputRef.current?.click();
-              setOpenMenu(null);
-            },
-            onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
-            onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
-            children: t("menu_open_folder")
-          }
-        ),
-        !isHidden("export") && /* @__PURE__ */ jsx(
-          "div",
-          {
-            style: { padding: "6px 16px", fontSize: "12px", color: theme.text, cursor: "pointer", backgroundColor: "transparent" },
-            onClick: () => {
-              props.setActiveTool?.("export");
-              setOpenMenu(null);
-            },
-            onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
-            onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
-            children: t("menu_export")
-          }
-        ),
-        !isHidden("clear") && /* @__PURE__ */ jsx(
-          "div",
-          {
-            style: { padding: "6px 16px", fontSize: "12px", color: theme.text, cursor: "pointer", backgroundColor: "transparent" },
-            onClick: () => {
-              props.handleClear?.();
-              setOpenMenu(null);
-            },
-            onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
-            onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
-            children: t("op_clear")
-          }
-        )
+        !isHidden("open_file") && menuItem(/* @__PURE__ */ jsx(IconOpenFile, {}), t("menu_open_file"), () => {
+          fileInputRef.current?.click();
+          setOpenMenu(null);
+        }),
+        !isHidden("export") && menuItem(/* @__PURE__ */ jsx(IconExportScene, {}), t("menu_export"), () => {
+          props.setActiveTool?.("export");
+          setOpenMenu(null);
+        }),
+        !isHidden("clear") && /* @__PURE__ */ jsxs(Fragment, { children: [
+          menuDivider(),
+          menuItem(/* @__PURE__ */ jsx(IconClear, {}), t("op_clear"), () => {
+            props.handleClear?.();
+            setOpenMenu(null);
+          })
+        ] })
       ] }))
     ] }) }),
     !isHidden("view") && /* @__PURE__ */ jsxs("div", { className: "ui-toolbar-group", children: [
@@ -5717,137 +5931,47 @@ const Toolbar = (props) => {
           }
         ),
         renderDropdown("views", /* @__PURE__ */ jsxs(Fragment, { children: [
-          /* @__PURE__ */ jsx(
-            "div",
-            {
-              style: { padding: "6px 16px", fontSize: "12px", color: theme.text, cursor: "pointer", backgroundColor: "transparent" },
-              onClick: () => {
-                props.handleView?.("front");
-                setOpenMenu(null);
-              },
-              onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
-              onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
-              children: t("view_front")
-            }
-          ),
-          /* @__PURE__ */ jsx(
-            "div",
-            {
-              style: { padding: "6px 16px", fontSize: "12px", color: theme.text, cursor: "pointer", backgroundColor: "transparent" },
-              onClick: () => {
-                props.handleView?.("back");
-                setOpenMenu(null);
-              },
-              onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
-              onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
-              children: t("view_back")
-            }
-          ),
-          /* @__PURE__ */ jsx(
-            "div",
-            {
-              style: { padding: "6px 16px", fontSize: "12px", color: theme.text, cursor: "pointer", backgroundColor: "transparent" },
-              onClick: () => {
-                props.handleView?.("top");
-                setOpenMenu(null);
-              },
-              onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
-              onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
-              children: t("view_top")
-            }
-          ),
-          /* @__PURE__ */ jsx(
-            "div",
-            {
-              style: { padding: "6px 16px", fontSize: "12px", color: theme.text, cursor: "pointer", backgroundColor: "transparent" },
-              onClick: () => {
-                props.handleView?.("bottom");
-                setOpenMenu(null);
-              },
-              onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
-              onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
-              children: t("view_bottom")
-            }
-          ),
-          /* @__PURE__ */ jsx(
-            "div",
-            {
-              style: { padding: "6px 16px", fontSize: "12px", color: theme.text, cursor: "pointer", backgroundColor: "transparent" },
-              onClick: () => {
-                props.handleView?.("left");
-                setOpenMenu(null);
-              },
-              onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
-              onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
-              children: t("view_left")
-            }
-          ),
-          /* @__PURE__ */ jsx(
-            "div",
-            {
-              style: { padding: "6px 16px", fontSize: "12px", color: theme.text, cursor: "pointer", backgroundColor: "transparent" },
-              onClick: () => {
-                props.handleView?.("right");
-                setOpenMenu(null);
-              },
-              onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
-              onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
-              children: t("view_right")
-            }
-          ),
-          /* @__PURE__ */ jsx("div", { style: { height: "1px", backgroundColor: theme.border, margin: "4px 0" } }),
-          /* @__PURE__ */ jsx(
-            "div",
-            {
-              style: { padding: "6px 16px", fontSize: "12px", color: theme.text, cursor: "pointer", backgroundColor: "transparent" },
-              onClick: () => {
-                props.handleView?.("se");
-                setOpenMenu(null);
-              },
-              onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
-              onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
-              children: t("view_se")
-            }
-          ),
-          /* @__PURE__ */ jsx(
-            "div",
-            {
-              style: { padding: "6px 16px", fontSize: "12px", color: theme.text, cursor: "pointer", backgroundColor: "transparent" },
-              onClick: () => {
-                props.handleView?.("sw");
-                setOpenMenu(null);
-              },
-              onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
-              onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
-              children: t("view_sw")
-            }
-          ),
-          /* @__PURE__ */ jsx(
-            "div",
-            {
-              style: { padding: "6px 16px", fontSize: "12px", color: theme.text, cursor: "pointer", backgroundColor: "transparent" },
-              onClick: () => {
-                props.handleView?.("ne");
-                setOpenMenu(null);
-              },
-              onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
-              onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
-              children: t("view_ne")
-            }
-          ),
-          /* @__PURE__ */ jsx(
-            "div",
-            {
-              style: { padding: "6px 16px", fontSize: "12px", color: theme.text, cursor: "pointer", backgroundColor: "transparent" },
-              onClick: () => {
-                props.handleView?.("nw");
-                setOpenMenu(null);
-              },
-              onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
-              onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
-              children: t("view_nw")
-            }
-          )
+          menuItem(/* @__PURE__ */ jsx(IconViewFront, {}), t("view_front"), () => {
+            props.handleView?.("front");
+            setOpenMenu(null);
+          }),
+          menuItem(/* @__PURE__ */ jsx(IconViewBack, {}), t("view_back"), () => {
+            props.handleView?.("back");
+            setOpenMenu(null);
+          }),
+          menuItem(/* @__PURE__ */ jsx(IconViewTop, {}), t("view_top"), () => {
+            props.handleView?.("top");
+            setOpenMenu(null);
+          }),
+          menuItem(/* @__PURE__ */ jsx(IconViewBottom, {}), t("view_bottom"), () => {
+            props.handleView?.("bottom");
+            setOpenMenu(null);
+          }),
+          menuItem(/* @__PURE__ */ jsx(IconViewLeft, {}), t("view_left"), () => {
+            props.handleView?.("left");
+            setOpenMenu(null);
+          }),
+          menuItem(/* @__PURE__ */ jsx(IconViewRight, {}), t("view_right"), () => {
+            props.handleView?.("right");
+            setOpenMenu(null);
+          }),
+          menuDivider(),
+          menuItem(/* @__PURE__ */ jsx(IconViewSE, {}), t("view_se"), () => {
+            props.handleView?.("se");
+            setOpenMenu(null);
+          }),
+          menuItem(/* @__PURE__ */ jsx(IconViewSW, {}), t("view_sw"), () => {
+            props.handleView?.("sw");
+            setOpenMenu(null);
+          }),
+          menuItem(/* @__PURE__ */ jsx(IconViewNE, {}), t("view_ne"), () => {
+            props.handleView?.("ne");
+            setOpenMenu(null);
+          }),
+          menuItem(/* @__PURE__ */ jsx(IconViewNW, {}), t("view_nw"), () => {
+            props.handleView?.("nw");
+            setOpenMenu(null);
+          })
         ] }))
       ] })
     ] }),
@@ -5864,46 +5988,14 @@ const Toolbar = (props) => {
           }
         ),
         renderDropdown("displayMode", /* @__PURE__ */ jsxs(Fragment, { children: [
-          /* @__PURE__ */ jsx(
-            "div",
-            {
-              style: {
-                padding: "6px 16px",
-                fontSize: "12px",
-                color: props.displayMode === "solid" ? theme.accent : theme.text,
-                cursor: "pointer",
-                backgroundColor: props.displayMode === "solid" ? theme.itemHover : "transparent",
-                fontWeight: props.displayMode === "solid" ? "600" : "400"
-              },
-              onClick: () => {
-                props.handleDisplayModeChange?.("solid");
-                setOpenMenu(null);
-              },
-              onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
-              onMouseLeave: (e) => e.currentTarget.style.backgroundColor = props.displayMode === "solid" ? theme.itemHover : "transparent",
-              children: t("dm_solid") || "着色"
-            }
-          ),
-          /* @__PURE__ */ jsx(
-            "div",
-            {
-              style: {
-                padding: "6px 16px",
-                fontSize: "12px",
-                color: props.displayMode === "transparent" ? theme.accent : theme.text,
-                cursor: "pointer",
-                backgroundColor: props.displayMode === "transparent" ? theme.itemHover : "transparent",
-                fontWeight: props.displayMode === "transparent" ? "600" : "400"
-              },
-              onClick: () => {
-                props.handleDisplayModeChange?.("transparent");
-                setOpenMenu(null);
-              },
-              onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
-              onMouseLeave: (e) => e.currentTarget.style.backgroundColor = props.displayMode === "transparent" ? theme.itemHover : "transparent",
-              children: t("dm_transparent") || "透明"
-            }
-          )
+          menuItem(/* @__PURE__ */ jsx(IconSolid, {}), t("dm_solid") || "着色", () => {
+            props.handleDisplayModeChange?.("solid");
+            setOpenMenu(null);
+          }),
+          menuItem(/* @__PURE__ */ jsx(IconTransparent, {}), t("dm_transparent") || "透明", () => {
+            props.handleDisplayModeChange?.("transparent");
+            setOpenMenu(null);
+          })
         ] }))
       ] }),
       !isHidden("outline") && /* @__PURE__ */ jsx(
@@ -6044,7 +6136,7 @@ const Button = ({
 }) => {
   let btnClass = "ui-btn";
   if (variant === "primary") btnClass += " ui-btn-primary";
-  else if (variant === "danger") btnClass += " bg-error text-white border-error";
+  else if (variant === "danger") btnClass += " ui-btn-danger";
   else if (variant === "ghost") btnClass += " ui-btn-ghost";
   else btnClass += " ui-btn-default";
   if (active) btnClass += " active";
@@ -6449,6 +6541,124 @@ const Checkbox = ({
   );
 };
 
+const InputNumber = ({
+  value,
+  onChange,
+  min,
+  max,
+  step = 1,
+  unit,
+  className = "",
+  style,
+  ...props
+}) => {
+  const handleChange = (e) => {
+    let val = parseFloat(e.target.value);
+    if (isNaN(val)) return;
+    if (min !== void 0) val = Math.max(min, val);
+    if (max !== void 0) val = Math.min(max, val);
+    onChange(val);
+  };
+  const stepUp = () => {
+    let val = value + step;
+    if (max !== void 0) val = Math.min(max, val);
+    onChange(val);
+  };
+  const stepDown = () => {
+    let val = value - step;
+    if (min !== void 0) val = Math.max(min, val);
+    onChange(val);
+  };
+  return /* @__PURE__ */ jsxs(
+    "div",
+    {
+      className: `ui-input-number ${className}`,
+      style: {
+        display: "inline-flex",
+        alignItems: "center",
+        position: "relative",
+        ...style
+      },
+      children: [
+        /* @__PURE__ */ jsx(
+          "input",
+          {
+            type: "number",
+            value,
+            onChange: handleChange,
+            min,
+            max,
+            step,
+            className: "ui-input",
+            style: {
+              paddingRight: unit ? "24px" : "48px",
+              textAlign: "right"
+            },
+            ...props
+          }
+        ),
+        unit && /* @__PURE__ */ jsx("span", { style: {
+          position: "absolute",
+          right: "32px",
+          fontSize: "11px",
+          color: "var(--text-muted)"
+        }, children: unit }),
+        /* @__PURE__ */ jsxs("div", { className: "ui-input-number-controls", style: {
+          position: "absolute",
+          right: "4px",
+          display: "flex",
+          flexDirection: "column",
+          height: "calc(100% - 8px)",
+          gap: "2px"
+        }, children: [
+          /* @__PURE__ */ jsx(
+            "button",
+            {
+              onClick: stepUp,
+              className: "ui-input-number-btn",
+              title: "Increase",
+              style: {
+                flex: 1,
+                background: "transparent",
+                border: "none",
+                color: "var(--text-muted)",
+                cursor: "pointer",
+                padding: "0 4px",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                fontSize: "8px"
+              },
+              children: "▲"
+            }
+          ),
+          /* @__PURE__ */ jsx(
+            "button",
+            {
+              onClick: stepDown,
+              className: "ui-input-number-btn",
+              title: "Decrease",
+              style: {
+                flex: 1,
+                background: "transparent",
+                border: "none",
+                color: "var(--text-muted)",
+                cursor: "pointer",
+                padding: "0 4px",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                fontSize: "8px"
+              },
+              children: "▼"
+            }
+          )
+        ] })
+      ]
+    }
+  );
+};
+
 const ContextMenu = ({ x, y, items, onClose, theme }) => {
   const menuRef = useRef(null);
   useEffect(() => {
@@ -6647,7 +6857,6 @@ const SceneTree = ({
   onSelect,
   onToggleVisibility,
   onDelete,
-  onFocus,
   onIsolate,
   onHide,
   onShowAll,
@@ -6673,6 +6882,7 @@ const SceneTree = ({
   const [scrollTop, setScrollTop] = useState(0);
   const [containerHeight, setContainerHeight] = useState(400);
   const containerRef = useRef(null);
+  const selectionSourceRef = useRef(null);
   const searchExpandedStateRef = useRef(null);
   const previousSearchQueryRef = useRef("");
   const lastLocateResultsRef = useRef([]);
@@ -6833,19 +7043,10 @@ const SceneTree = ({
   const endIndex = Math.min(flatData.length, startIndex + visibleCount + 1);
   const visibleItems = flatData.slice(startIndex, endIndex);
   useEffect(() => {
-    if (!selectedUuid || !containerRef.current) return;
-    const targetIndex = flatData.findIndex((node) => node.uuid === selectedUuid);
-    if (targetIndex < 0) return;
-    const currentTop = containerRef.current.scrollTop;
-    const currentBottom = currentTop + containerHeight;
-    const itemTop = targetIndex * rowHeight;
-    const itemBottom = itemTop + rowHeight;
-    if (itemTop < currentTop) {
-      containerRef.current.scrollTop = itemTop;
-    } else if (itemBottom > currentBottom) {
-      containerRef.current.scrollTop = Math.max(0, itemBottom - containerHeight);
+    if (selectionSourceRef.current === "tree") {
+      selectionSourceRef.current = null;
     }
-  }, [selectedUuid, flatData, containerHeight, rowHeight]);
+  }, [selectedUuid]);
   const toggleNode = (nodeUuid) => {
     const toggle = (nodes) => nodes.map((node) => {
       if (node.uuid === nodeUuid) {
@@ -6879,7 +7080,7 @@ const SceneTree = ({
   const handleLocateFirstMatch = () => {
     if (!firstSearchMatch) return;
     onSelect(firstSearchMatch.uuid, firstSearchMatch.object);
-    onFocus?.(firstSearchMatch.object);
+    onLocate?.(firstSearchMatch.object);
   };
   const handleLocateIfcMatch = (matchIndex = 0) => {
     const target = locatorMatches[matchIndex];
@@ -7164,65 +7365,22 @@ const SceneTree = ({
           "div",
           {
             className: `ui-tree-node ${node.uuid === selectedUuid ? "selected" : ""} ${locateResultUuids.includes(node.uuid) ? "matched" : ""} ${node.uuid === locatedUuid ? "located" : ""}`,
-            style: { paddingLeft: 8 },
-            onClick: () => onSelect(node.uuid, node.object),
-            onDoubleClick: () => onLocate ? onLocate(node.object) : onFocus?.(node.object),
+            style: { paddingLeft: 8 + node.depth * 16 },
+            onClick: () => {
+              selectionSourceRef.current = "tree";
+              onSelect(node.uuid, node.object);
+            },
+            onDoubleClick: (e) => {
+              if (node.hasChildren) {
+                e.stopPropagation();
+                toggleNode(node.uuid);
+              }
+            },
             onContextMenu: (e) => {
               e.preventDefault();
               setContextMenu({ x: e.clientX, y: e.clientY, node });
             },
             children: [
-              node.depth > 0 && /* @__PURE__ */ jsxs("div", { style: { display: "flex", height: "100%", alignItems: "center", flexShrink: 0 }, children: [
-                node.parentIsLast?.map((isLast, i) => /* @__PURE__ */ jsx(
-                  "div",
-                  {
-                    style: {
-                      width: 12,
-                      height: "100%",
-                      position: "relative",
-                      borderLeft: isLast ? "none" : "1px solid var(--border-color)"
-                    }
-                  },
-                  i
-                )),
-                /* @__PURE__ */ jsxs(
-                  "div",
-                  {
-                    style: {
-                      width: 12,
-                      height: "100%",
-                      position: "relative",
-                      display: "flex",
-                      alignItems: "center"
-                    },
-                    children: [
-                      /* @__PURE__ */ jsx(
-                        "div",
-                        {
-                          style: {
-                            position: "absolute",
-                            left: 0,
-                            top: 0,
-                            bottom: node.isLastChild ? "50%" : 0,
-                            borderLeft: "1px solid var(--border-color)"
-                          }
-                        }
-                      ),
-                      /* @__PURE__ */ jsx(
-                        "div",
-                        {
-                          style: {
-                            position: "absolute",
-                            left: 0,
-                            width: 10,
-                            borderTop: "1px solid var(--border-color)"
-                          }
-                        }
-                      )
-                    ]
-                  }
-                )
-              ] }),
               /* @__PURE__ */ jsx(
                 "div",
                 {
@@ -7260,7 +7418,7 @@ const SceneTree = ({
         items: [
           {
             label: t("locate_in_view") || "定位到视图",
-            onClick: () => onFocus?.(contextMenu.node.object)
+            onClick: () => onLocate?.(contextMenu.node.object)
           },
           { divider: true },
           {
@@ -7289,20 +7447,19 @@ const FloatingPanel = ({
   onClose,
   children,
   width = 300,
-  height = 200,
+  height,
   x = 100,
   y = 100,
   resizable = false,
   movable = true,
   storageId,
   modal = false,
-  // 默认非模态模式
   autoHeight = height === void 0
 }) => {
   const panelRef = useRef(null);
   const minWidth = storageId === "tool_measure" ? 320 : 220;
   const minHeight = storageId === "tool_measure" ? 400 : 120;
-  const [pos, setPos] = useState(() => {
+  const getInitialPos = () => {
     if (modal) {
       return {
         x: Math.max(0, (window.innerWidth - width) / 2),
@@ -7315,23 +7472,24 @@ const FloatingPanel = ({
         if (saved) {
           const parsed = JSON.parse(saved);
           if (parsed.pos && typeof parsed.pos.x === "number" && typeof parsed.pos.y === "number") {
-            const loadedX = Math.min(Math.max(0, parsed.pos.x), window.innerWidth - 50);
-            const loadedY = Math.min(Math.max(0, parsed.pos.y), window.innerHeight - 50);
-            return { x: loadedX, y: loadedY };
+            return {
+              x: Math.min(Math.max(0, parsed.pos.x), window.innerWidth - 50),
+              y: Math.min(Math.max(0, parsed.pos.y), window.innerHeight - 50)
+            };
           }
         }
       } catch (e) {
-        console.error("Failed to load panel state", e);
       }
     }
     if (x === 100 && y === 100 && !storageId) {
-      const centerX = (window.innerWidth - width) / 2;
-      const centerY = (window.innerHeight - (height ?? minHeight)) / 2;
-      return { x: Math.max(0, centerX), y: Math.max(0, centerY) };
+      return {
+        x: Math.max(0, (window.innerWidth - width) / 2),
+        y: Math.max(0, (window.innerHeight - (height ?? minHeight)) / 2)
+      };
     }
     return { x, y };
-  });
-  const [size, setSize] = useState(() => {
+  };
+  const getInitialSize = () => {
     if (storageId && resizable) {
       try {
         const saved = localStorage.getItem(`panel_${storageId}`);
@@ -7348,79 +7506,94 @@ const FloatingPanel = ({
       }
     }
     return { w: width, h: height ?? minHeight };
-  });
-  useEffect(() => {
-    if (!modal) return;
-    const centerPanel = () => {
-      const measuredHeight = autoHeight ? Math.min(window.innerHeight - 64, panelRef.current?.offsetHeight || size.h) : size.h;
-      const centerX = (window.innerWidth - size.w) / 2;
-      const centerY = (window.innerHeight - measuredHeight) / 2;
-      setPos({ x: Math.max(0, centerX), y: Math.max(0, centerY) });
-    };
-    window.addEventListener("resize", centerPanel);
-    centerPanel();
-    return () => {
-      window.removeEventListener("resize", centerPanel);
-    };
-  }, [autoHeight, modal, size.w, size.h]);
+  };
+  const posRef = useRef(getInitialPos());
+  const sizeRef = useRef(getInitialSize());
   const isDragging = useRef(false);
   const isResizing = useRef(false);
+  const resizeDirection = useRef(null);
   const dragStart = useRef({ x: 0, y: 0 });
   const startPos = useRef({ x: 0, y: 0 });
   const startSize = useRef({ w: 0, h: 0 });
-  const currentPosRef = useRef(pos);
-  const currentSizeRef = useRef(size);
-  const animationFrame = useRef(0);
-  useEffect(() => {
-    currentPosRef.current = pos;
-  }, [pos]);
-  useEffect(() => {
-    currentSizeRef.current = size;
-  }, [size]);
+  const applyStyle = useCallback(() => {
+    const panel = panelRef.current;
+    if (!panel) return;
+    const pos2 = posRef.current;
+    const size2 = sizeRef.current;
+    panel.style.transform = `translate(${pos2.x}px, ${pos2.y}px)`;
+    panel.style.width = `${size2.w}px`;
+    if (!autoHeight) {
+      panel.style.height = `${size2.h}px`;
+    }
+  }, [autoHeight]);
   const handleMouseMove = useCallback((e) => {
     if (!isDragging.current && !isResizing.current) return;
     e.preventDefault();
-    if (animationFrame.current) cancelAnimationFrame(animationFrame.current);
-    animationFrame.current = requestAnimationFrame(() => {
-      const dx = e.clientX - dragStart.current.x;
-      const dy = e.clientY - dragStart.current.y;
-      if (isDragging.current) {
-        let newX = startPos.current.x + dx;
-        let newY = startPos.current.y + dy;
-        let limitW = window.innerWidth;
-        let limitH = window.innerHeight;
-        if (panelRef.current?.parentElement) {
-          limitW = panelRef.current.parentElement.clientWidth;
-          limitH = panelRef.current.parentElement.clientHeight;
-        }
-        const maxX = limitW - size.w;
-        const maxY = limitH - size.h;
-        newX = Math.max(0, Math.min(newX, maxX));
-        newY = Math.max(0, Math.min(newY, maxY));
-        setPos({ x: newX, y: newY });
-      } else if (isResizing.current) {
-        setSize({
-          w: Math.max(minWidth, startSize.current.w + dx),
-          h: Math.max(minHeight, startSize.current.h + dy)
-        });
+    const dx = e.clientX - dragStart.current.x;
+    const dy = e.clientY - dragStart.current.y;
+    const panel = panelRef.current;
+    if (isDragging.current) {
+      let limitW = window.innerWidth;
+      let limitH = window.innerHeight;
+      if (panel?.parentElement) {
+        limitW = panel.parentElement.clientWidth;
+        limitH = panel.parentElement.clientHeight;
       }
-    });
-  }, [size, minWidth, minHeight]);
+      const panelHeight = autoHeight ? panel?.offsetHeight || sizeRef.current.h : sizeRef.current.h;
+      const maxX = limitW - sizeRef.current.w;
+      const maxY = limitH - panelHeight;
+      posRef.current = {
+        x: Math.max(0, Math.min(startPos.current.x + dx, maxX)),
+        y: Math.max(0, Math.min(startPos.current.y + dy, maxY))
+      };
+      applyStyle();
+    } else if (isResizing.current && resizeDirection.current) {
+      const dir = resizeDirection.current;
+      let newW = startSize.current.w;
+      let newH = startSize.current.h;
+      let newX = startPos.current.x;
+      let newY = startPos.current.y;
+      if (dir.includes("e")) {
+        newW = Math.max(minWidth, startSize.current.w + dx);
+      }
+      if (dir.includes("w")) {
+        const maxDx = startSize.current.w - minWidth;
+        const actualDx = Math.min(dx, maxDx);
+        newW = startSize.current.w - actualDx;
+        newX = startPos.current.x + actualDx;
+      }
+      if (dir.includes("s")) {
+        newH = Math.max(minHeight, startSize.current.h + dy);
+      }
+      if (dir.includes("n")) {
+        const maxDy = startSize.current.h - minHeight;
+        const actualDy = Math.min(dy, maxDy);
+        newH = startSize.current.h - actualDy;
+        newY = startPos.current.y + actualDy;
+      }
+      sizeRef.current = { w: newW, h: newH };
+      if (dir.includes("w") || dir.includes("n")) {
+        posRef.current = { x: newX, y: newY };
+      }
+      applyStyle();
+    }
+  }, [minWidth, minHeight, autoHeight, applyStyle]);
   const handleMouseUp = useCallback(() => {
-    if ((isDragging.current || isResizing.current) && storageId) {
-      try {
-        const stateToSave = {
-          pos: currentPosRef.current,
-          size: currentSizeRef.current
-        };
-        localStorage.setItem(`panel_${storageId}`, JSON.stringify(stateToSave));
-      } catch (e) {
-        console.error("Failed to save panel state", e);
+    if (isDragging.current || isResizing.current) {
+      if (storageId) {
+        try {
+          localStorage.setItem(`panel_${storageId}`, JSON.stringify({
+            pos: posRef.current,
+            size: sizeRef.current
+          }));
+        } catch (e) {
+        }
       }
     }
     isDragging.current = false;
     isResizing.current = false;
-    if (animationFrame.current) cancelAnimationFrame(animationFrame.current);
+    resizeDirection.current = null;
+    document.body.style.cursor = "";
   }, [storageId]);
   useEffect(() => {
     document.addEventListener("mousemove", handleMouseMove);
@@ -7428,29 +7601,58 @@ const FloatingPanel = ({
     return () => {
       document.removeEventListener("mousemove", handleMouseMove);
       document.removeEventListener("mouseup", handleMouseUp);
-      if (animationFrame.current) cancelAnimationFrame(animationFrame.current);
     };
   }, [handleMouseMove, handleMouseUp]);
+  useEffect(() => {
+    if (!modal) return;
+    const centerPanel = () => {
+      const measuredHeight = autoHeight ? Math.min(window.innerHeight - 64, panelRef.current?.offsetHeight || sizeRef.current.h) : sizeRef.current.h;
+      posRef.current = {
+        x: Math.max(0, (window.innerWidth - sizeRef.current.w) / 2),
+        y: Math.max(0, (window.innerHeight - measuredHeight) / 2)
+      };
+      applyStyle();
+    };
+    window.addEventListener("resize", centerPanel);
+    centerPanel();
+    return () => window.removeEventListener("resize", centerPanel);
+  }, [autoHeight, modal, applyStyle]);
   const onHeaderDown = (e) => {
     if (modal || e.button !== 0 || !movable) return;
     e.preventDefault();
     e.stopPropagation();
     isDragging.current = true;
     dragStart.current = { x: e.clientX, y: e.clientY };
-    startPos.current = { ...pos };
+    startPos.current = { ...posRef.current };
+    document.body.style.cursor = "grabbing";
   };
-  const onResizeDown = (e) => {
+  const onResizeDown = (direction) => (e) => {
     if (modal || e.button !== 0 || !resizable) return;
     e.preventDefault();
     e.stopPropagation();
     isResizing.current = true;
+    resizeDirection.current = direction;
     dragStart.current = { x: e.clientX, y: e.clientY };
-    startSize.current = { ...size };
+    startSize.current = { ...sizeRef.current };
+    startPos.current = { ...posRef.current };
+    const cursors = {
+      "n": "ns-resize",
+      "s": "ns-resize",
+      "e": "ew-resize",
+      "w": "ew-resize",
+      "ne": "nesw-resize",
+      "sw": "nesw-resize",
+      "nw": "nwse-resize",
+      "se": "nwse-resize"
+    };
+    document.body.style.cursor = cursors[direction];
   };
   const onCloseClick = (e) => {
     e.stopPropagation();
     onClose?.();
   };
+  const pos = posRef.current;
+  const size = sizeRef.current;
   return /* @__PURE__ */ jsxs(Fragment, { children: [
     modal && /* @__PURE__ */ jsx(
       "div",
@@ -7473,12 +7675,14 @@ const FloatingPanel = ({
         className: "ui-panel",
         style: {
           position: modal ? "fixed" : "absolute",
-          left: pos.x,
-          top: pos.y,
+          left: 0,
+          top: 0,
+          transform: `translate(${pos.x}px, ${pos.y}px)`,
           width: size.w,
           height: autoHeight ? "auto" : size.h,
           maxHeight: autoHeight ? "calc(100vh - 64px)" : void 0,
-          zIndex: modal ? 2e3 : 200
+          zIndex: modal ? 2e3 : 200,
+          willChange: isDragging.current || isResizing.current ? "transform, width, height" : "auto"
         },
         children: [
           /* @__PURE__ */ jsxs(
@@ -7501,13 +7705,13 @@ const FloatingPanel = ({
             }
           ),
           /* @__PURE__ */ jsx("div", { className: "ui-panel-content", children }),
-          resizable && !modal && /* @__PURE__ */ jsx(
-            "div",
-            {
-              className: "ui-panel-resize cursor-se-resize",
-              onMouseDown: onResizeDown
-            }
-          )
+          resizable && !modal && /* @__PURE__ */ jsxs(Fragment, { children: [
+            /* @__PURE__ */ jsx("div", { className: "ui-panel-resize-handle ui-panel-resize-e", onMouseDown: onResizeDown("e") }),
+            /* @__PURE__ */ jsx("div", { className: "ui-panel-resize-handle ui-panel-resize-s", onMouseDown: onResizeDown("s") }),
+            /* @__PURE__ */ jsx("div", { className: "ui-panel-resize-handle ui-panel-resize-w", onMouseDown: onResizeDown("w") }),
+            /* @__PURE__ */ jsx("div", { className: "ui-panel-resize-handle ui-panel-resize-se", onMouseDown: onResizeDown("se") }),
+            /* @__PURE__ */ jsx("div", { className: "ui-panel-resize-handle ui-panel-resize-sw", onMouseDown: onResizeDown("sw") })
+          ] })
         ]
       }
     )
@@ -7576,7 +7780,6 @@ const SettingsPanel = ({
   const tabOptions = [
     { value: "general", label: t("setting_general") || "通用" },
     { value: "viewport", label: t("st_viewport") || "视口" },
-    { value: "import", label: t("st_import_settings") || "导入" },
     { value: "highlight", label: t("st_highlight") || "高亮" }
   ];
   return /* @__PURE__ */ jsx(
@@ -7627,19 +7830,7 @@ const SettingsPanel = ({
               checked: showStats,
               onChange: (v) => setShowStats(v)
             }
-          ) }),
-          /* @__PURE__ */ jsx(Row$1, { label: t("st_font_size"), labelWidth: "70px", children: /* @__PURE__ */ jsx("div", { style: { flex: 1, display: "flex", justifyContent: "flex-end" }, children: /* @__PURE__ */ jsx(
-            SegmentedControl$1,
-            {
-              options: [
-                { value: "compact", label: t("st_font_compact") || "紧凑" },
-                { value: "medium", label: t("st_font_medium") || "中等" },
-                { value: "loose", label: t("st_font_loose") || "宽松" }
-              ],
-              value: settings.fontSize || "medium",
-              onChange: (v) => onUpdate({ fontSize: v })
-            }
-          ) }) })
+          ) })
         ] }),
         activeTab === "viewport" && /* @__PURE__ */ jsxs("div", { className: "mb-2", style: { padding: "0 6px" }, children: [
           /* @__PURE__ */ jsx(Row$1, { label: t("st_viewcube_size"), labelWidth: "90px", stretch: true, children: /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", gap: "8px", width: "100%" }, children: [
@@ -7678,13 +7869,6 @@ const SettingsPanel = ({
             }
           ) }) })
         ] }),
-        activeTab === "import" && /* @__PURE__ */ jsx("div", { className: "mb-2", style: { padding: "0 6px" }, children: /* @__PURE__ */ jsx(Row$1, { label: t("ifc_grid_visible") || "IFC 轴网", labelWidth: "90px", children: /* @__PURE__ */ jsx(
-          Switch,
-          {
-            checked: settings.ifcGridVisible !== false,
-            onChange: (v) => onUpdate({ ifcGridVisible: v })
-          }
-        ) }) }),
         activeTab === "highlight" && /* @__PURE__ */ jsxs("div", { className: "mb-2", style: { padding: "0 6px" }, children: [
           /* @__PURE__ */ jsx(Row$1, { label: t("st_highlight_color") || "高亮颜色", labelWidth: "90px", stretch: true, children: /* @__PURE__ */ jsx(
             ColorPicker,
@@ -8002,102 +8186,96 @@ const ClipPanel = ({
       height: 420,
       resizable: false,
       storageId: "tool_clip",
-      children: /* @__PURE__ */ jsxs(
-        "div",
-        {
-          className: "ui-panel-stack",
-          style: { height: "100%" },
-          children: [
-            /* @__PURE__ */ jsxs("div", { className: "ui-panel-section", children: [
-              /* @__PURE__ */ jsxs("div", { className: "ui-form-row", children: [
-                /* @__PURE__ */ jsx("span", { className: "ui-form-label", children: t("clip_enable") }),
-                /* @__PURE__ */ jsx("div", { className: "ui-form-value", children: /* @__PURE__ */ jsx(Switch, { checked: clipEnabled, onChange: (v) => setClipEnabled(v) }) })
-              ] }),
-              /* @__PURE__ */ jsxs("div", { className: "ui-form-row", children: [
-                /* @__PURE__ */ jsx("span", { className: "ui-form-label", children: t("clip_helper_visible") }),
-                /* @__PURE__ */ jsx("div", { className: "ui-form-value", children: /* @__PURE__ */ jsx(
-                  Switch,
-                  {
-                    checked: clipHelperVisible,
-                    onChange: (v) => setClipHelperVisible(v),
-                    disabled: !clipEnabled
-                  }
-                ) })
-              ] }),
-              /* @__PURE__ */ jsxs("div", { className: "ui-form-row", children: [
-                /* @__PURE__ */ jsx("span", { className: "ui-form-label", children: t("clip_helper_opacity") }),
-                /* @__PURE__ */ jsx("div", { className: "ui-form-value ui-form-value-stretch", children: /* @__PURE__ */ jsxs("div", { className: "ui-slider-field", children: [
-                  /* @__PURE__ */ jsx(
-                    Slider,
-                    {
-                      min: 0.05,
-                      max: 0.35,
-                      step: 0.01,
-                      value: clipHelperOpacity,
-                      onChange: (value) => setClipHelperOpacity(value),
-                      disabled: !clipEnabled || !clipHelperVisible
-                    }
-                  ),
-                  /* @__PURE__ */ jsxs("span", { className: "ui-slider-value", children: [
-                    Math.round(clipHelperOpacity * 100),
-                    "%"
-                  ] })
-                ] }) })
-              ] })
-            ] }),
-            /* @__PURE__ */ jsxs(
-              "div",
+      children: /* @__PURE__ */ jsxs("div", { style: { height: "100%", display: "flex", flexDirection: "column", gap: 12, padding: 12 }, children: [
+        /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 8 }, children: [
+          /* @__PURE__ */ jsxs("div", { className: "ui-form-row", children: [
+            /* @__PURE__ */ jsx("span", { className: "ui-form-label", children: t("clip_enable") }),
+            /* @__PURE__ */ jsx("div", { className: "ui-form-value", children: /* @__PURE__ */ jsx(Switch, { checked: clipEnabled, onChange: (v) => setClipEnabled(v) }) })
+          ] }),
+          /* @__PURE__ */ jsxs("div", { className: "ui-form-row", children: [
+            /* @__PURE__ */ jsx("span", { className: "ui-form-label", children: t("clip_helper_visible") }),
+            /* @__PURE__ */ jsx("div", { className: "ui-form-value", children: /* @__PURE__ */ jsx(
+              Switch,
               {
-                className: "ui-panel-section flex flex-col",
-                style: {
-                  flex: 1,
-                  opacity: clipEnabled ? 1 : 0.4,
-                  pointerEvents: clipEnabled ? "auto" : "none"
-                },
-                children: [
-                  /* @__PURE__ */ jsx(
-                    AxisSliderRow,
-                    {
-                      axis: "x",
-                      label: t("clip_x"),
-                      active: clipActive.x,
-                      value: clipValues.x,
-                      onToggle: (v) => setClipActive({ ...clipActive, x: v }),
-                      onChange: (val) => setClipValues({ ...clipValues, x: val }),
-                      disabled: !clipEnabled
-                    }
-                  ),
-                  /* @__PURE__ */ jsx(
-                    AxisSliderRow,
-                    {
-                      axis: "y",
-                      label: t("clip_y"),
-                      active: clipActive.y,
-                      value: clipValues.y,
-                      onToggle: (v) => setClipActive({ ...clipActive, y: v }),
-                      onChange: (val) => setClipValues({ ...clipValues, y: val }),
-                      disabled: !clipEnabled
-                    }
-                  ),
-                  /* @__PURE__ */ jsx(
-                    AxisSliderRow,
-                    {
-                      axis: "z",
-                      label: t("clip_z"),
-                      active: clipActive.z,
-                      value: clipValues.z,
-                      onToggle: (v) => setClipActive({ ...clipActive, z: v }),
-                      onChange: (val) => setClipValues({ ...clipValues, z: val }),
-                      disabled: !clipEnabled
-                    }
-                  )
-                ]
+                checked: clipHelperVisible,
+                onChange: (v) => setClipHelperVisible(v),
+                disabled: !clipEnabled
               }
-            ),
-            /* @__PURE__ */ jsx("div", { className: "ui-panel-footer", children: /* @__PURE__ */ jsx(Button, { variant: "default", onClick: handleReset, disabled: !clipEnabled, children: t("clip_reset") || "重置范围" }) })
-          ]
-        }
-      )
+            ) })
+          ] }),
+          /* @__PURE__ */ jsxs("div", { className: "ui-form-row", children: [
+            /* @__PURE__ */ jsx("span", { className: "ui-form-label", children: t("clip_helper_opacity") }),
+            /* @__PURE__ */ jsx("div", { className: "ui-form-value ui-form-value-stretch", children: /* @__PURE__ */ jsxs("div", { className: "ui-slider-field", children: [
+              /* @__PURE__ */ jsx(
+                Slider,
+                {
+                  min: 0.05,
+                  max: 0.35,
+                  step: 0.01,
+                  value: clipHelperOpacity,
+                  onChange: (value) => setClipHelperOpacity(value),
+                  disabled: !clipEnabled || !clipHelperVisible
+                }
+              ),
+              /* @__PURE__ */ jsxs("span", { className: "ui-slider-value", children: [
+                Math.round(clipHelperOpacity * 100),
+                "%"
+              ] })
+            ] }) })
+          ] })
+        ] }),
+        /* @__PURE__ */ jsxs(
+          "div",
+          {
+            style: {
+              flex: 1,
+              display: "flex",
+              flexDirection: "column",
+              opacity: clipEnabled ? 1 : 0.4,
+              pointerEvents: clipEnabled ? "auto" : "none"
+            },
+            children: [
+              /* @__PURE__ */ jsx(
+                AxisSliderRow,
+                {
+                  axis: "x",
+                  label: t("clip_x"),
+                  active: clipActive.x,
+                  value: clipValues.x,
+                  onToggle: (v) => setClipActive({ ...clipActive, x: v }),
+                  onChange: (val) => setClipValues({ ...clipValues, x: val }),
+                  disabled: !clipEnabled
+                }
+              ),
+              /* @__PURE__ */ jsx(
+                AxisSliderRow,
+                {
+                  axis: "y",
+                  label: t("clip_y"),
+                  active: clipActive.y,
+                  value: clipValues.y,
+                  onToggle: (v) => setClipActive({ ...clipActive, y: v }),
+                  onChange: (val) => setClipValues({ ...clipValues, y: val }),
+                  disabled: !clipEnabled
+                }
+              ),
+              /* @__PURE__ */ jsx(
+                AxisSliderRow,
+                {
+                  axis: "z",
+                  label: t("clip_z"),
+                  active: clipActive.z,
+                  value: clipValues.z,
+                  onToggle: (v) => setClipActive({ ...clipActive, z: v }),
+                  onChange: (val) => setClipValues({ ...clipValues, z: val }),
+                  disabled: !clipEnabled
+                }
+              )
+            ]
+          }
+        ),
+        /* @__PURE__ */ jsx("div", { style: { display: "flex", justifyContent: "flex-end" }, children: /* @__PURE__ */ jsx(Button, { variant: "default", onClick: handleReset, disabled: !clipEnabled, children: t("clip_reset") || "重置范围" }) })
+      ] })
     }
   );
 };
@@ -8108,7 +8286,7 @@ const ExportPanel = ({ t, onClose, onExport, getDefaultFileName, theme }) => {
   useEffect(() => {
     setFileName(getDefaultFileName(format));
   }, [format, getDefaultFileName]);
-  return /* @__PURE__ */ jsx(FloatingPanel, { title: t("export_title"), onClose, width: 320, height: 500, resizable: false, theme, storageId: "tool_export", children: /* @__PURE__ */ jsxs("div", { style: { padding: 16 }, children: [
+  return /* @__PURE__ */ jsx(FloatingPanel, { title: t("export_title"), onClose, width: 320, height: 450, resizable: false, theme, storageId: "tool_export", children: /* @__PURE__ */ jsxs("div", { style: { padding: 16 }, children: [
     /* @__PURE__ */ jsxs("div", { style: { marginBottom: 10, fontSize: 12, color: theme.textMuted }, children: [
       t("export_format"),
       ":"
@@ -8116,7 +8294,6 @@ const ExportPanel = ({ t, onClose, onExport, getDefaultFileName, theme }) => {
     [
       { id: "glb", label: "GLB", desc: t("export_glb") },
       { id: "lmb", label: "LMB", desc: t("export_lmb") },
-      { id: "3dtiles", label: "3D Tiles", desc: t("export_3dtiles") },
       { id: "nbim", label: "NBIM", desc: t("export_nbim") }
     ].map((opt) => /* @__PURE__ */ jsxs("label", { style: {
       display: "flex",
@@ -8247,7 +8424,6 @@ const ViewpointPanel = ({
   onUpdateName,
   onLoad,
   onDelete,
-  onOverwrite,
   theme
 }) => {
   const [newName, setNewName] = useState("");
@@ -8285,13 +8461,13 @@ const ViewpointPanel = ({
     {
       title: t("viewpoint_title") || "视点管理",
       onClose,
-      width: 380,
+      width: 320,
       height: 470,
       resizable: true,
       theme,
       storageId: "tool_viewpoint",
-      children: /* @__PURE__ */ jsxs("div", { className: "ui-panel-stack", style: { height: "100%" }, children: [
-        /* @__PURE__ */ jsx("div", { className: "ui-panel-section", children: /* @__PURE__ */ jsx("div", { className: "ui-form-row ui-form-row-top", children: /* @__PURE__ */ jsx("div", { className: "ui-form-value ui-form-value-stretch", children: /* @__PURE__ */ jsxs("div", { className: "ui-inline-actions", children: [
+      children: /* @__PURE__ */ jsxs("div", { style: { height: "100%", display: "flex", flexDirection: "column", gap: 12, padding: 12 }, children: [
+        /* @__PURE__ */ jsxs("div", { className: "ui-inline-actions", children: [
           /* @__PURE__ */ jsx(
             "input",
             {
@@ -8302,52 +8478,59 @@ const ViewpointPanel = ({
                 if (e.key === "Enter") handleSave();
               },
               className: "ui-input",
-              placeholder: t("viewpoint_title") || "视点名称"
+              placeholder: t("viewpoint_title") || "视点名称",
+              style: { flex: 1 }
             }
           ),
           /* @__PURE__ */ jsx(Button, { variant: "primary", onClick: handleSave, children: t("btn_confirm") || "保存" })
-        ] }) }) }) }),
-        /* @__PURE__ */ jsx("div", { className: "ui-panel-section ui-panel-section-fill", children: viewpoints.length === 0 ? /* @__PURE__ */ jsx("div", { className: "ui-empty-state", children: t("viewpoint_empty") || "暂无保存的视点" }) : /* @__PURE__ */ jsx("div", { className: "ui-viewpoint-list", children: viewpoints.map((vp) => /* @__PURE__ */ jsxs("div", { className: "ui-viewpoint-card", children: [
-          /* @__PURE__ */ jsx(
-            "button",
+        ] }),
+        /* @__PURE__ */ jsx("div", { style: { flex: 1, overflow: "auto", minHeight: 0 }, children: viewpoints.length === 0 ? /* @__PURE__ */ jsx("div", { className: "ui-empty-state", children: t("viewpoint_empty") || "暂无保存的视点" }) : /* @__PURE__ */ jsx("div", { className: "ui-viewpoint-grid", children: viewpoints.map((vp) => /* @__PURE__ */ jsxs("div", { className: "ui-viewpoint-card-v2", children: [
+          /* @__PURE__ */ jsxs(
+            "div",
             {
-              className: "ui-viewpoint-preview",
-              onClick: () => onLoad(vp),
-              title: t("viewpoint_load") || "恢复视点",
-              children: vp.image ? /* @__PURE__ */ jsx(
-                "img",
-                {
-                  src: vp.image,
-                  alt: vp.name,
-                  style: { width: "100%", height: "100%", objectFit: "cover" }
-                }
-              ) : /* @__PURE__ */ jsx("div", { className: "ui-empty-state", style: { minHeight: "100%" }, children: t("viewpoint_no_preview") || "无预览" })
+              className: "ui-viewpoint-image",
+              onDoubleClick: () => onLoad(vp),
+              title: t("viewpoint_load") || "双击恢复视点",
+              children: [
+                vp.image ? /* @__PURE__ */ jsx(
+                  "img",
+                  {
+                    src: vp.image,
+                    alt: vp.name
+                  }
+                ) : /* @__PURE__ */ jsx("div", { className: "ui-viewpoint-no-preview", children: t("viewpoint_no_preview") || "无预览" }),
+                /* @__PURE__ */ jsx(
+                  "button",
+                  {
+                    className: "ui-viewpoint-delete",
+                    onClick: (e) => {
+                      e.stopPropagation();
+                      onDelete(vp.id);
+                    },
+                    title: t("delete_item") || "删除",
+                    children: /* @__PURE__ */ jsx(IconTrash2, { size: 12 })
+                  }
+                )
+              ]
             }
           ),
-          /* @__PURE__ */ jsxs("div", { className: "ui-viewpoint-main", children: [
-            /* @__PURE__ */ jsx(
-              "input",
-              {
-                className: "ui-input",
-                value: editingNames[vp.id] || "",
-                onChange: (e) => setEditingNames((prev) => ({
-                  ...prev,
-                  [vp.id]: e.target.value
-                })),
-                onBlur: () => handleRenameCommit(vp.id),
-                onKeyDown: (e) => {
-                  if (e.key === "Enter") {
-                    e.currentTarget.blur();
-                  }
+          /* @__PURE__ */ jsx(
+            "input",
+            {
+              className: "ui-viewpoint-name",
+              value: editingNames[vp.id] || "",
+              onChange: (e) => setEditingNames((prev) => ({
+                ...prev,
+                [vp.id]: e.target.value
+              })),
+              onBlur: () => handleRenameCommit(vp.id),
+              onKeyDown: (e) => {
+                if (e.key === "Enter") {
+                  e.currentTarget.blur();
                 }
               }
-            ),
-            /* @__PURE__ */ jsxs("div", { className: "ui-inline-actions ui-inline-actions-wrap", children: [
-              /* @__PURE__ */ jsx(Button, { variant: "default", onClick: () => onLoad(vp), children: t("viewpoint_load") || "恢复" }),
-              /* @__PURE__ */ jsx(Button, { variant: "ghost", onClick: () => onOverwrite(vp.id), children: t("viewpoint_overwrite") || "覆盖" }),
-              /* @__PURE__ */ jsx(Button, { variant: "ghost", onClick: () => onDelete(vp.id), children: t("delete_item") || "删除" })
-            ] })
-          ] })
+            }
+          )
         ] }, vp.id)) }) })
       ] })
     }
@@ -8364,7 +8547,7 @@ const timeToSlider = (time) => {
 };
 const SunPanel = ({ t, onClose, settings, onUpdate, theme }) => {
   const timeValue = timeToSlider(settings.sunTime !== void 0 ? settings.sunTime : 12);
-  return /* @__PURE__ */ jsx(FloatingPanel, { title: t("st_sun_simulation") || "光照模拟", onClose, width: 320, height: 350, resizable: false, theme, storageId: "tool_sun", children: /* @__PURE__ */ jsxs("div", { style: { padding: "16px", display: "flex", flexDirection: "column", height: "100%", overflowY: "auto" }, children: [
+  return /* @__PURE__ */ jsx(FloatingPanel, { title: t("st_sun_simulation") || "光照模拟", onClose, width: 320, resizable: false, theme, storageId: "tool_sun", children: /* @__PURE__ */ jsxs("div", { style: { padding: "16px", display: "flex", flexDirection: "column", height: "100%", overflowY: "auto" }, children: [
     /* @__PURE__ */ jsxs("div", { style: { marginBottom: 16, paddingBottom: 12, borderBottom: "1px solid var(--border-color)" }, children: [
       /* @__PURE__ */ jsx(
         Checkbox,
@@ -8380,53 +8563,31 @@ const SunPanel = ({ t, onClose, settings, onUpdate, theme }) => {
     settings.sunEnabled && /* @__PURE__ */ jsxs(Fragment, { children: [
       /* @__PURE__ */ jsx("div", { style: { marginBottom: 16 }, children: /* @__PURE__ */ jsxs("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6, fontSize: 12, color: "var(--text-secondary)" }, children: [
         /* @__PURE__ */ jsx("span", { children: t("st_sun_latitude") || "纬度" }),
-        /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", gap: 4 }, children: [
-          /* @__PURE__ */ jsx(
-            "input",
-            {
-              type: "number",
-              min: -90,
-              max: 90,
-              value: settings.sunLatitude || 0,
-              onChange: (e) => {
-                let val = parseFloat(e.target.value);
-                val = Math.max(-90, Math.min(90, val));
-                onUpdate({ sunLatitude: val });
-              },
-              className: "ui-input",
-              style: {
-                width: 70,
-                textAlign: "right"
-              }
-            }
-          ),
-          /* @__PURE__ */ jsx("span", { style: { color: "var(--text-secondary)" }, children: "°" })
-        ] })
+        /* @__PURE__ */ jsx(
+          InputNumber,
+          {
+            min: -90,
+            max: 90,
+            value: settings.sunLatitude || 0,
+            onChange: (val) => onUpdate({ sunLatitude: val }),
+            unit: "°",
+            style: { width: 80 }
+          }
+        )
       ] }) }),
       /* @__PURE__ */ jsx("div", { style: { marginBottom: 16 }, children: /* @__PURE__ */ jsxs("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6, fontSize: 12, color: "var(--text-secondary)" }, children: [
         /* @__PURE__ */ jsx("span", { children: t("st_sun_longitude") || "经度" }),
-        /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", gap: 4 }, children: [
-          /* @__PURE__ */ jsx(
-            "input",
-            {
-              type: "number",
-              min: -180,
-              max: 180,
-              value: settings.sunLongitude || 0,
-              onChange: (e) => {
-                let val = parseFloat(e.target.value);
-                val = Math.max(-180, Math.min(180, val));
-                onUpdate({ sunLongitude: val });
-              },
-              className: "ui-input",
-              style: {
-                width: 70,
-                textAlign: "right"
-              }
-            }
-          ),
-          /* @__PURE__ */ jsx("span", { style: { color: "var(--text-secondary)" }, children: "°" })
-        ] })
+        /* @__PURE__ */ jsx(
+          InputNumber,
+          {
+            min: -180,
+            max: 180,
+            value: settings.sunLongitude || 0,
+            onChange: (val) => onUpdate({ sunLongitude: val }),
+            unit: "°",
+            style: { width: 80 }
+          }
+        )
       ] }) }),
       /* @__PURE__ */ jsxs("div", { style: { marginBottom: 16 }, children: [
         /* @__PURE__ */ jsxs("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6, fontSize: 12, color: "var(--text-secondary)" }, children: [
@@ -8568,7 +8729,7 @@ const ExplodePanel = ({
                 onChange: (value) => onModeChange(value)
               }
             ) }),
-            /* @__PURE__ */ jsx("div", { style: { display: "flex", justifyContent: "flex-end", paddingTop: "4px" }, children: /* @__PURE__ */ jsx(Button, { variant: "ghost", className: "ui-properties-action", onClick: onReset, children: t("explode_reset") || "重置" }) })
+            /* @__PURE__ */ jsx("div", { style: { display: "flex", justifyContent: "flex-end", paddingTop: "4px" }, children: /* @__PURE__ */ jsx(Button, { className: "ui-properties-action", onClick: onReset, children: t("explode_reset") || "重置" }) })
           ]
         }
       )
@@ -8631,6 +8792,25 @@ const PropertiesPanel = ({ t, selectedProps }) => {
       setCopiedText(text);
       setTimeout(() => setCopiedText(null), 1500);
     } catch (e) {
+      try {
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.setAttribute("readonly", "true");
+        textarea.style.position = "fixed";
+        textarea.style.left = "-9999px";
+        textarea.style.top = "0";
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+        const copied = document.execCommand("copy");
+        document.body.removeChild(textarea);
+        if (copied) {
+          setCopiedText(text);
+          setTimeout(() => setCopiedText(null), 1500);
+          return;
+        }
+      } catch {
+      }
       console.error("Failed to copy", e);
     }
   };
@@ -8675,19 +8855,29 @@ const PropertiesPanel = ({ t, selectedProps }) => {
           (t("prop_items") || "条目") + `: ${itemCount}`
         ] }),
         /* @__PURE__ */ jsx("div", { className: "ui-properties-actions", children: /* @__PURE__ */ jsx(
-          Button,
+          "button",
           {
-            variant: "ghost",
             className: "ui-properties-action",
             onClick: () => currentGroups && handleCopy(serializeGroups(currentGroups)),
             disabled: !currentGroups,
-            children: t("copy_all_props") || "复制全部"
+            title: t("copy_all_props") || "复制全部",
+            style: {
+              background: "transparent",
+              border: "none",
+              color: "var(--text-secondary)",
+              cursor: "pointer",
+              padding: 0,
+              display: "flex",
+              alignItems: "center",
+              opacity: currentGroups ? 1 : 0.5
+            },
+            children: /* @__PURE__ */ jsx(IconCopy, { size: 14 })
           }
         ) })
       ] })
     ] }),
     /* @__PURE__ */ jsx("div", { className: "flex-1 overflow-y-auto", children: filteredProps ? Object.entries(filteredProps).map(([group, props]) => /* @__PURE__ */ jsxs("div", { children: [
-      /* @__PURE__ */ jsxs("div", { className: "ui-prop-group", onClick: () => toggleGroup(group), children: [
+      /* @__PURE__ */ jsxs("div", { className: `ui-prop-group${collapsed.has(group) ? " collapsed" : ""}`, onClick: () => toggleGroup(group), children: [
         /* @__PURE__ */ jsx("span", { children: group }),
         /* @__PURE__ */ jsxs("div", { className: "ui-prop-group-actions", children: [
           /* @__PURE__ */ jsx(
@@ -8700,10 +8890,11 @@ const PropertiesPanel = ({ t, selectedProps }) => {
                   [`[${group}]`, ...Object.entries(props).map(([k, v]) => `${k}: ${v}`)].join("\n")
                 );
               },
-              children: t("copy_group_props") || "复制组"
+              title: t("copy_group_props") || "复制组",
+              children: /* @__PURE__ */ jsx(IconCopy, { size: 12 })
             }
           ),
-          /* @__PURE__ */ jsx("span", { style: { opacity: 0.6, display: "flex", alignItems: "center" }, children: collapsed.has(group) ? /* @__PURE__ */ jsx(IconChevronRight, { width: 14, height: 14 }) : /* @__PURE__ */ jsx(IconChevronDown, { width: 14, height: 14 }) })
+          /* @__PURE__ */ jsx("span", { style: { opacity: 0.6, display: "flex", alignItems: "center", marginLeft: 4 }, children: collapsed.has(group) ? /* @__PURE__ */ jsx(IconChevronRight, { width: 14, height: 14 }) : /* @__PURE__ */ jsx(IconChevronDown, { width: 14, height: 14 }) })
         ] })
       ] }),
       !collapsed.has(group) && Object.entries(props).map(([k, v]) => /* @__PURE__ */ jsxs("div", { className: "ui-prop-row", children: [
@@ -8785,9 +8976,7 @@ const ConfirmModal = ({ isOpen, title, message, onConfirm, onCancel, t, theme })
                 style: {
                   display: "flex",
                   justifyContent: "flex-end",
-                  gap: "10px",
-                  borderTop: "1px solid var(--border-color)",
-                  paddingTop: "14px"
+                  gap: "10px"
                 },
                 children: [
                   /* @__PURE__ */ jsx(
@@ -8804,7 +8993,16 @@ const ConfirmModal = ({ isOpen, title, message, onConfirm, onCancel, t, theme })
                       className: "ui-btn ui-btn-danger w-[80px]",
                       style: { backgroundColor: "var(--error)", borderColor: "var(--error)", color: "white" },
                       onClick: onConfirm,
-                      children: t("btn_confirm")
+                      children: (() => {
+                        const text = t("btn_confirm").trim();
+                        if (text.toLowerCase() === "confirm") {
+                          return "Confirm";
+                        }
+                        if (text === "确定" || text === "确认") {
+                          return text;
+                        }
+                        return text || (t("confirm") || "Confirm");
+                      })()
                     }
                   )
                 ]
@@ -9215,6 +9413,368 @@ function usePersistentState(key, initialValue, options = {}) {
   return [state, setState];
 }
 
+function useChunkProgress({
+  fileSetIdRef,
+  completedFileSetsRef,
+  onProgress,
+  onCompleted
+}) {
+  const chunkProgressRafRef = useRef(null);
+  const pendingChunkProgressRef = useRef(null);
+  const flushChunkProgress = useCallback(() => {
+    chunkProgressRafRef.current = null;
+    const pending = pendingChunkProgressRef.current;
+    if (!pending) return;
+    pendingChunkProgressRef.current = null;
+    const { loaded, total } = pending;
+    onProgress((prev) => {
+      if (prev.loaded === loaded && prev.total === total) return prev;
+      return { loaded, total };
+    });
+    const fileSetId = fileSetIdRef.current;
+    if (loaded === total && total > 0 && fileSetId) {
+      if (!completedFileSetsRef.current.has(fileSetId)) {
+        completedFileSetsRef.current.add(fileSetId);
+        onCompleted();
+      }
+    }
+  }, [completedFileSetsRef, fileSetIdRef, onCompleted, onProgress]);
+  const onManagerChunkProgress = useCallback((loaded, total) => {
+    pendingChunkProgressRef.current = { loaded, total };
+    if (chunkProgressRafRef.current === null) {
+      chunkProgressRafRef.current = requestAnimationFrame(flushChunkProgress);
+    }
+  }, [flushChunkProgress]);
+  useEffect(() => {
+    return () => {
+      if (chunkProgressRafRef.current !== null) {
+        cancelAnimationFrame(chunkProgressRafRef.current);
+        chunkProgressRafRef.current = null;
+      }
+      pendingChunkProgressRef.current = null;
+    };
+  }, []);
+  return { onManagerChunkProgress };
+}
+
+function normalizePath(path) {
+  return path.replace(/\\/g, "/").replace(/^(\.\/)+/, "").replace(/^\/+/, "").toLowerCase();
+}
+function candidateKeys(input) {
+  const normalized = normalizePath(input);
+  const parts = normalized.split("/");
+  const fileName = parts[parts.length - 1];
+  return Array.from(/* @__PURE__ */ new Set([
+    normalized,
+    fileName,
+    `./${normalized}`,
+    `./${fileName}`
+  ]));
+}
+function createResourceResolver(files) {
+  const localFiles = files.filter((item) => item instanceof File);
+  if (localFiles.length === 0) return null;
+  const blobUrlMap = /* @__PURE__ */ new Map();
+  const register = (key, file) => {
+    if (!key || blobUrlMap.has(key)) return;
+    blobUrlMap.set(key, URL.createObjectURL(file));
+  };
+  localFiles.forEach((file) => {
+    register(normalizePath(file.name), file);
+    const relativePath = file.webkitRelativePath;
+    if (relativePath) {
+      const trimmed = relativePath.split("/").slice(1).join("/");
+      register(normalizePath(trimmed), file);
+    }
+  });
+  return {
+    resolve: (url) => {
+      if (!url || /^(blob:|data:|https?:)/i.test(url)) return url;
+      for (const key of candidateKeys(url)) {
+        const resolved = blobUrlMap.get(key);
+        if (resolved) return resolved;
+      }
+      return url;
+    },
+    has: (url) => candidateKeys(url).some((key) => blobUrlMap.has(key)),
+    dispose: () => {
+      blobUrlMap.forEach((blobUrl) => URL.revokeObjectURL(blobUrl));
+      blobUrlMap.clear();
+    }
+  };
+}
+
+const STAGE_LABELS = {
+  fetch: "reading",
+  parse: "analyzing",
+  normalize: "processing",
+  optimize: "processing",
+  addToScene: "processing"
+};
+const STAGE_WEIGHTS = {
+  fetch: [0, 20],
+  parse: [20, 58],
+  normalize: [58, 72],
+  optimize: [72, 92],
+  addToScene: [92, 100]
+};
+const libPathCache = /* @__PURE__ */ new Map();
+function normalizeLibPath(libPath) {
+  if (!libPathCache.has(libPath)) {
+    const trimmed = libPath.replace(/\/$/, "");
+    const resolved = typeof window !== "undefined" ? new URL(trimmed ? `${trimmed}/` : "./", window.location.href).toString().replace(/\/$/, "") : trimmed;
+    libPathCache.set(libPath, resolved);
+  }
+  return libPathCache.get(libPath);
+}
+function createLoadingManager(files, _libPath, _settings) {
+  const resourceResolver = createResourceResolver(files);
+  const manager = new THREE.LoadingManager();
+  if (resourceResolver) {
+    manager.setURLModifier((url) => resourceResolver.resolve(url));
+  }
+  const cleanup = () => {
+    resourceResolver?.dispose();
+  };
+  return { manager, cleanup, resourceResolver };
+}
+async function createGltfLoaderRuntime(manager, libPath) {
+  const [
+    { GLTFLoader },
+    { DRACOLoader },
+    { KTX2Loader },
+    { MeshoptDecoder }
+  ] = await Promise.all([
+    import('./loaders-TXHpcosE.js').then(n => n.a),
+    import('./loaders-TXHpcosE.js').then(n => n.D),
+    import('./loaders-TXHpcosE.js').then(n => n.K),
+    import('./meshopt_decoder.module-C_9D6xwu.js')
+  ]);
+  const normalizedLibPath = normalizeLibPath(libPath);
+  const supportsCompressedTextures = typeof window !== "undefined" && !!window.createImageBitmap;
+  let probeRenderer = null;
+  const dracoLoader = new DRACOLoader(manager);
+  dracoLoader.setDecoderPath(`${normalizedLibPath}/draco/gltf/`);
+  const ktx2Loader = new KTX2Loader(manager);
+  ktx2Loader.setTranscoderPath(`${normalizedLibPath}/basis/`);
+  if (typeof document !== "undefined") {
+    try {
+      probeRenderer = new THREE.WebGLRenderer({ canvas: document.createElement("canvas") });
+      ktx2Loader.detectSupport(probeRenderer);
+    } catch (error) {
+      console.warn("[LoaderUtils] KTX2 detectSupport failed", error);
+    }
+  }
+  const loader = new GLTFLoader(manager);
+  loader.setDRACOLoader(dracoLoader);
+  loader.setMeshoptDecoder(MeshoptDecoder);
+  if (supportsCompressedTextures) {
+    loader.setKTX2Loader(ktx2Loader);
+  }
+  return {
+    loader,
+    cleanup: () => {
+      dracoLoader.dispose();
+      ktx2Loader.dispose();
+      probeRenderer?.dispose();
+    }
+  };
+}
+function createStageProgressReporter(onProgress, t, fileName, fileBaseProgress, fileWeight) {
+  return (stage, progress, msg) => {
+    const [start, end] = STAGE_WEIGHTS[stage];
+    const safeP = Math.min(100, Math.max(0, Number.isFinite(progress) ? progress : 0));
+    const stagePercent = start + safeP / 100 * (end - start);
+    const totalPercent = fileBaseProgress + stagePercent / 100 * fileWeight;
+    const label = msg || `${t(STAGE_LABELS[stage])} ${fileName}`;
+    onProgress(Math.round(totalPercent), label);
+  };
+}
+async function loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t, settings, libPath) {
+  const loaderContext = createLoadingManager(files);
+  const { manager, cleanup, resourceResolver } = loaderContext;
+  try {
+    if (ext === "lmb") {
+      const { LMBLoader } = await import('./lmbLoader-DKeiizRf.js');
+      const loader = new LMBLoader();
+      reportStage("parse", 0);
+      return await loader.loadAsync(url, (p) => reportStage("parse", p * 100));
+    }
+    if (ext === "glb" || ext === "gltf") {
+      const { loader, cleanup: cleanupGltf } = await createGltfLoaderRuntime(manager, libPath);
+      reportStage("parse", 0);
+      try {
+        const gltf = await new Promise((resolve, reject) => {
+          loader.load(
+            url,
+            resolve,
+            (e) => {
+              if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
+              else reportStage("parse", 50);
+            },
+            reject
+          );
+        });
+        return gltf.scene;
+      } finally {
+        cleanupGltf();
+      }
+    }
+    if (ext === "fbx") {
+      const { FBXLoader } = await import('./loaders-TXHpcosE.js').then(n => n.F);
+      const loader = new FBXLoader(manager);
+      reportStage("parse", 0);
+      return await new Promise((resolve, reject) => {
+        loader.load(
+          url,
+          resolve,
+          (e) => {
+            if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
+            else reportStage("parse", 50);
+          },
+          reject
+        );
+      });
+    }
+    if (ext === "ifc") {
+      const { loadIFC } = await import('./IFCLoader-BghtoYiB.js');
+      reportStage("parse", 0);
+      return await loadIFC(
+        typeof fileOrUrl === "string" ? url : fileOrUrl,
+        (p, msg) => reportStage("parse", p, msg),
+        t,
+        libPath,
+        settings
+      );
+    }
+    if (ext === "obj") {
+      const [{ OBJLoader }, { MTLLoader }] = await Promise.all([
+        import('./loaders-TXHpcosE.js').then(n => n.b),
+        import('./loaders-TXHpcosE.js').then(n => n.M)
+      ]);
+      const objLoader = new OBJLoader(manager);
+      const mtlName = url.replace(/\.[^.]+$/i, ".mtl");
+      if (resourceResolver?.has(mtlName)) {
+        try {
+          const materials = await new Promise((resolve, reject) => {
+            const mtlLoader = new MTLLoader(manager);
+            mtlLoader.load(mtlName, resolve, void 0, reject);
+          });
+          materials.preload();
+          objLoader.setMaterials(materials);
+        } catch (error) {
+          console.warn("[LoaderUtils] Failed to load companion MTL", error);
+        }
+      }
+      reportStage("parse", 0);
+      return await objLoader.loadAsync(url, (e) => {
+        if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
+        else reportStage("parse", 50);
+      });
+    }
+    if (ext === "stl") {
+      const { STLLoader } = await import('./loaders-TXHpcosE.js').then(n => n.S);
+      const loader = new STLLoader(manager);
+      reportStage("parse", 0);
+      const geometry = await loader.loadAsync(url, (e) => {
+        if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
+      });
+      return new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color: 8947848 }));
+    }
+    if (ext === "ply") {
+      const { PLYLoader } = await import('./loaders-TXHpcosE.js').then(n => n.P);
+      const loader = new PLYLoader(manager);
+      reportStage("parse", 0);
+      const geometry = await loader.loadAsync(url, (e) => {
+        if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
+      });
+      return new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({
+        color: 8947848,
+        vertexColors: geometry.hasAttribute("color")
+      }));
+    }
+    if (ext === "3mf") {
+      const { ThreeMFLoader } = await import('./loaders-TXHpcosE.js').then(n => n._);
+      const loader = new ThreeMFLoader(manager);
+      reportStage("parse", 0);
+      return await loader.loadAsync(url, (e) => {
+        if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
+      });
+    }
+    if (ext === "stp" || ext === "step" || ext === "igs" || ext === "iges") {
+      reportStage("fetch", 0);
+      const buffer = typeof fileOrUrl === "string" ? await fetch(url).then((r) => r.arrayBuffer()) : await fileOrUrl.arrayBuffer();
+      const normalizedLibPath = normalizeLibPath(libPath);
+      const wasmUrl = `${normalizedLibPath}/occt-import-js/occt-import-js.wasm`;
+      const { OCCTLoader } = await import('./OCCTLoader-CiM09x_z.js');
+      const loader = new OCCTLoader(wasmUrl);
+      reportStage("parse", 0);
+      return await loader.load(buffer, t, (p, msg) => reportStage("parse", p, msg));
+    }
+    return null;
+  } finally {
+    cleanup();
+  }
+}
+function normalizeLoadedObject(object, settings) {
+  object.traverse((child) => {
+    if (child.isMesh) {
+      const mesh = child;
+      mesh.frustumCulled = settings.frustumCulling ?? true;
+      if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+      if (!mesh.geometry.boundingSphere) mesh.geometry.computeBoundingSphere();
+      const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      materials.forEach((material) => {
+        if (!material) return;
+        if ("wireframe" in material) {
+          material.wireframe = false;
+        }
+      });
+    }
+  });
+}
+const loadModelFiles = async (files, onProgress, t, settings, libPath = "./libs") => {
+  const loadedObjects = [];
+  const totalFiles = files.length;
+  for (let i = 0; i < totalFiles; i++) {
+    const fileOrUrl = files[i];
+    const isUrl = typeof fileOrUrl === "string";
+    let fileName = "";
+    let ext = "";
+    let url = "";
+    if (isUrl) {
+      url = fileOrUrl;
+      const urlPath = url.split("?")[0].split("#")[0];
+      fileName = urlPath.split("/").pop() || "model";
+      ext = fileName.split(".").pop()?.toLowerCase() || "";
+    } else {
+      fileName = fileOrUrl.name;
+      ext = fileName.split(".").pop()?.toLowerCase() || "";
+      url = URL.createObjectURL(fileOrUrl);
+    }
+    const fileBaseProgress = i / totalFiles * 100;
+    const fileWeight = 100 / totalFiles;
+    const reportStage = createStageProgressReporter(onProgress, t, fileName, fileBaseProgress, fileWeight);
+    try {
+      reportStage("fetch", 5);
+      const object = await loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t, settings, libPath);
+      if (!object) continue;
+      object.name = fileName;
+      reportStage("normalize", 30, `${t("processing")} ${fileName}`);
+      normalizeLoadedObject(object, settings);
+      reportStage("optimize", 100, `${t("analyzing")} ${fileName}`);
+      reportStage("addToScene", 100, `${t("success")} ${fileName}`);
+      loadedObjects.push(object);
+    } catch (error) {
+      console.error(`加载 ${fileName} 失败`, error);
+    } finally {
+      if (!isUrl) URL.revokeObjectURL(url);
+    }
+  }
+  onProgress(100, t("analyzing"));
+  return loadedObjects;
+};
+
 function cleanLoadingStatus(message) {
   if (!message) return "";
   return message.replace(/:\s*\d+%/g, "").replace(/\(\d+%\)/g, "").replace(/\d+%/g, "").trim();
@@ -9277,6 +9837,91 @@ async function loadSceneItems({
   }
 }
 
+function useFileLoadingFlow({
+  managerRef,
+  sceneSettings,
+  libPath,
+  t,
+  setCurrentFileSetId,
+  setLoading,
+  setStatus,
+  setProgress,
+  setToast,
+  updateTree
+}) {
+  const loadItemsIntoScene = useCallback(async (items) => {
+    if (!items.length || !managerRef.current) return;
+    await loadSceneItems({
+      items,
+      manager: managerRef.current,
+      sceneSettings,
+      libPath,
+      t,
+      onProgress: (p, msg) => {
+        setProgress(p);
+        if (msg) setStatus(cleanLoadingStatus(msg));
+      }
+    });
+  }, [libPath, managerRef, sceneSettings, setProgress, setStatus, t]);
+  const processFiles = useCallback(async (items) => {
+    if (!items.length || !managerRef.current) return;
+    const setId = createFileSetId(items);
+    setCurrentFileSetId(setId);
+    managerRef.current.setChunkLoadingEnabled?.(true);
+    managerRef.current.setContentVisible?.(true);
+    setLoading(true);
+    setStatus(t("loading"));
+    setProgress(0);
+    try {
+      await loadItemsIntoScene(items);
+      updateTree();
+      setStatus(t("success"));
+      managerRef.current?.fitView(false);
+    } catch (err) {
+      setStatus(t("failed"));
+      setToast({ message: `${t("failed")}: ${err.message}`, type: "error" });
+    } finally {
+      setLoading(false);
+    }
+  }, [loadItemsIntoScene, managerRef, setCurrentFileSetId, setLoading, setProgress, setStatus, setToast, t, updateTree]);
+  return {
+    processFiles,
+    loadItemsIntoScene
+  };
+}
+
+function toggleUuidSelection(current, uuid) {
+  return current.includes(uuid) ? current.filter((id) => id !== uuid) : [...current, uuid];
+}
+function getLastSelectedUuid(current) {
+  return current.length > 0 ? current[current.length - 1] : null;
+}
+
+function useSceneSelection() {
+  const [selectedUuids, setSelectedUuids] = useState([]);
+  const selectedUuid = useMemo(
+    () => getLastSelectedUuid(selectedUuids),
+    [selectedUuids]
+  );
+  const clearSelection = useCallback(() => {
+    setSelectedUuids([]);
+  }, []);
+  const setSingleSelection = useCallback((uuid) => {
+    setSelectedUuids([uuid]);
+  }, []);
+  const toggleSelection = useCallback((uuid) => {
+    setSelectedUuids((prev) => toggleUuidSelection(prev, uuid));
+  }, []);
+  return {
+    selectedUuids,
+    selectedUuid,
+    setSelectedUuids,
+    clearSelection,
+    setSingleSelection,
+    toggleSelection
+  };
+}
+
 function buildSelectedPropertyGroups({
   basicLabel,
   geoLabel,
@@ -9299,6 +9944,7 @@ function buildSelectedPropertyGroups({
   return groups;
 }
 
+const IS_DEV = typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
 const ThreeViewer = ({
   allowDragOpen = true,
   hiddenMenus = [],
@@ -9312,7 +9958,9 @@ const ThreeViewer = ({
   initialFiles,
   onSelect: propOnSelect,
   onLoad,
-  hideDeleteModel = false
+  hideDeleteModel = false,
+  performancePreset = "balanced",
+  chunkOptions
 }) => {
   const sceneBgFollowsTheme = initialSettings?.bgColor === void 0;
   const [themeMode, setThemeMode] = usePersistentState(
@@ -9339,9 +9987,34 @@ const ThreeViewer = ({
       setLang(defaultLang);
     }
   }, [defaultLang, lang, setLang]);
+  useEffect(() => {
+    const preventDefault = (event) => {
+      event.preventDefault();
+    };
+    const preventBrowserNavigation = (event) => {
+      if (event.button === 3 || event.button === 4) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    };
+    document.addEventListener("contextmenu", preventDefault, { capture: true });
+    document.addEventListener("gesturestart", preventDefault, { capture: true });
+    window.addEventListener("auxclick", preventDefault, { capture: true });
+    window.addEventListener("mousedown", preventBrowserNavigation, { capture: true });
+    return () => {
+      document.removeEventListener("contextmenu", preventDefault, { capture: true });
+      document.removeEventListener("gesturestart", preventDefault, { capture: true });
+      window.removeEventListener("auxclick", preventDefault, { capture: true });
+      window.removeEventListener("mousedown", preventBrowserNavigation, { capture: true });
+    };
+  }, []);
   const [treeRoot, setTreeRoot] = useState([]);
-  const [selectedUuids, setSelectedUuids] = useState([]);
-  const selectedUuid = selectedUuids.length > 0 ? selectedUuids[selectedUuids.length - 1] : null;
+  const {
+    selectedUuids,
+    selectedUuid,
+    setSelectedUuids,
+    clearSelection
+  } = useSceneSelection();
   const [locatedUuid, setLocatedUuid] = useState(null);
   const [locateResultUuids, setLocateResultUuids] = useState([]);
   const [selectedProps, setSelectedProps] = useState(null);
@@ -9355,7 +10028,6 @@ const ThreeViewer = ({
     memory: 0,
     textureMemory: 0,
     drawCalls: 0,
-    fps: 0,
     chunksLoaded: 0,
     chunksTotal: 0,
     chunksQueued: 0,
@@ -9421,7 +10093,6 @@ const ThreeViewer = ({
       toneMapping: "aces",
       exposure: 1,
       shadowQuality: "medium",
-      ifcGridVisible: true,
       adaptiveQuality: true,
       minPixelRatio: 0.8,
       maxPixelRatio: 2,
@@ -9506,14 +10177,36 @@ const ThreeViewer = ({
       });
     }
   }, [clipHelperVisible, clipHelperOpacity, setClipHelperOpacity]);
+  useEffect(() => {
+    const manager = sceneMgr.current;
+    if (!manager) return;
+    manager.setChunkOptions(chunkOptions || {});
+    manager.updateSettings({
+      ...sceneSettings,
+      performanceMode: performancePreset,
+      targetFps: chunkOptions?.targetMinFps ?? sceneSettings.targetFps
+    });
+  }, [chunkOptions, performancePreset, sceneSettings]);
   const hasModels = treeRoot.length > 0;
   const completedFileSetsRef = useRef(/* @__PURE__ */ new Set());
+  const currentFileSetIdRef = useRef("");
+  useEffect(() => {
+    currentFileSetIdRef.current = currentFileSetId;
+  }, [currentFileSetId]);
   const [errorState, setErrorState] = useState({ isOpen: false, title: "", message: "" });
   const [toast, setToast] = useState(null);
+  const { onManagerChunkProgress } = useChunkProgress({
+    fileSetIdRef: currentFileSetIdRef,
+    completedFileSetsRef,
+    onProgress: setChunkProgress,
+    onCompleted: () => {
+      setToast({ message: t("all_chunks_loaded"), type: "success" });
+      setChunkProgress({ loaded: 0, total: 0 });
+    }
+  });
   const [contextMenu, setContextMenu] = useState({ x: 0, y: 0, visible: false });
   const [hiddenUuids, setHiddenUuids] = useState(/* @__PURE__ */ new Set());
   const [isolatedUuids, setIsolatedUuids] = useState(/* @__PURE__ */ new Set());
-  const [ifcGridDiagnostics, setIfcGridDiagnostics] = useState([]);
   const [contextMenuOpacity, setContextMenuOpacity] = useState(1);
   const visibilityStackRef = useRef([]);
   const handleHideSelected = useCallback(() => {
@@ -9653,13 +10346,19 @@ const ThreeViewer = ({
     let image = "";
     try {
       sceneMgr.current.renderer.render(sceneMgr.current.scene, sceneMgr.current.camera);
+      const srcCanvas = sceneMgr.current.canvas;
+      const srcWidth = srcCanvas.width;
+      const srcHeight = srcCanvas.height;
+      const scale = Math.min(640 / srcWidth, 360 / srcHeight);
+      const dstWidth = Math.round(srcWidth * scale);
+      const dstHeight = Math.round(srcHeight * scale);
       const tempCanvas = document.createElement("canvas");
-      tempCanvas.width = 64;
-      tempCanvas.height = 48;
+      tempCanvas.width = dstWidth;
+      tempCanvas.height = dstHeight;
       const ctx = tempCanvas.getContext("2d");
       if (ctx) {
-        ctx.drawImage(sceneMgr.current.canvas, 0, 0, 64, 48);
-        image = tempCanvas.toDataURL("image/jpeg", 0.7);
+        ctx.drawImage(srcCanvas, 0, 0, dstWidth, dstHeight);
+        image = tempCanvas.toDataURL("image/jpeg", 0.92);
       }
     } catch (e) {
       console.error("Failed to capture thumbnail", e);
@@ -9854,19 +10553,6 @@ const ThreeViewer = ({
       });
       return roots;
     });
-    const diagnostics = /* @__PURE__ */ new Map();
-    sceneMgr.current.contentGroup.children.forEach((child) => {
-      const items = child.userData?.ifcGridDiagnostics;
-      if (Array.isArray(items)) {
-        items.forEach((item) => {
-          if (!item) return;
-          diagnostics.set(item, (diagnostics.get(item) || 0) + 1);
-        });
-      }
-    });
-    setIfcGridDiagnostics(
-      Array.from(diagnostics.entries()).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], "zh-Hans-CN")).map(([name, count]) => `${name} x${count}`)
-    );
   }, []);
   useCallback((expanded) => {
     const update = (nodes) => {
@@ -10026,21 +10712,17 @@ const ThreeViewer = ({
       });
     }
   };
-  const handleFocusObject = (obj) => {
-    if (!sceneMgr.current || !obj) return;
-    const uuid = obj.uuid || obj.id;
-    if (!uuid) return;
-    sceneMgr.current.fitViewToObject(uuid);
-    void handleSelect(obj);
-  };
   const handleClearSelection = () => {
-    setSelectedUuids([]);
+    clearSelection();
     setSelectedIfcStorey("");
     sceneMgr.current?.highlightObjects([]);
   };
   useEffect(() => {
     if (!canvasRef.current) return;
-    const manager = new SceneManager(canvasRef.current);
+    const manager = new SceneManager(canvasRef.current, {
+      performancePreset,
+      chunkOptions
+    });
     sceneMgr.current = manager;
     setMgrInstance(manager);
     if (onLoad) onLoad(manager);
@@ -10052,28 +10734,12 @@ const ThreeViewer = ({
     requestAnimationFrame(() => {
       manager.resize();
     });
-    manager.onChunkProgress = (loaded, total) => {
-      setChunkProgress({ loaded, total });
-      if (loaded === total && total > 0 && currentFileSetId) {
-        if (!completedFileSetsRef.current.has(currentFileSetId)) {
-          setToast({ message: t("all_chunks_loaded"), type: "success" });
-          completedFileSetsRef.current.add(currentFileSetId);
-          setChunkProgress({ loaded: 0, total: 0 });
-        }
-      }
-    };
+    manager.onChunkProgress = onManagerChunkProgress;
     manager.onMeasureUpdate = (records) => {
       setMeasureHistory(records.map((r) => ({ id: r.id, type: r.type, val: r.val })));
     };
     manager.onStructureUpdate = () => {
       updateTree();
-    };
-    let debounceTimer;
-    manager.onTilesUpdate = () => {
-      if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(() => {
-        updateTree();
-      }, 500);
     };
     return () => {
       manager.dispose();
@@ -10098,29 +10764,7 @@ const ThreeViewer = ({
     const loadInitial = async () => {
       const itemsToProcess = Array.isArray(initialFiles) ? initialFiles : [initialFiles];
       console.log("[ThreeViewer] loadInitial with items:", itemsToProcess);
-      const modelItems = [];
-      for (const item of itemsToProcess) {
-        if (typeof item === "string") {
-          const urlPath = item.split("?")[0].split("#")[0];
-          if (urlPath.toLowerCase().endsWith(".json") || urlPath.includes("tileset")) {
-            console.log("[ThreeViewer] Initial URL detected as 3D Tiles:", item);
-            mgrInstance.addTileset(item, (p, msg) => {
-              setProgress(p);
-              if (msg) setStatus(cleanLoadingStatus(msg));
-            });
-            updateTree();
-            setStatus(t("tileset_loaded"));
-            setTimeout(() => mgrInstance?.fitView(false), 500);
-          } else {
-            modelItems.push(item);
-          }
-        } else {
-          modelItems.push(item);
-        }
-      }
-      if (modelItems.length > 0) {
-        await processFiles(modelItems);
-      }
+      await processFiles(itemsToProcess);
     };
     loadInitial();
   }, [mgrInstance, initialFiles]);
@@ -10369,7 +11013,8 @@ const ThreeViewer = ({
       sceneMgr.current.highlightObjects([]);
       return;
     }
-    const uuid = obj.uuid || obj.id;
+    const rawUuid = obj.uuid || obj.id;
+    const uuid = sceneMgr.current ? sceneMgr.current.resolveSelectionUuid(rawUuid) : rawUuid;
     if (!uuid) return;
     const nextUuids = isMultiSelect ? selectedUuids.includes(uuid) ? selectedUuids.filter((id) => id !== uuid) : [...selectedUuids, uuid] : [uuid];
     setSelectedUuids(nextUuids);
@@ -10409,9 +11054,9 @@ const ThreeViewer = ({
     const basicProps = {};
     const geoProps = {};
     let ifcGroups = null;
-    basicProps[t("prop_name")] = target.name || "Unnamed";
+    const wrappedId = sceneMgr.current?.getBimIdByUuid(focusUuid) || focusUuid;
+    basicProps[t("prop_id")] = wrappedId;
     basicProps[t("prop_type")] = target.type || (target.children ? "Group" : "Mesh");
-    basicProps[t("prop_id")] = focusUuid;
     if (typeof targetElevation === "number" && Number.isFinite(targetElevation)) {
       basicProps[t("prop_storey_elevation") || "楼层标高"] = String(targetElevation);
     }
@@ -10490,6 +11135,18 @@ const ThreeViewer = ({
     }
     const nbimProps = sceneMgr.current.getNbimProperties(focusUuid);
     const nbimIfcGroups = sceneMgr.current.getNbimIfcPropertyGroups(focusUuid, "raw");
+    if (IS_DEV && nbimProps && Object.keys(nbimProps).length > 0) {
+      console.group(`NBIM 选中属性: ${focusUuid}`);
+      console.log(nbimProps);
+      console.log(JSON.stringify(nbimProps, null, 2));
+      console.groupEnd();
+    }
+    if (IS_DEV && nbimIfcGroups) {
+      console.group(`NBIM IFC 组属性: ${focusUuid}`);
+      console.log(nbimIfcGroups);
+      console.log(JSON.stringify(nbimIfcGroups, null, 2));
+      console.groupEnd();
+    }
     const mergedIfcGroups = ifcGroups || nbimIfcGroups || null;
     const selectedGroups = buildSelectedPropertyGroups({
       basicLabel: t("pg_basic"),
@@ -10506,12 +11163,14 @@ const ThreeViewer = ({
     const uuid = obj.uuid || obj.id;
     if (!uuid) return;
     setLocatedUuid(uuid);
-    const resultSet = locateResultUuids.length > 0 ? locateResultUuids : [uuid];
-    sceneMgr.current.setLocateResultSet(resultSet, uuid);
-    sceneMgr.current.highlightObject(uuid);
+    sceneMgr.current.clearLocateFocus();
+    sceneMgr.current.isolateObjects([uuid]);
+    setHiddenUuids(/* @__PURE__ */ new Set());
+    setIsolatedUuids(/* @__PURE__ */ new Set([uuid]));
+    updateTree();
     sceneMgr.current.fitViewToObject(uuid);
     void handleSelect(obj);
-  }, [handleSelect, locateResultUuids]);
+  }, [handleSelect, updateTree]);
   const handleLocateResultsChange = useCallback((uuids) => {
     setLocateResultUuids((prev) => {
       if (prev.length === uuids.length && prev.every((uuid, index) => uuid === uuids[index])) {
@@ -10522,60 +11181,34 @@ const ThreeViewer = ({
     if (!sceneMgr.current) return;
     if (uuids.length === 0) {
       sceneMgr.current.clearLocateFocus();
-      if (hiddenUuids.size === 0 && isolatedUuids.size === 0) {
-        sceneMgr.current.setAllVisibility(true);
-        updateTree();
-      }
+      sceneMgr.current.setAllVisibility(true);
+      setHiddenUuids(/* @__PURE__ */ new Set());
+      setIsolatedUuids(/* @__PURE__ */ new Set());
+      updateTree();
     }
-  }, [hiddenUuids.size, isolatedUuids.size, updateTree]);
+  }, [updateTree]);
   const handleClearLocate = useCallback(() => {
     setLocatedUuid(null);
     setLocateResultUuids([]);
     sceneMgr.current?.clearLocateFocus();
+    sceneMgr.current?.setAllVisibility(true);
+    setHiddenUuids(/* @__PURE__ */ new Set());
+    setIsolatedUuids(/* @__PURE__ */ new Set());
     sceneMgr.current?.highlightObjects(selectedUuids);
-    if (hiddenUuids.size === 0 && isolatedUuids.size === 0) {
-      sceneMgr.current?.setAllVisibility(true);
-      updateTree();
-    }
-  }, [hiddenUuids, isolatedUuids, selectedUuids, updateTree]);
-  const processFiles = async (items) => {
-    if (!items.length || !sceneMgr.current) return;
-    const setId = createFileSetId(items);
-    setCurrentFileSetId(setId);
-    console.log("[ThreeViewer] processFiles called with", items.length, "items");
-    sceneMgr.current.setChunkLoadingEnabled?.(true);
-    sceneMgr.current.setContentVisible?.(true);
-    setLoading(true);
-    setStatus(t("loading"));
-    setProgress(0);
-    try {
-      await loadItemsIntoScene(items);
-      updateTree();
-      setStatus(t("success"));
-      console.log("[ThreeViewer] processFiles completed successfully");
-      sceneMgr.current?.fitView(false);
-    } catch (err) {
-      console.error("[ThreeViewer] processFiles error:", err);
-      setStatus(t("failed"));
-      setToast({ message: `${t("failed")}: ${err.message}`, type: "error" });
-    } finally {
-      setLoading(false);
-    }
-  };
-  const loadItemsIntoScene = async (items) => {
-    if (!items.length || !sceneMgr.current) return;
-    await loadSceneItems({
-      items,
-      manager: sceneMgr.current,
-      sceneSettings,
-      libPath,
-      t,
-      onProgress: (p, msg) => {
-        setProgress(p);
-        if (msg) setStatus(cleanLoadingStatus(msg));
-      }
-    });
-  };
+    updateTree();
+  }, [selectedUuids, updateTree]);
+  const { processFiles, loadItemsIntoScene } = useFileLoadingFlow({
+    managerRef: sceneMgr,
+    sceneSettings,
+    libPath,
+    t,
+    setCurrentFileSetId,
+    setLoading,
+    setStatus,
+    setProgress,
+    setToast,
+    updateTree
+  });
   const handleOpenFiles = async (e) => {
     if (!e.target.files?.length) return;
     await processFiles(Array.from(e.target.files));
@@ -10626,26 +11259,11 @@ const ThreeViewer = ({
   const handleOpenUrl = async () => {
     const url = window.prompt(t("menu_open_url"), "http://");
     if (!url || !url.startsWith("http")) return;
-    console.log("[ThreeViewer] handleOpenUrl called with:", url);
+    if (IS_DEV) console.log("[ThreeViewer] handleOpenUrl called with:", url);
     setLoading(true);
     setStatus(t("processing") + "...");
     try {
-      const urlPath = url.split("?")[0].split("#")[0];
-      console.log("[ThreeViewer] Parsed path:", urlPath);
-      if (urlPath.toLowerCase().endsWith(".json") || urlPath.includes("tileset")) {
-        console.log("[ThreeViewer] Detected as 3D Tiles");
-        if (sceneMgr.current) {
-          sceneMgr.current.addTileset(url, (p, msg) => {
-            setProgress(p);
-            if (msg) setStatus(cleanLoadingStatus(msg));
-          });
-          updateTree();
-          setStatus(t("tileset_loaded"));
-          sceneMgr.current?.fitView(false);
-        }
-      } else {
-        await processFiles([url]);
-      }
+      await processFiles([url]);
     } catch (err) {
       console.error("[ThreeViewer] handleOpenUrl error:", err);
       setStatus(t("failed"));
@@ -10676,35 +11294,6 @@ const ThreeViewer = ({
       }
     }
   };
-  const handleOpenFolder = async (e) => {
-    if (!e.target.files?.length || !sceneMgr.current) return;
-    setLoading(true);
-    setProgress(0);
-    try {
-      const url = await parseTilesetFromFolder(
-        e.target.files,
-        (p, msg) => {
-          setProgress(p);
-          if (msg) setStatus(cleanLoadingStatus(msg));
-        },
-        t
-      );
-      if (url) {
-        sceneMgr.current.addTileset(url, (p, msg) => {
-          setProgress(p);
-          if (msg) setStatus(cleanLoadingStatus(msg));
-        });
-        updateTree();
-        setStatus(t("tileset_loaded"));
-        sceneMgr.current?.fitView(false);
-      }
-    } catch (err) {
-      console.error(err);
-      setStatus(t("failed") + ": " + err.message);
-    } finally {
-      setLoading(false);
-    }
-  };
   const stripFileExtension = (name) => name.replace(/\.[^./\\]+$/, "");
   const sanitizeFileStem = (name) => {
     const sanitized = name.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, " ").trim();
@@ -10716,7 +11305,7 @@ const ThreeViewer = ({
     const names = [];
     content.children.forEach((child) => {
       if (child.userData?.isOptimizedGroup) return;
-      if (child.name === "TilesRenderer" || child.name.startsWith("optimized_")) return;
+      if (child.name.startsWith("optimized_")) return;
       const rawName = (typeof child.userData?.modelName === "string" ? child.userData.modelName : "") || (child.children?.[0]?.name || "") || child.name;
       const baseName = sanitizeFileStem(stripFileExtension(rawName));
       names.push(baseName);
@@ -10736,7 +11325,7 @@ const ThreeViewer = ({
   const resolveExportFilename = (format, requestedName) => {
     const fallback = getDefaultExportFileName(format);
     const stem = sanitizeFileStem(stripFileExtension((requestedName || "").trim()) || fallback);
-    return format === "3dtiles" ? stem : `${stem}.${format}`;
+    return `${stem}.${format}`;
   };
   const handleExport = async (format, requestedName) => {
     if (!sceneMgr.current) return;
@@ -10764,7 +11353,7 @@ const ThreeViewer = ({
       }, 100);
       return;
     }
-    const modelsToExport = content.children.filter((c) => !c.userData.isOptimizedGroup && c.name !== "TilesRenderer");
+    const modelsToExport = content.children.filter((c) => !c.userData.isOptimizedGroup);
     if (modelsToExport.length === 0) {
       setToast({ message: t("no_models"), type: "info" });
       return;
@@ -10779,32 +11368,7 @@ const ThreeViewer = ({
       try {
         let blob = null;
         const filename = resolvedFileName;
-        if (format === "3dtiles") {
-          if (!window.showDirectoryPicker) {
-            setToast({ message: t("select_output"), type: "info" });
-            throw new Error("Browser does not support directory picker");
-          }
-          const dirHandle = await window.showDirectoryPicker({ mode: "readwrite" });
-          const filesMap = await convertLMBTo3DTiles(exportGroup, (msg) => {
-            if (msg.includes("%")) {
-              const p = parseInt(msg.match(/(\d+)%/)?.[1] || "0");
-              setProgress(p);
-            }
-            setStatus(cleanLoadingStatus(msg));
-          });
-          setStatus(t("writing"));
-          let writeCount = 0;
-          for (const [name, b] of filesMap) {
-            const fileHandle = await dirHandle.getFileHandle(name, { create: true });
-            const writable = await fileHandle.createWritable();
-            await writable.write(b);
-            await writable.close();
-            writeCount++;
-            if (writeCount % 5 === 0) setProgress(Math.floor(writeCount / filesMap.size * 100));
-          }
-          setToast({ message: t("success"), type: "success" });
-          return;
-        } else if (format === "glb") {
+        if (format === "glb") {
           blob = await exportGLB(exportGroup);
         } else if (format === "lmb") {
           blob = await exportLMB(exportGroup, (msg) => setStatus(cleanLoadingStatus(msg)));
@@ -10909,11 +11473,12 @@ const ThreeViewer = ({
         });
       }
     });
+    sceneMgr.current.requestRender();
   };
   return /* @__PURE__ */ jsx(ErrorBoundary, { t, theme, children: /* @__PURE__ */ jsxs(
     "div",
     {
-      className: `ui-container ${themeMode} font-${sceneSettings.fontSize || "medium"}`,
+      className: `ui-container ${themeMode} font-medium`,
       style: {
         display: "flex",
         flexDirection: "column",
@@ -10938,7 +11503,6 @@ const ThreeViewer = ({
             setThemeType: setThemeMode,
             handleOpenFiles,
             handleBatchConvert,
-            handleOpenFolder,
             handleOpenUrl,
             handleView,
             handleClear,
@@ -10993,7 +11557,6 @@ const ThreeViewer = ({
                   const uuid = obj?.uuid || obj?.id;
                   if (uuid) handleDeleteObject(uuid);
                 },
-                onFocus: (obj) => handleFocusObject(obj),
                 onHide: handleHideObject,
                 onIsolate: handleIsolateObject,
                 onShowAll: handleShowAll,
@@ -11263,23 +11826,7 @@ const ThreeViewer = ({
                 }
               ) })
             ] }),
-            (hiddenUuids.size > 0 || isolatedUuids.size > 0) && /* @__PURE__ */ jsx("button", { className: "ui-statusbar-tag", onClick: handleShowAll, children: hiddenUuids.size > 0 ? `${t("hide_selected") || "隐藏选中"} ${hiddenUuids.size}` : `${t("isolate_selection") || "隔离选中"} ${isolatedUuids.size}` }),
-            ifcGridDiagnostics.length > 0 && /* @__PURE__ */ jsxs(
-              "button",
-              {
-                className: "ui-statusbar-tag",
-                title: ifcGridDiagnostics.join(", "),
-                onClick: () => setToast({
-                  message: `${t("ifc_grid_diagnostics") || "轴网诊断"}: ${ifcGridDiagnostics.slice(0, 6).join(", ")}`,
-                  type: "info"
-                }),
-                children: [
-                  t("ifc_grid_diagnostics") || "轴网诊断",
-                  " ",
-                  ifcGridDiagnostics.length
-                ]
-              }
-            )
+            (hiddenUuids.size > 0 || isolatedUuids.size > 0) && /* @__PURE__ */ jsx("button", { className: "ui-statusbar-tag", onClick: handleShowAll, children: hiddenUuids.size > 0 ? `${t("hide_selected") || "隐藏选中"} ${hiddenUuids.size}` : `${t("isolate_selection") || "隔离选中"} ${isolatedUuids.size}` })
           ] }),
           /* @__PURE__ */ jsxs("div", { className: "ui-statusbar-right", children: [
             mousePos && /* @__PURE__ */ jsxs("div", { style: { opacity: 0.85 }, children: [
@@ -11307,10 +11854,6 @@ const ThreeViewer = ({
                 /* @__PURE__ */ jsx(IconActivity, { width: 14, height: 14 }),
                 /* @__PURE__ */ jsx("span", { children: formatMemory(stats.memory) })
               ] }),
-              /* @__PURE__ */ jsxs("div", { style: { opacity: 0.75, fontVariantNumeric: "tabular-nums" }, title: "FPS", children: [
-                stats.fps,
-                " FPS"
-              ] }),
               stats.chunksTotal > 0 && /* @__PURE__ */ jsxs("div", { style: { opacity: 0.75, fontVariantNumeric: "tabular-nums" }, title: "Chunks", children: [
                 "CH ",
                 stats.chunksLoaded,
@@ -11322,6 +11865,7 @@ const ThreeViewer = ({
                 stats.pixelRatio
               ] })
             ] }),
+            /* @__PURE__ */ jsx("div", { className: "ui-divider-vertical ui-divider-vertical-compact", style: { height: "12px" } }),
             /* @__PURE__ */ jsx(
               "button",
               {

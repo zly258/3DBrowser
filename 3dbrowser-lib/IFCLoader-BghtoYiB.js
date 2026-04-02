@@ -4,7 +4,8 @@ let cachedIfcRuntimePromise = null;
 let cachedIfcRuntimePath = "";
 const ifcTypeCodeCache = /* @__PURE__ */ new Map();
 function getIfcWasmPath(libPath) {
-  return libPath.endsWith("/") ? `${libPath}web-ifc/` : `${libPath}/web-ifc/`;
+  const normalized = typeof window !== "undefined" ? new URL(libPath.endsWith("/") ? libPath : `${libPath}/`, window.location.href).toString() : libPath.endsWith("/") ? libPath : `${libPath}/`;
+  return `${normalized}web-ifc/`;
 }
 async function getIfcRuntime(libPath) {
   const wasmPath = getIfcWasmPath(libPath);
@@ -665,7 +666,7 @@ const loadIFC = async (input, onProgress, t, libPath = "./libs", settings) => {
       if (!grids || grids.size() === 0) return;
       const gridGroup = new THREE.Group();
       gridGroup.name = "__IFCGridHelper";
-      gridGroup.visible = settings?.ifcGridVisible !== false;
+      gridGroup.visible = true;
       gridGroup.userData.isIfcGridHelper = true;
       const axisConfigs = [
         { key: "UAxes", color: "#d97706" },

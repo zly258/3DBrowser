@@ -16,5 +16,6 @@ export interface ThemeColors {
     shadow: string;
 }
 export declare const themes: Record<'dark' | 'light', ThemeColors>;
-export declare const DEFAULT_FONT = "'Segoe UI', 'Microsoft YaHei', sans-serif";
+export declare const DEFAULT_FONT = "'Roboto', 'Inter', 'Segoe UI', 'Microsoft YaHei', sans-serif";
 export declare const colors: ThemeColors;
+export declare function resolveThemeColors(themeMode: "dark" | "light"): ThemeColors;
