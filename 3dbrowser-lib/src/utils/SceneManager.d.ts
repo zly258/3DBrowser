@@ -1,9 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-<<<<<<< HEAD
 import { type PerformancePreset, type SceneChunkOptions, type SceneManagerOptions } from "./scene/types";
-=======
->>>>>>> 85ff37e52f123e1ede73230549f217eded2bc80e
 export type MeasureType = 'dist' | 'angle' | 'coord' | 'none';
 export interface MeasurementRecord {
     id: string;
@@ -159,11 +156,8 @@ export declare class SceneManager {
     private workerQueue;
     private activeWorkerCount;
     private maxWorkers;
-<<<<<<< HEAD
     private readonly options;
     private readonly resolvedChunkOptions;
-=======
->>>>>>> 85ff37e52f123e1ede73230549f217eded2bc80e
     private isCameraMoving;
     private activePixelRatio;
     private chunkLoadResumeAt;
@@ -206,11 +200,7 @@ export declare class SceneManager {
     private ghostMeshPool;
     private registerChunk;
     private rebuildChunkIdSet;
-<<<<<<< HEAD
     constructor(canvas: HTMLCanvasElement, options?: SceneManagerOptions);
-=======
-    constructor(canvas: HTMLCanvasElement);
->>>>>>> 85ff37e52f123e1ede73230549f217eded2bc80e
     /** 按需调度一帧：合并多次调用，在相机静止且无后台任务时不常驻 requestAnimationFrame */
     requestRender(): void;
     updateSettings(newSettings: Partial<SceneSettings>): void;
