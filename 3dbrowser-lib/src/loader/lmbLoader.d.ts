@@ -19,10 +19,17 @@ export declare const composeMatrixByMatrix3: (matrix: Float32Array, position: Fl
 export declare class LMBLoader extends Loader {
     manager: LoadingManager;
     private static expressIdCounter;
+    private static textDecoder;
     constructor(manager?: LoadingManager);
-    loadAsync(url: string, onProgress?: (progress: any) => void): Promise<THREE.Group>;
-    parse(buffer: ArrayBuffer, onProgress?: (progress: number) => void): any;
-    parseNode(buffer: ArrayBuffer, view: DataView, offset: number): {
+    loadAsync(url: string, onProgress?: (progress: any) => void, options?: {
+        fastMode?: boolean;
+    }): Promise<THREE.Group>;
+    parse(buffer: ArrayBuffer, onProgress?: (progress: number) => void, options?: {
+        fastMode?: boolean;
+    }): any;
+    parseNode(buffer: ArrayBuffer, view: DataView, offset: number, options?: {
+        decodeNames?: boolean;
+    }): {
         name: string;
         matrix: Float32Array<ArrayBuffer>;
         position: Float32Array<ArrayBuffer>;

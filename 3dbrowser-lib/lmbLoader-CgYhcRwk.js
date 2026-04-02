@@ -129,11 +129,14 @@ class LMBLoader extends Loader {
   static {
     this.expressIdCounter = LMB_EXPRESS_ID_START;
   }
+  static {
+    this.textDecoder = new TextDecoder();
+  }
   constructor(manager) {
     super(manager);
     this.manager = manager || THREE.DefaultLoadingManager;
   }
-  async loadAsync(url, onProgress) {
+  async loadAsync(url, onProgress, options = {}) {
     const loader = new FileLoader(this.manager);
     loader.setResponseType("arraybuffer");
     let buffer = await new Promise((resolve, reject) => {
@@ -141,10 +144,11 @@ class LMBLoader extends Loader {
     });
     const isCompressed = url.split("?")[0].split("#")[0].toLowerCase().endsWith("lmbz");
     if (isCompressed) throw new Error("不支持 lmbz 压缩格式，请使用 .lmb");
-    return this.parse(buffer, onProgress);
+    return this.parse(buffer, onProgress, options);
   }
   parse(buffer, onProgress = () => {
-  }) {
+  }, options = {}) {
+    const fastMode = options.fastMode ?? true;
     const view = new DataView(buffer);
     let offset = 0;
     const position = new Float32Array(3);
@@ -160,7 +164,7 @@ class LMBLoader extends Loader {
     const totalSteps = colorCount + nodeCount;
     const colors = [];
     for (let i = 0; i < colorCount; i++) {
-      onProgress(currentStep / totalSteps);
+      if ((i & 31) === 0) onProgress(currentStep / totalSteps);
       currentStep++;
       const color = view.getUint32(offset, true);
       colors.push(color);
@@ -182,9 +186,9 @@ class LMBLoader extends Loader {
       return material;
     });
     for (let i = 0; i < nodeCount; i++) {
-      onProgress(currentStep / totalSteps);
+      if ((i & 31) === 0) onProgress(currentStep / totalSteps);
       currentStep++;
-      const node = this.parseNode(buffer, view, offset);
+      const node = this.parseNode(buffer, view, offset, { decodeNames: !fastMode });
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute("position", new THREE.Float32BufferAttribute(node.vertices, 3));
       geometry.setAttribute("normal", new THREE.Float32BufferAttribute(node.normals, 3));
@@ -225,10 +229,11 @@ class LMBLoader extends Loader {
     onProgress(1);
     return root;
   }
-  parseNode(buffer, view, offset) {
+  parseNode(buffer, view, offset, options = {}) {
+    const decodeNames = options.decodeNames ?? true;
     const nameLength = view.getUint16(offset, true);
     offset += 2;
-    const name = new TextDecoder().decode(new Uint8Array(buffer, offset, nameLength));
+    const name = decodeNames ? LMBLoader.textDecoder.decode(new Uint8Array(buffer, offset, nameLength)) : "";
     offset += nameLength;
     while (offset % 4 !== 0) offset++;
     const matrix = new Float32Array(9);
@@ -305,7 +310,7 @@ class LMBLoader extends Loader {
       for (let i = 0; i < instanceCount; i++) {
         const instanceNameLength = view.getUint16(offset, true);
         offset += 2;
-        const instanceName = new TextDecoder().decode(new Uint8Array(buffer, offset, instanceNameLength));
+        const instanceName = decodeNames ? LMBLoader.textDecoder.decode(new Uint8Array(buffer, offset, instanceNameLength)) : "";
         offset += instanceNameLength;
         const alignmentPadding = (4 - offset % 4) % 4;
         offset += alignmentPadding;

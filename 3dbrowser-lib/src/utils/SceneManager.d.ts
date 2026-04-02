@@ -116,6 +116,8 @@ export declare class SceneManager {
     precomputedBounds: THREE.Box3;
     private chunks;
     private chunkIdSet;
+    private chunkById;
+    private chunkIndexById;
     private processingChunks;
     private cancelledChunkIds;
     private frustum;
@@ -147,6 +149,7 @@ export declare class SceneManager {
     private readonly chunkReadCache;
     private chunkReadCacheOrder;
     private prefetchQueue;
+    private prefetchQueueSet;
     private prefetchInFlight;
     private prefetchRoundRobinCursor;
     private prefetchPaused;
@@ -174,6 +177,7 @@ export declare class SceneManager {
     private postMoveRecoveryUntil;
     private deferredStructureTimer;
     private deferredStructureToken;
+    private loadGeneration;
     private fastPreviewMeshLimit;
     private fastPreviewModels;
     private readonly chunkCullingTempSize;
@@ -193,13 +197,14 @@ export declare class SceneManager {
     private cullingTimeBudgetMovingMs;
     private cullingTimeBudgetRecoveryMs;
     private cullingTimeBudgetIdleMs;
-    private adaptiveRuntimeAccumulatedMs;
-    private adaptiveRuntimeSampleCount;
+    private forceMaxChunkLoadSpeed;
     private ghostEdgesGeometry;
     private ghostMaterial;
     private ghostMeshPool;
     private registerChunk;
     private rebuildChunkIdSet;
+    private getChunkById;
+    private getChunkIndex;
     constructor(canvas: HTMLCanvasElement, options?: SceneManagerOptions);
     /** 按需调度一帧：合并多次调用，在相机静止且无后台任务时不常驻 requestAnimationFrame */
     requestRender(): void;
@@ -223,6 +228,7 @@ export declare class SceneManager {
     private takeCachedChunkMesh;
     private clearChunkCache;
     private getChunkReadCacheKey;
+    private hasValidChunkBinaryRange;
     private touchChunkReadCache;
     private putChunkReadCache;
     private readChunkBuffer;
@@ -260,12 +266,17 @@ export declare class SceneManager {
     private unloadChunk;
     private loadChunk;
     setChunkLoadingEnabled(enabled: boolean): void;
+    private applyNbimScaleTuning;
     setChunkOptions(options?: SceneChunkOptions): void;
     getChunkOptions(): {
         chunkReadCacheSize: number;
         chunkPrefetchWindow: number;
         ghostMode: import("./scene/types").GhostMode;
         targetMinFps: number;
+        loadProfile: import("./scene/types").LoadProfile;
+        deferIfcProperties: boolean;
+        preferWorkerOctree: boolean;
+        fastGeometrySanitize: boolean;
     };
     setContentVisible(visible: boolean): void;
     private buildSceneGraph;
@@ -284,6 +295,8 @@ export declare class SceneManager {
     private prepareModelChunkStage;
     private finalizeModelStage;
     private cancelDeferredStructureBuild;
+    beginLoadGeneration(): number;
+    isLoadGenerationCurrent(generation: number): boolean;
     private deactivateFastPreviewForModel;
     private scheduleDeferredStructureReplacement;
     addModel(object: THREE.Object3D, onProgress?: (p: number, msg: string) => void): Promise<void>;

@@ -14,21 +14,6 @@ function deriveInitialRuntimeFromHardware(cpuCount, preset) {
     maxChunkLoadsPerFrame
   };
 }
-function adaptChunkRuntime(input) {
-  const targetFrameMs = 1e3 / Math.max(20, input.targetMinFps);
-  const overloaded = input.frameDeltaMs > targetFrameMs * 1.08;
-  const underLoaded = input.frameDeltaMs < targetFrameMs * 0.78;
-  let nextConcurrentLoads = input.currentConcurrentLoads;
-  let nextFrameBudget = input.currentFrameBudget;
-  if (overloaded) {
-    nextConcurrentLoads = Math.max(8, input.currentConcurrentLoads - 2);
-    nextFrameBudget = Math.max(4, input.currentFrameBudget - 1);
-  } else if (underLoaded) {
-    nextConcurrentLoads = Math.min(128, input.currentConcurrentLoads + 1);
-    nextFrameBudget = Math.min(64, input.currentFrameBudget + 1);
-  }
-  return { nextConcurrentLoads, nextFrameBudget };
-}
 
 const isDevHost = typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
 function debugLog(scope, ...args) {
@@ -95,17 +80,25 @@ function estimateTextureMemoryMb(root) {
 }
 
 const DEFAULT_SCENE_CHUNK_OPTIONS = {
-  chunkReadCacheSize: 64,
-  chunkPrefetchWindow: 8,
+  chunkReadCacheSize: 128,
+  chunkPrefetchWindow: 0,
   ghostMode: "visible-first",
-  targetMinFps: 32
+  targetMinFps: 20,
+  loadProfile: "max-speed",
+  deferIfcProperties: true,
+  preferWorkerOctree: true,
+  fastGeometrySanitize: true
 };
 function resolveSceneChunkOptions(options) {
   return {
     chunkReadCacheSize: Math.max(8, Math.min(256, Math.floor(options?.chunkReadCacheSize ?? DEFAULT_SCENE_CHUNK_OPTIONS.chunkReadCacheSize))),
     chunkPrefetchWindow: Math.max(0, Math.min(32, Math.floor(options?.chunkPrefetchWindow ?? DEFAULT_SCENE_CHUNK_OPTIONS.chunkPrefetchWindow))),
     ghostMode: options?.ghostMode ?? DEFAULT_SCENE_CHUNK_OPTIONS.ghostMode,
-    targetMinFps: Math.max(20, Math.min(60, Math.floor(options?.targetMinFps ?? DEFAULT_SCENE_CHUNK_OPTIONS.targetMinFps)))
+    targetMinFps: Math.max(20, Math.min(60, Math.floor(options?.targetMinFps ?? DEFAULT_SCENE_CHUNK_OPTIONS.targetMinFps))),
+    loadProfile: options?.loadProfile ?? DEFAULT_SCENE_CHUNK_OPTIONS.loadProfile,
+    deferIfcProperties: options?.deferIfcProperties ?? DEFAULT_SCENE_CHUNK_OPTIONS.deferIfcProperties,
+    preferWorkerOctree: options?.preferWorkerOctree ?? DEFAULT_SCENE_CHUNK_OPTIONS.preferWorkerOctree,
+    fastGeometrySanitize: options?.fastGeometrySanitize ?? DEFAULT_SCENE_CHUNK_OPTIONS.fastGeometrySanitize
   };
 }
 
@@ -190,6 +183,8 @@ class SceneManager {
     this.precomputedBounds = new THREE.Box3();
     this.chunks = [];
     this.chunkIdSet = /* @__PURE__ */ new Set();
+    this.chunkById = /* @__PURE__ */ new Map();
+    this.chunkIndexById = /* @__PURE__ */ new Map();
     this.processingChunks = /* @__PURE__ */ new Set();
     this.cancelledChunkIds = /* @__PURE__ */ new Set();
     this.frustum = new THREE.Frustum();
@@ -223,6 +218,7 @@ class SceneManager {
     this.chunkReadCache = /* @__PURE__ */ new Map();
     this.chunkReadCacheOrder = [];
     this.prefetchQueue = [];
+    this.prefetchQueueSet = /* @__PURE__ */ new Set();
     this.prefetchInFlight = /* @__PURE__ */ new Set();
     this.prefetchRoundRobinCursor = 0;
     this.prefetchPaused = false;
@@ -324,6 +320,7 @@ class SceneManager {
     this.postMoveRecoveryUntil = 0;
     this.deferredStructureTimer = null;
     this.deferredStructureToken = 0;
+    this.loadGeneration = 0;
     this.fastPreviewMeshLimit = 1200;
     this.fastPreviewModels = /* @__PURE__ */ new Set();
     this.chunkCullingTempSize = new THREE.Vector3();
@@ -343,8 +340,7 @@ class SceneManager {
     this.cullingTimeBudgetMovingMs = 4.5;
     this.cullingTimeBudgetRecoveryMs = 6;
     this.cullingTimeBudgetIdleMs = 9;
-    this.adaptiveRuntimeAccumulatedMs = 0;
-    this.adaptiveRuntimeSampleCount = 0;
+    this.forceMaxChunkLoadSpeed = true;
     this.ghostMeshPool = [];
     this.canvas = canvas;
     this.options = options;
@@ -516,12 +512,25 @@ class SceneManager {
   registerChunk(chunk) {
     this.chunks.push(chunk);
     this.chunkIdSet.add(chunk.id);
+    this.chunkById.set(chunk.id, chunk);
+    this.chunkIndexById.set(chunk.id, this.chunks.length - 1);
   }
   rebuildChunkIdSet() {
     this.chunkIdSet.clear();
-    for (const chunk of this.chunks) {
+    this.chunkById.clear();
+    this.chunkIndexById.clear();
+    for (let index = 0; index < this.chunks.length; index++) {
+      const chunk = this.chunks[index];
       this.chunkIdSet.add(chunk.id);
+      this.chunkById.set(chunk.id, chunk);
+      this.chunkIndexById.set(chunk.id, index);
     }
+  }
+  getChunkById(chunkId) {
+    return this.chunkById.get(chunkId);
+  }
+  getChunkIndex(chunkId) {
+    return this.chunkIndexById.get(chunkId) ?? -1;
   }
   /** 按需调度一帧：合并多次调用，在相机静止且无后台任务时不常驻 requestAnimationFrame */
   requestRender() {
@@ -766,9 +775,20 @@ class SceneManager {
     const memoryGb = nav.deviceMemory || 8;
     const preset = this.options.performancePreset ?? this.settings.performanceMode ?? "balanced";
     const runtime = deriveInitialRuntimeFromHardware(cpuCount, preset);
-    this.maxWorkers = Math.max(2, Math.min(8, Math.floor(cpuCount / 2)));
-    this.maxConcurrentChunkLoads = runtime.maxConcurrentChunkLoads;
-    this.maxChunkLoadsPerFrame = runtime.maxChunkLoadsPerFrame;
+    if (this.forceMaxChunkLoadSpeed) {
+      this.maxWorkers = Math.max(4, Math.min(12, cpuCount - 1));
+      this.maxConcurrentChunkLoads = Math.max(128, Math.min(192, this.maxWorkers * 24));
+      this.maxChunkLoadsPerFrame = Math.max(64, Math.min(128, this.maxWorkers * 14));
+      this.cullingTimeBudgetMovingMs = 7.5;
+      this.cullingTimeBudgetRecoveryMs = 10.5;
+      this.cullingTimeBudgetIdleMs = 14;
+      this.chunkRegistrationBatchSize = 28;
+      this.chunkGhostBatchSize = 40;
+    } else {
+      this.maxWorkers = 4;
+      this.maxConcurrentChunkLoads = runtime.maxConcurrentChunkLoads;
+      this.maxChunkLoadsPerFrame = runtime.maxChunkLoadsPerFrame;
+    }
     this.maxLoadedChunks = memoryGb <= 4 ? 160 : memoryGb <= 8 ? 320 : 640;
     this.maxCachedChunks = memoryGb <= 4 ? 24 : memoryGb <= 8 ? 48 : 96;
     this.settings.targetFps = this.resolvedChunkOptions.targetMinFps;
@@ -908,6 +928,9 @@ class SceneManager {
   getChunkReadCacheKey(chunk) {
     return `${chunk.nbimFileId || "local"}:${chunk.byteOffset || 0}:${chunk.byteLength || 0}`;
   }
+  hasValidChunkBinaryRange(chunk) {
+    return Number.isFinite(chunk?.byteOffset) && Number.isFinite(chunk?.byteLength) && chunk.byteLength > 0;
+  }
   touchChunkReadCache(cacheKey) {
     this.chunkReadCacheOrder = this.chunkReadCacheOrder.filter((key) => key !== cacheKey);
     this.chunkReadCacheOrder.push(cacheKey);
@@ -937,9 +960,10 @@ class SceneManager {
   enqueueChunkPrefetch(chunkIds) {
     if (this.resolvedChunkOptions.chunkPrefetchWindow <= 0) return;
     for (const chunkId of chunkIds) {
-      if (this.prefetchQueue.includes(chunkId)) continue;
+      if (this.prefetchQueueSet.has(chunkId)) continue;
       if (this.prefetchInFlight.has(chunkId)) continue;
       this.prefetchQueue.push(chunkId);
+      this.prefetchQueueSet.add(chunkId);
     }
   }
   schedulePrefetchFromVisibleChunks(visibleChunks) {
@@ -950,11 +974,11 @@ class SceneManager {
     const toPrefetch = [];
     for (let i = 0; i < visibleChunks.length && toPrefetch.length < windowSize; i++) {
       const pivot = visibleChunks[(this.prefetchRoundRobinCursor + i) % visibleChunks.length];
-      const pivotIndex = this.chunks.findIndex((chunk) => chunk.id === pivot.id);
+      const pivotIndex = this.getChunkIndex(pivot.id);
       if (pivotIndex < 0) continue;
       const nextChunk = this.chunks[pivotIndex + 1];
       if (!nextChunk || nextChunk.loaded || this.processingChunks.has(nextChunk.id)) continue;
-      if (!nextChunk.nbimFileId || !nextChunk.byteOffset || !nextChunk.byteLength) continue;
+      if (!nextChunk.nbimFileId || !this.hasValidChunkBinaryRange(nextChunk)) continue;
       const cacheKey = this.getChunkReadCacheKey(nextChunk);
       if (this.chunkReadCache.has(cacheKey)) continue;
       toPrefetch.push(nextChunk.id);
@@ -970,8 +994,9 @@ class SceneManager {
     while (!this.prefetchPaused && !this.isCameraMoving && this.prefetchQueue.length > 0 && this.prefetchInFlight.size < maxParallel) {
       const chunkId = this.prefetchQueue.shift();
       if (!chunkId) break;
-      const chunk = this.chunks.find((item) => item.id === chunkId);
-      if (!chunk || !chunk.nbimFileId || !chunk.byteOffset || !chunk.byteLength) continue;
+      this.prefetchQueueSet.delete(chunkId);
+      const chunk = this.getChunkById(chunkId);
+      if (!chunk || !chunk.nbimFileId || !this.hasValidChunkBinaryRange(chunk)) continue;
       const cacheKey = this.getChunkReadCacheKey(chunk);
       if (this.chunkReadCache.has(cacheKey)) continue;
       this.prefetchInFlight.add(chunkId);
@@ -1148,7 +1173,7 @@ class SceneManager {
       const end = Math.min(ghostSpecs.length, start + this.chunkGhostBatchSize);
       for (let index = start; index < end; index++) {
         const spec = ghostSpecs[index];
-        const chunk = this.chunks.find((c) => c.id === spec.chunkId);
+        const chunk = this.getChunkById(spec.chunkId);
         if (!chunk || chunk.loaded || this.cancelledChunkIds.has(spec.chunkId)) continue;
         if (this.ghostGroup.getObjectByName(`ghost_${spec.chunkId}`)) continue;
         const edges = this.createGhostLine(`ghost_${spec.chunkId}`, spec.bounds);
@@ -1204,7 +1229,8 @@ class SceneManager {
     return ghostSpecs;
   }
   async buildLeafPlans(items, bounds, maxItemsPerNode, maxDepth) {
-    if (items.length < this.octreeWorkerThreshold) {
+    const workerThreshold = this.resolvedChunkOptions.preferWorkerOctree ? 1200 : this.octreeWorkerThreshold;
+    if (items.length < workerThreshold) {
       const octree = buildOctree(items, bounds, { maxItemsPerNode, maxDepth });
       return collectLeafNodes(octree).map((node) => ({
         bounds: node.bounds,
@@ -1347,6 +1373,9 @@ class SceneManager {
     return "idle";
   }
   getChunkFrameBudget(phase, profile, warmupExtra) {
+    if (this.forceMaxChunkLoadSpeed) {
+      return this.maxChunkLoadsPerFrame + warmupExtra;
+    }
     const mode = this.settings.performanceMode ?? "balanced";
     const chunkCount = this.chunks.length;
     const isHugeScene = chunkCount > 2e3;
@@ -1551,21 +1580,7 @@ class SceneManager {
       }
     }
     this.schedulePrefetchFromVisibleChunks(loadedChunks);
-    this.adaptiveRuntimeSampleCount++;
-    this.adaptiveRuntimeAccumulatedMs += this.clock.getDelta() * 1e3;
-    if (this.adaptiveRuntimeSampleCount >= 20) {
-      const sampleAvg = this.adaptiveRuntimeAccumulatedMs / this.adaptiveRuntimeSampleCount;
-      const adaptive = adaptChunkRuntime({
-        frameDeltaMs: sampleAvg,
-        targetMinFps: this.resolvedChunkOptions.targetMinFps,
-        currentConcurrentLoads: this.maxConcurrentChunkLoads,
-        currentFrameBudget: this.maxChunkLoadsPerFrame
-      });
-      this.maxConcurrentChunkLoads = adaptive.nextConcurrentLoads;
-      this.maxChunkLoadsPerFrame = adaptive.nextFrameBudget;
-      this.adaptiveRuntimeSampleCount = 0;
-      this.adaptiveRuntimeAccumulatedMs = 0;
-    }
+    if (!this.forceMaxChunkLoadSpeed) ;
     if (abortedByBudget) {
       this.cullingDirty = true;
     }
@@ -1637,7 +1652,7 @@ class SceneManager {
           batchSize: 1200,
           yieldControl: () => this.yieldToMainThread()
         });
-      } else if (chunk.nbimFileId && this.nbimFiles.has(chunk.nbimFileId) && chunk.byteOffset) {
+      } else if (chunk.nbimFileId && this.nbimFiles.has(chunk.nbimFileId) && this.hasValidChunkBinaryRange(chunk)) {
         const buffer = await this.readChunkBuffer(chunk);
         const meta = this.nbimMeta.get(chunk.nbimFileId);
         const version = meta?.version ?? 8;
@@ -1652,14 +1667,14 @@ class SceneManager {
         }, [buffer]);
         bm = this.reconstructBatchedMesh(workerResult, this.sharedMaterial);
         if (!this.isCameraMoving && this.resolvedChunkOptions.chunkPrefetchWindow > 0) {
-          const chunkIndex = this.chunks.findIndex((item) => item.id === chunk.id);
+          const chunkIndex = this.getChunkIndex(chunk.id);
           if (chunkIndex >= 0) {
             const candidates = [];
             for (let i = 1; i <= this.resolvedChunkOptions.chunkPrefetchWindow; i++) {
               const next = this.chunks[chunkIndex + i];
               if (!next) break;
               if (next.loaded || this.processingChunks.has(next.id)) continue;
-              if (!next.nbimFileId || !next.byteOffset || !next.byteLength) continue;
+              if (!next.nbimFileId || !this.hasValidChunkBinaryRange(next)) continue;
               candidates.push(next.id);
             }
             this.enqueueChunkPrefetch(candidates);
@@ -1726,12 +1741,30 @@ class SceneManager {
     this.cullingDirty = true;
     if (enabled) this.checkCullingAndLoad();
   }
+  applyNbimScaleTuning(chunkCount) {
+    const userChunkOptions = this.options.chunkOptions || {};
+    const autoTuned = chunkCount >= 2e3 ? { chunkPrefetchWindow: 0, chunkReadCacheSize: 128, targetMinFps: 20 } : chunkCount <= 1e3 ? { chunkPrefetchWindow: 0, chunkReadCacheSize: 128, targetMinFps: 20 } : { chunkPrefetchWindow: 0, chunkReadCacheSize: 128, targetMinFps: 20 };
+    this.setChunkOptions({
+      chunkPrefetchWindow: userChunkOptions.chunkPrefetchWindow ?? autoTuned.chunkPrefetchWindow,
+      chunkReadCacheSize: userChunkOptions.chunkReadCacheSize ?? autoTuned.chunkReadCacheSize,
+      targetMinFps: userChunkOptions.targetMinFps ?? autoTuned.targetMinFps,
+      ghostMode: userChunkOptions.ghostMode ?? this.resolvedChunkOptions.ghostMode,
+      loadProfile: userChunkOptions.loadProfile ?? this.resolvedChunkOptions.loadProfile,
+      deferIfcProperties: userChunkOptions.deferIfcProperties ?? this.resolvedChunkOptions.deferIfcProperties,
+      preferWorkerOctree: userChunkOptions.preferWorkerOctree ?? this.resolvedChunkOptions.preferWorkerOctree,
+      fastGeometrySanitize: userChunkOptions.fastGeometrySanitize ?? this.resolvedChunkOptions.fastGeometrySanitize
+    });
+  }
   setChunkOptions(options = {}) {
     const resolved = resolveSceneChunkOptions(options);
     this.resolvedChunkOptions.chunkReadCacheSize = resolved.chunkReadCacheSize;
     this.resolvedChunkOptions.chunkPrefetchWindow = resolved.chunkPrefetchWindow;
     this.resolvedChunkOptions.ghostMode = resolved.ghostMode;
     this.resolvedChunkOptions.targetMinFps = resolved.targetMinFps;
+    this.resolvedChunkOptions.loadProfile = resolved.loadProfile;
+    this.resolvedChunkOptions.deferIfcProperties = resolved.deferIfcProperties;
+    this.resolvedChunkOptions.preferWorkerOctree = resolved.preferWorkerOctree;
+    this.resolvedChunkOptions.fastGeometrySanitize = resolved.fastGeometrySanitize;
     this.settings.targetFps = resolved.targetMinFps;
     while (this.chunkReadCacheOrder.length > this.resolvedChunkOptions.chunkReadCacheSize) {
       const evict = this.chunkReadCacheOrder.shift();
@@ -1744,7 +1777,11 @@ class SceneManager {
       chunkReadCacheSize: this.resolvedChunkOptions.chunkReadCacheSize,
       chunkPrefetchWindow: this.resolvedChunkOptions.chunkPrefetchWindow,
       ghostMode: this.resolvedChunkOptions.ghostMode,
-      targetMinFps: this.resolvedChunkOptions.targetMinFps
+      targetMinFps: this.resolvedChunkOptions.targetMinFps,
+      loadProfile: this.resolvedChunkOptions.loadProfile,
+      deferIfcProperties: this.resolvedChunkOptions.deferIfcProperties,
+      preferWorkerOctree: this.resolvedChunkOptions.preferWorkerOctree,
+      fastGeometrySanitize: this.resolvedChunkOptions.fastGeometrySanitize
     };
   }
   setContentVisible(visible) {
@@ -1839,7 +1876,13 @@ class SceneManager {
   }
   configureModelWarmup(meshCount) {
     this.chunkWarmupActive = true;
+    if (this.resolvedChunkOptions.loadProfile === "max-speed") {
+      this.initialChunkLoadTarget = meshCount > 1e5 ? 42 : meshCount > 3e4 ? 32 : 20;
+      this.warmupChunkBoost = 16;
+      return;
+    }
     this.initialChunkLoadTarget = meshCount > 1e5 ? 24 : meshCount > 3e4 ? 18 : 12;
+    this.warmupChunkBoost = 12;
   }
   prepareStructureStage(object, meshCount, onProgress) {
     const shouldDeferStructure = meshCount >= this.deferredStructureThreshold;
@@ -1926,8 +1969,10 @@ class SceneManager {
   }
   async prepareModelChunkStage(object, meshCount, onProgress) {
     if (onProgress) onProgress(10, "正在收集构件...");
-    const items = meshCount >= this.octreeWorkerThreshold ? await collectItemsBatched(object, {
-      batchSize: 3e3,
+    const preferFastCollect = this.resolvedChunkOptions.loadProfile === "max-speed";
+    const collectBatchedThreshold = preferFastCollect ? 1200 : this.octreeWorkerThreshold;
+    const items = meshCount >= collectBatchedThreshold ? await collectItemsBatched(object, {
+      batchSize: preferFastCollect ? 5200 : 3e3,
       onProgress: (processed, total) => {
         if (!onProgress || total === 0) return;
         const ratio = processed / total;
@@ -1993,6 +2038,13 @@ class SceneManager {
       this.deferredStructureTimer = null;
     }
     this.deferredStructureToken++;
+  }
+  beginLoadGeneration() {
+    this.loadGeneration += 1;
+    return this.loadGeneration;
+  }
+  isLoadGenerationCurrent(generation) {
+    return generation === this.loadGeneration;
   }
   deactivateFastPreviewForModel(originalUuid) {
     if (!this.fastPreviewModels.has(originalUuid)) return;
@@ -2460,7 +2512,7 @@ class SceneManager {
       let buffer;
       if (chunk.node) {
         buffer = this.generateChunkBinaryV8(chunk.node.items, bimIdToIndex);
-      } else if (chunk.nbimFileId && this.nbimFiles.has(chunk.nbimFileId) && chunk.byteOffset) {
+      } else if (chunk.nbimFileId && this.nbimFiles.has(chunk.nbimFileId) && this.hasValidChunkBinaryRange(chunk)) {
         const file = this.nbimFiles.get(chunk.nbimFileId);
         const raw = await file.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength).arrayBuffer();
         const meta = this.nbimMeta.get(chunk.nbimFileId);
@@ -2692,6 +2744,7 @@ class SceneManager {
     if (onProgress) onProgress(30, "正在初始化分块...");
     const chunkOffset = this.globalOffset.lengthSq() > 0 ? this.globalOffset.clone().negate() : null;
     const chunkEntries = Array.isArray(manifest.chunks) ? manifest.chunks : [];
+    this.applyNbimScaleTuning(chunkEntries.length);
     const deferredGhostSpecs = [];
     const immediateGhostLimit = this.resolvedChunkOptions.ghostMode === "all" ? Number.MAX_SAFE_INTEGER : GHOST_VISIBLE_FIRST_BATCH;
     for (let i = 0; i < chunkEntries.length; i++) {
@@ -2755,6 +2808,7 @@ class SceneManager {
     }
   }
   async clear() {
+    this.beginLoadGeneration();
     debugLog("SceneManager", "开始清空场景...");
     this.cancelDeferredStructureBuild();
     this.resetExplode();
@@ -2800,10 +2854,13 @@ class SceneManager {
       this.bimIdToNodeIds.clear();
       this.chunks = [];
       this.chunkIdSet.clear();
+      this.chunkById.clear();
+      this.chunkIndexById.clear();
       this.lastReportedProgress = { loaded: -1, total: -1 };
       this.processingChunks.clear();
       this.cancelledChunkIds.clear();
       this.prefetchQueue = [];
+      this.prefetchQueueSet.clear();
       this.prefetchInFlight.clear();
       this.chunkLoadedCount = 0;
       this.reportChunkProgress();
@@ -4749,6 +4806,7 @@ class SceneManager {
     this.processingChunks.clear();
     this.cancelledChunkIds.clear();
     this.prefetchQueue = [];
+    this.prefetchQueueSet.clear();
     this.prefetchInFlight.clear();
     this.chunkReadCache.clear();
     this.chunkReadCacheOrder = [];
@@ -6958,6 +7016,7 @@ const SceneTree = ({
   }, [searchQuery, setTreeRoot, treeRoot]);
   useEffect(() => {
     if (!selectedUuid) return;
+    if (selectionSourceRef.current !== "tree") return;
     setTreeRoot((prev) => {
       const expandSelectedPath = (nodes) => {
         let found2 = false;
@@ -9199,7 +9258,7 @@ const ViewCube = ({ sceneMgr, lang = "zh", theme }) => {
     const offset = 0.5;
     createPart(new THREE.Vector3(faceSize, 0.05, faceSize), new THREE.Vector3(0, -offset, 0), "front", faceColor, t("cube_front"));
     createPart(new THREE.Vector3(faceSize, 0.05, faceSize), new THREE.Vector3(0, offset, 0), "back", faceColor, t("cube_back"), 180);
-    createPart(new THREE.Vector3(faceSize, faceSize, 0.05), new THREE.Vector3(0, 0, offset), "top", faceColor, t("cube_top"), 270);
+    createPart(new THREE.Vector3(faceSize, faceSize, 0.05), new THREE.Vector3(0, 0, offset), "top", faceColor, t("cube_top"), 360);
     createPart(new THREE.Vector3(faceSize, faceSize, 0.05), new THREE.Vector3(0, 0, -offset), "bottom", faceColor, t("cube_bottom"));
     createPart(new THREE.Vector3(0.05, faceSize, faceSize), new THREE.Vector3(-offset, 0, 0), "left", faceColor, t("cube_left"), 90);
     createPart(new THREE.Vector3(0.05, faceSize, faceSize), new THREE.Vector3(offset, 0, 0), "right", faceColor, t("cube_right"), 270);
@@ -9519,6 +9578,23 @@ const STAGE_WEIGHTS = {
   addToScene: [92, 100]
 };
 const libPathCache = /* @__PURE__ */ new Map();
+let gltfModulesPromise = null;
+async function getGltfModules() {
+  if (!gltfModulesPromise) {
+    gltfModulesPromise = Promise.all([
+      import('./loaders-TXHpcosE.js').then(n => n.a),
+      import('./loaders-TXHpcosE.js').then(n => n.D),
+      import('./loaders-TXHpcosE.js').then(n => n.K),
+      import('./meshopt_decoder.module-C_9D6xwu.js')
+    ]).then(([a, b, c, d]) => ({
+      GLTFLoader: a.GLTFLoader,
+      DRACOLoader: b.DRACOLoader,
+      KTX2Loader: c.KTX2Loader,
+      MeshoptDecoder: d.MeshoptDecoder
+    }));
+  }
+  return gltfModulesPromise;
+}
 function normalizeLibPath(libPath) {
   if (!libPathCache.has(libPath)) {
     const trimmed = libPath.replace(/\/$/, "");
@@ -9539,17 +9615,7 @@ function createLoadingManager(files, _libPath, _settings) {
   return { manager, cleanup, resourceResolver };
 }
 async function createGltfLoaderRuntime(manager, libPath) {
-  const [
-    { GLTFLoader },
-    { DRACOLoader },
-    { KTX2Loader },
-    { MeshoptDecoder }
-  ] = await Promise.all([
-    import('./loaders-TXHpcosE.js').then(n => n.a),
-    import('./loaders-TXHpcosE.js').then(n => n.D),
-    import('./loaders-TXHpcosE.js').then(n => n.K),
-    import('./meshopt_decoder.module-C_9D6xwu.js')
-  ]);
+  const { GLTFLoader, DRACOLoader, KTX2Loader, MeshoptDecoder } = await getGltfModules();
   const normalizedLibPath = normalizeLibPath(libPath);
   const supportsCompressedTextures = typeof window !== "undefined" && !!window.createImageBitmap;
   let probeRenderer = null;
@@ -9590,15 +9656,19 @@ function createStageProgressReporter(onProgress, t, fileName, fileBaseProgress, 
     onProgress(Math.round(totalPercent), label);
   };
 }
-async function loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t, settings, libPath) {
+async function loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t, settings, libPath, runtimeHints) {
   const loaderContext = createLoadingManager(files);
   const { manager, cleanup, resourceResolver } = loaderContext;
   try {
     if (ext === "lmb") {
-      const { LMBLoader } = await import('./lmbLoader-DKeiizRf.js');
+      const { LMBLoader } = await import('./lmbLoader-CgYhcRwk.js');
       const loader = new LMBLoader();
       reportStage("parse", 0);
-      return await loader.loadAsync(url, (p) => reportStage("parse", p * 100));
+      return await loader.loadAsync(
+        url,
+        (p) => reportStage("parse", p * 100),
+        { fastMode: (runtimeHints.loadProfile ?? "balanced") === "max-speed" }
+      );
     }
     if (ext === "glb" || ext === "gltf") {
       const { loader, cleanup: cleanupGltf } = await createGltfLoaderRuntime(manager, libPath);
@@ -9637,14 +9707,18 @@ async function loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t,
       });
     }
     if (ext === "ifc") {
-      const { loadIFC } = await import('./IFCLoader-BghtoYiB.js');
+      const { loadIFC } = await import('./IFCLoader-DMndQRjK.js');
       reportStage("parse", 0);
+      const ifcSettings = {
+        ...settings,
+        deferIfcProperties: runtimeHints.deferIfcProperties ?? true
+      };
       return await loadIFC(
         typeof fileOrUrl === "string" ? url : fileOrUrl,
         (p, msg) => reportStage("parse", p, msg),
         t,
         libPath,
-        settings
+        ifcSettings
       );
     }
     if (ext === "obj") {
@@ -9716,11 +9790,15 @@ async function loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t,
     cleanup();
   }
 }
-function normalizeLoadedObject(object, settings) {
+function normalizeLoadedObject(object, settings, mode = "full") {
+  const maxFastMeshes = 3200;
+  let meshVisited = 0;
   object.traverse((child) => {
     if (child.isMesh) {
+      if (mode === "fast" && meshVisited >= maxFastMeshes) return;
       const mesh = child;
       mesh.frustumCulled = settings.frustumCulling ?? true;
+      meshVisited += 1;
       if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
       if (!mesh.geometry.boundingSphere) mesh.geometry.computeBoundingSphere();
       const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
@@ -9733,10 +9811,11 @@ function normalizeLoadedObject(object, settings) {
     }
   });
 }
-const loadModelFiles = async (files, onProgress, t, settings, libPath = "./libs") => {
+const loadModelFiles = async (files, onProgress, t, settings, libPath = "./libs", runtimeHints = {}) => {
   const loadedObjects = [];
   const totalFiles = files.length;
   for (let i = 0; i < totalFiles; i++) {
+    if (runtimeHints.isStale?.()) break;
     const fileOrUrl = files[i];
     const isUrl = typeof fileOrUrl === "string";
     let fileName = "";
@@ -9757,11 +9836,18 @@ const loadModelFiles = async (files, onProgress, t, settings, libPath = "./libs"
     const reportStage = createStageProgressReporter(onProgress, t, fileName, fileBaseProgress, fileWeight);
     try {
       reportStage("fetch", 5);
-      const object = await loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t, settings, libPath);
+      const object = await loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t, settings, libPath, runtimeHints);
       if (!object) continue;
       object.name = fileName;
       reportStage("normalize", 30, `${t("processing")} ${fileName}`);
-      normalizeLoadedObject(object, settings);
+      const fastSanitize = runtimeHints.fastGeometrySanitize ?? true;
+      normalizeLoadedObject(object, settings, fastSanitize ? "fast" : "full");
+      if (fastSanitize) {
+        setTimeout(() => {
+          if (runtimeHints.isStale?.()) return;
+          normalizeLoadedObject(object, settings, "full");
+        }, 0);
+      }
       reportStage("optimize", 100, `${t("analyzing")} ${fileName}`);
       reportStage("addToScene", 100, `${t("success")} ${fileName}`);
       loadedObjects.push(object);
@@ -9789,7 +9875,9 @@ async function loadSceneItems({
   sceneSettings,
   libPath,
   t,
-  onProgress
+  onProgress,
+  runtimeHints = {},
+  isStale
 }) {
   if (!items.length) return;
   const nbimItems = [];
@@ -9803,6 +9891,7 @@ async function loadSceneItems({
     }
   }
   for (const item of nbimItems) {
+    if (isStale?.()) return;
     if (typeof item === "string") {
       const response = await fetch(item);
       if (!response.ok) throw new Error(`HTTP ${response.status} when fetching NBIM`);
@@ -9824,10 +9913,15 @@ async function loadSceneItems({
     onProgress,
     t,
     sceneSettings,
-    libPath
+    libPath,
+    {
+      ...runtimeHints,
+      isStale
+    }
   );
   const totalObjects = Math.max(loadedObjects.length, 1);
   for (let index = 0; index < loadedObjects.length; index++) {
+    if (isStale?.()) return;
     const obj = loadedObjects[index];
     const objectBase = 92 + Math.round(index / totalObjects * 8);
     await manager.addModel(obj, (p, msg) => {
@@ -9851,6 +9945,8 @@ function useFileLoadingFlow({
 }) {
   const loadItemsIntoScene = useCallback(async (items) => {
     if (!items.length || !managerRef.current) return;
+    const generation = managerRef.current.beginLoadGeneration?.() ?? 0;
+    const runtimeHints = managerRef.current.getChunkOptions?.() || {};
     await loadSceneItems({
       items,
       manager: managerRef.current,
@@ -9860,7 +9956,9 @@ function useFileLoadingFlow({
       onProgress: (p, msg) => {
         setProgress(p);
         if (msg) setStatus(cleanLoadingStatus(msg));
-      }
+      },
+      runtimeHints,
+      isStale: () => !managerRef.current?.isLoadGenerationCurrent?.(generation)
     });
   }, [libPath, managerRef, sceneSettings, setProgress, setStatus, t]);
   const processFiles = useCallback(async (items) => {
@@ -9959,7 +10057,7 @@ const ThreeViewer = ({
   onSelect: propOnSelect,
   onLoad,
   hideDeleteModel = false,
-  performancePreset = "balanced",
+  performancePreset = "quality",
   chunkOptions
 }) => {
   const sceneBgFollowsTheme = initialSettings?.bgColor === void 0;
@@ -9974,6 +10072,16 @@ const ThreeViewer = ({
   const theme = useMemo(() => {
     return themes[themeMode];
   }, [themeMode]);
+  const effectiveChunkOptions = useMemo(() => ({
+    chunkReadCacheSize: chunkOptions?.chunkReadCacheSize ?? 128,
+    chunkPrefetchWindow: chunkOptions?.chunkPrefetchWindow ?? 0,
+    targetMinFps: chunkOptions?.targetMinFps ?? 20,
+    ghostMode: chunkOptions?.ghostMode,
+    loadProfile: chunkOptions?.loadProfile ?? "max-speed",
+    deferIfcProperties: chunkOptions?.deferIfcProperties ?? true,
+    preferWorkerOctree: chunkOptions?.preferWorkerOctree ?? true,
+    fastGeometrySanitize: chunkOptions?.fastGeometrySanitize ?? true
+  }), [chunkOptions]);
   const [lang, setLang] = usePersistentState(
     "3dbrowser_lang",
     () => defaultLang || "zh",
@@ -10180,13 +10288,13 @@ const ThreeViewer = ({
   useEffect(() => {
     const manager = sceneMgr.current;
     if (!manager) return;
-    manager.setChunkOptions(chunkOptions || {});
+    manager.setChunkOptions(effectiveChunkOptions);
     manager.updateSettings({
       ...sceneSettings,
       performanceMode: performancePreset,
-      targetFps: chunkOptions?.targetMinFps ?? sceneSettings.targetFps
+      targetFps: effectiveChunkOptions.targetMinFps ?? sceneSettings.targetFps
     });
-  }, [chunkOptions, performancePreset, sceneSettings]);
+  }, [effectiveChunkOptions, performancePreset, sceneSettings]);
   const hasModels = treeRoot.length > 0;
   const completedFileSetsRef = useRef(/* @__PURE__ */ new Set());
   const currentFileSetIdRef = useRef("");
@@ -10204,6 +10312,9 @@ const ThreeViewer = ({
       setChunkProgress({ loaded: 0, total: 0 });
     }
   });
+  const handleManagerChunkProgress = useCallback((loaded, total) => {
+    onManagerChunkProgress(loaded, total);
+  }, [onManagerChunkProgress]);
   const [contextMenu, setContextMenu] = useState({ x: 0, y: 0, visible: false });
   const [hiddenUuids, setHiddenUuids] = useState(/* @__PURE__ */ new Set());
   const [isolatedUuids, setIsolatedUuids] = useState(/* @__PURE__ */ new Set());
@@ -10721,7 +10832,7 @@ const ThreeViewer = ({
     if (!canvasRef.current) return;
     const manager = new SceneManager(canvasRef.current, {
       performancePreset,
-      chunkOptions
+      chunkOptions: effectiveChunkOptions
     });
     sceneMgr.current = manager;
     setMgrInstance(manager);
@@ -10734,7 +10845,7 @@ const ThreeViewer = ({
     requestAnimationFrame(() => {
       manager.resize();
     });
-    manager.onChunkProgress = onManagerChunkProgress;
+    manager.onChunkProgress = handleManagerChunkProgress;
     manager.onMeasureUpdate = (records) => {
       setMeasureHistory(records.map((r) => ({ id: r.id, type: r.type, val: r.val })));
     };
