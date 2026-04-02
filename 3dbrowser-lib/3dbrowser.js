@@ -767,8 +767,13 @@ class SceneManager {
     const preset = this.options.performancePreset ?? this.settings.performanceMode ?? "balanced";
     const runtime = deriveInitialRuntimeFromHardware(cpuCount, preset);
     this.maxWorkers = Math.max(2, Math.min(8, Math.floor(cpuCount / 2)));
+<<<<<<< HEAD
     this.maxConcurrentChunkLoads = runtime.maxConcurrentChunkLoads;
     this.maxChunkLoadsPerFrame = runtime.maxChunkLoadsPerFrame;
+=======
+    this.maxConcurrentChunkLoads = Math.max(24, Math.min(112, cpuCount * 10));
+    this.maxChunkLoadsPerFrame = Math.max(12, Math.min(40, cpuCount * 3));
+>>>>>>> 85ff37e52f123e1ede73230549f217eded2bc80e
     this.maxLoadedChunks = memoryGb <= 4 ? 160 : memoryGb <= 8 ? 320 : 640;
     this.maxCachedChunks = memoryGb <= 4 ? 24 : memoryGb <= 8 ? 48 : 96;
     this.settings.targetFps = this.resolvedChunkOptions.targetMinFps;
@@ -2780,12 +2785,17 @@ class SceneManager {
       while (this.contentGroup.children.length > 0) {
         this.contentGroup.remove(this.contentGroup.children[0]);
       }
+<<<<<<< HEAD
       while (this.ghostGroup.children.length > 0) {
         const ghost = this.ghostGroup.children[0];
         this.ghostGroup.remove(ghost);
         this.releaseGhostLine(ghost);
       }
       this.ghostMeshPool.length = 0;
+=======
+      this.ghostGroup.children.forEach(disposeObject);
+      this.ghostGroup.clear();
+>>>>>>> 85ff37e52f123e1ede73230549f217eded2bc80e
       this.selectionBox.visible = false;
       this.highlightMesh.visible = false;
       this.clearAllMeasurements();
@@ -2819,7 +2829,11 @@ class SceneManager {
       this.ghostGroup.visible = true;
       this.chunkWarmupActive = false;
       this.globalOffset.set(0, 0, 0);
+<<<<<<< HEAD
       debugLog("SceneManager", "场景已清空");
+=======
+      console.log("场景已清空");
+>>>>>>> 85ff37e52f123e1ede73230549f217eded2bc80e
       this.requestRender();
     } catch (error) {
       console.error("清空场景失败:", error);
@@ -3070,7 +3084,21 @@ class SceneManager {
   }
   /** 由 UUID 导出的稳定单位向量，近似均匀分布于球面（与径向方向混合后爆炸更散、更匀） */
   explodeStableUnitDirection(seed, target) {
+<<<<<<< HEAD
     stableExplodeDirection(seed, target);
+=======
+    let h = 2166136261;
+    for (let i = 0; i < seed.length; i++) {
+      h ^= seed.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    const u1 = (h >>> 0) / 4294967296;
+    const u2 = (Math.imul(h ^ 2654435769, 2246822519) >>> 0) / 4294967296;
+    const phi = 2 * Math.PI * u1;
+    const z = 1 - 2 * u2;
+    const r = Math.sqrt(Math.max(0, 1 - z * z));
+    target.set(Math.cos(phi) * r, Math.sin(phi) * r, z).normalize();
+>>>>>>> 85ff37e52f123e1ede73230549f217eded2bc80e
   }
   captureExplodeSnapshot() {
     this.explodeObjectStates.clear();
@@ -3295,9 +3323,15 @@ class SceneManager {
     this.clearLocateFocus();
     const resultSet = expandedTargets;
     this.locateResultSet = resultSet;
+<<<<<<< HEAD
     this.locateFocusUuid = focusUuid && resultSet.has(focusUuid) ? focusUuid : expandedList[0];
     const focusKey = this.locateFocusUuid;
     const dimmedColor = new THREE.Color("#b7bec9");
+=======
+    this.locateFocusUuid = focusUuid && resultSet.has(focusUuid) ? focusUuid : normalized[0];
+    const focusKey = this.locateFocusUuid;
+    const dimmedColor = new THREE.Color("#cfd4dc");
+>>>>>>> 85ff37e52f123e1ede73230549f217eded2bc80e
     const accentColor = new THREE.Color(this.settings.highlightColor || "#ff9f1c");
     this.contentGroup.traverse((child) => {
       const mesh = child;
@@ -3321,9 +3355,15 @@ class SceneManager {
             cloned.color.copy(baseColor.lerp(accentColor, tint));
           } else {
             cloned.transparent = true;
+<<<<<<< HEAD
             cloned.opacity = 0.18;
             cloned.depthWrite = false;
             cloned.color.copy(baseColor.lerp(dimmedColor, 0.84));
+=======
+            cloned.opacity = 0.12;
+            cloned.depthWrite = false;
+            cloned.color.copy(baseColor.lerp(dimmedColor, 0.78));
+>>>>>>> 85ff37e52f123e1ede73230549f217eded2bc80e
           }
         }
         if ("emissive" in cloned && cloned.emissive) {
@@ -3686,6 +3726,56 @@ class SceneManager {
       box.setFromObject(obj);
     }
     if (!box.isEmpty()) targetBox.union(box);
+<<<<<<< HEAD
+=======
+  }
+  unionTilesNodeBounds(node, targetBox) {
+    const encodedBox = node?.userData?.tilesBoundingVolumeBox;
+    if (!Array.isArray(encodedBox) || encodedBox.length < 12) return;
+    const center = new THREE.Vector3(encodedBox[0], encodedBox[1], encodedBox[2]);
+    const axisX = new THREE.Vector3(encodedBox[3], encodedBox[4], encodedBox[5]);
+    const axisY = new THREE.Vector3(encodedBox[6], encodedBox[7], encodedBox[8]);
+    const axisZ = new THREE.Vector3(encodedBox[9], encodedBox[10], encodedBox[11]);
+    const extent = new THREE.Vector3(axisX.length(), axisY.length(), axisZ.length());
+    const box = new THREE.Box3(center.clone().sub(extent), center.clone().add(extent));
+    if (!box.isEmpty()) targetBox.union(box);
+  }
+  unionOptimizedBounds(uuid, targetBox) {
+    const mappings = this.optimizedMapping.get(uuid);
+    if (!mappings || mappings.length === 0) return;
+    const instanceMatrix = new THREE.Matrix4();
+    for (const mapping of mappings) {
+      const geometry = mapping.geometry || mapping.mesh.geometry;
+      if (!geometry.boundingBox) geometry.computeBoundingBox();
+      if (!geometry.boundingBox) continue;
+      mapping.mesh.getMatrixAt(mapping.instanceId, instanceMatrix);
+      instanceMatrix.premultiply(mapping.mesh.matrixWorld);
+      const box = geometry.boundingBox.clone().applyMatrix4(instanceMatrix);
+      if (!box.isEmpty()) targetBox.union(box);
+    }
+  }
+  unionNodeBounds(uuid, targetBox, visited = /* @__PURE__ */ new Set()) {
+    if (!uuid || visited.has(uuid)) return;
+    visited.add(uuid);
+    const obj = this.contentGroup.getObjectByProperty("uuid", uuid);
+    if (obj) {
+      this.unionObjectBounds(obj, targetBox);
+    }
+    this.unionOptimizedBounds(uuid, targetBox);
+    const nodes = this.nodeMap.get(uuid) || [];
+    for (const node of nodes) {
+      this.unionTilesNodeBounds(node, targetBox);
+      const children = Array.isArray(node.children) ? node.children : [];
+      for (const child of children) {
+        this.unionNodeBounds(child.id, targetBox, visited);
+      }
+    }
+  }
+  fitViewToObject(uuid) {
+    const box = new THREE.Box3();
+    this.unionNodeBounds(uuid, box);
+    if (!box.isEmpty()) this.fitBox(box, false);
+>>>>>>> 85ff37e52f123e1ede73230549f217eded2bc80e
   }
   unionTilesNodeBounds(node, targetBox) {
     const encodedBox = node?.userData?.tilesBoundingVolumeBox;
@@ -5892,6 +5982,7 @@ const Toolbar = (props) => {
         }
       ),
       renderDropdown("file", /* @__PURE__ */ jsxs(Fragment, { children: [
+<<<<<<< HEAD
         !isHidden("open_file") && menuItem(/* @__PURE__ */ jsx(IconOpenFile, {}), t("menu_open_file"), () => {
           fileInputRef.current?.click();
           setOpenMenu(null);
@@ -5907,6 +5998,47 @@ const Toolbar = (props) => {
             setOpenMenu(null);
           })
         ] })
+=======
+        !isHidden("open_file") && /* @__PURE__ */ jsx(
+          "div",
+          {
+            style: { padding: "6px 16px", fontSize: "12px", color: theme.text, cursor: "pointer", backgroundColor: "transparent" },
+            onClick: () => {
+              fileInputRef.current?.click();
+              setOpenMenu(null);
+            },
+            onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
+            onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
+            children: t("menu_open_file")
+          }
+        ),
+        !isHidden("export") && /* @__PURE__ */ jsx(
+          "div",
+          {
+            style: { padding: "6px 16px", fontSize: "12px", color: theme.text, cursor: "pointer", backgroundColor: "transparent" },
+            onClick: () => {
+              props.setActiveTool?.("export");
+              setOpenMenu(null);
+            },
+            onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
+            onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
+            children: t("menu_export")
+          }
+        ),
+        !isHidden("clear") && /* @__PURE__ */ jsx(
+          "div",
+          {
+            style: { padding: "6px 16px", fontSize: "12px", color: theme.text, cursor: "pointer", backgroundColor: "transparent" },
+            onClick: () => {
+              props.handleClear?.();
+              setOpenMenu(null);
+            },
+            onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
+            onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
+            children: t("op_clear")
+          }
+        )
+>>>>>>> 85ff37e52f123e1ede73230549f217eded2bc80e
       ] }))
     ] }) }),
     !isHidden("view") && /* @__PURE__ */ jsxs("div", { className: "ui-toolbar-group", children: [
@@ -7043,10 +7175,19 @@ const SceneTree = ({
   const endIndex = Math.min(flatData.length, startIndex + visibleCount + 1);
   const visibleItems = flatData.slice(startIndex, endIndex);
   useEffect(() => {
+<<<<<<< HEAD
     if (selectionSourceRef.current === "tree") {
       selectionSourceRef.current = null;
     }
   }, [selectedUuid]);
+=======
+    if (!selectedUuid || !containerRef.current) return;
+    const targetIndex = flatData.findIndex((node) => node.uuid === selectedUuid);
+    if (targetIndex < 0) return;
+    const itemCenter = targetIndex * rowHeight + rowHeight / 2;
+    containerRef.current.scrollTop = Math.max(0, itemCenter - containerHeight / 2);
+  }, [selectedUuid, flatData, containerHeight, rowHeight]);
+>>>>>>> 85ff37e52f123e1ede73230549f217eded2bc80e
   const toggleNode = (nodeUuid) => {
     const toggle = (nodes) => nodes.map((node) => {
       if (node.uuid === nodeUuid) {
@@ -7365,11 +7506,16 @@ const SceneTree = ({
           "div",
           {
             className: `ui-tree-node ${node.uuid === selectedUuid ? "selected" : ""} ${locateResultUuids.includes(node.uuid) ? "matched" : ""} ${node.uuid === locatedUuid ? "located" : ""}`,
+<<<<<<< HEAD
             style: { paddingLeft: 8 + node.depth * 16 },
             onClick: () => {
               selectionSourceRef.current = "tree";
               onSelect(node.uuid, node.object);
             },
+=======
+            style: { paddingLeft: 8 },
+            onClick: () => onSelect(node.uuid, node.object),
+>>>>>>> 85ff37e52f123e1ede73230549f217eded2bc80e
             onDoubleClick: (e) => {
               if (node.hasChildren) {
                 e.stopPropagation();
@@ -9413,6 +9559,7 @@ function usePersistentState(key, initialValue, options = {}) {
   return [state, setState];
 }
 
+<<<<<<< HEAD
 function useChunkProgress({
   fileSetIdRef,
   completedFileSetsRef,
@@ -9457,6 +9604,8 @@ function useChunkProgress({
   return { onManagerChunkProgress };
 }
 
+=======
+>>>>>>> 85ff37e52f123e1ede73230549f217eded2bc80e
 function normalizePath(path) {
   return path.replace(/\\/g, "/").replace(/^(\.\/)+/, "").replace(/^\/+/, "").toLowerCase();
 }
@@ -9637,6 +9786,7 @@ async function loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t,
       });
     }
     if (ext === "ifc") {
+<<<<<<< HEAD
       const { loadIFC } = await import('./IFCLoader-BghtoYiB.js');
       reportStage("parse", 0);
       return await loadIFC(
@@ -9646,6 +9796,11 @@ async function loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t,
         libPath,
         settings
       );
+=======
+      const { loadIFC } = await import('./IFCLoader-DEnjPaAa.js');
+      reportStage("parse", 0);
+      return await loadIFC(typeof fileOrUrl === "string" ? url : fileOrUrl, (p, msg) => reportStage("parse", p, msg), t, libPath, settings);
+>>>>>>> 85ff37e52f123e1ede73230549f217eded2bc80e
     }
     if (ext === "obj") {
       const [{ OBJLoader }, { MTLLoader }] = await Promise.all([
@@ -11163,11 +11318,16 @@ const ThreeViewer = ({
     const uuid = obj.uuid || obj.id;
     if (!uuid) return;
     setLocatedUuid(uuid);
+<<<<<<< HEAD
     sceneMgr.current.clearLocateFocus();
     sceneMgr.current.isolateObjects([uuid]);
     setHiddenUuids(/* @__PURE__ */ new Set());
     setIsolatedUuids(/* @__PURE__ */ new Set([uuid]));
     updateTree();
+=======
+    const resultSet = locateResultUuids.length > 0 ? locateResultUuids : [uuid];
+    sceneMgr.current.setLocateResultSet(resultSet, uuid);
+>>>>>>> 85ff37e52f123e1ede73230549f217eded2bc80e
     sceneMgr.current.fitViewToObject(uuid);
     void handleSelect(obj);
   }, [handleSelect, updateTree]);
