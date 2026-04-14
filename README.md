@@ -1,6 +1,6 @@
 # @zhangly1403/3dbrowser
 
-Professional 3D model viewer library for React and Web applications. Built with performance and extensibility in mind.
+A high-performance 3D model browser based on Three.js, supporting IFC, GLB, and more. Built with performance and extensibility in mind.
 
 ## Key Features
 
@@ -9,11 +9,14 @@ Professional 3D model viewer library for React and Web applications. Built with 
   - **BIM**: IFC (using web-ifc)
   - **Standard**: GLB/GLTF, FBX, OBJ
   - **Custom**: LMB, NBIM
+  - **3D Tiles**: Support for 3D Tiles format (using 3d-tiles-renderer)
 - **Advanced Tools**:
   - **Measurement**: Distance, angle, and coordinate measurement tools.
   - **Sectioning**: Real-time clipping planes for internal inspection.
   - **Scene Tree**: Interactive hierarchical view of the model structure.
   - **Properties**: Detailed metadata viewer for selected components.
+  - **Clash Detection**: Identify collisions between model elements.
+  - **Explode View**: Visualize model components in exploded form.
 - **Modern Tech Stack**: Built with **React 19**, **Three.js**, and **TypeScript**.
 - **Localization**: Built-in support for English and Chinese out of the box.
 
@@ -27,7 +30,7 @@ npm install @zhangly1403/3dbrowser
 
 You need to copy the `libs` folder from the package to your project's public directory. This folder contains the required WASM and worker files for decoding IFC and OCC files.
 
-1. Copy `node_modules/@zhangly1403/3dbrowser/dist/libs` to your project's `public/libs` folder.
+1. Copy `node_modules/@zhangly1403/3dbrowser/libs` to your project's `public/libs` folder.
 2. Specify the `libPath` prop in the component if you placed them in a different location (default is `./libs`).
 
 ## Quick Usage
@@ -96,7 +99,7 @@ This project is intended for learning and research purposes only. **Commercial u
 
 # @zhangly1403/3dbrowser (中文)
 
-专业的 React 3D 模型浏览器组件库，专注于高性能和易用性。
+基于 Three.js 的高性能 3D 模型浏览器，支持 IFC、GLB 等多种格式。
 
 ## 特色功能
 
@@ -105,11 +108,14 @@ This project is intended for learning and research purposes only. **Commercial u
   - **BIM**: IFC (基于 web-ifc)
   - **标准格式**: GLB/GLTF, FBX, OBJ
   - **自定义格式**: LMB, NBIM
+  - **3D Tiles**: 支持 3D Tiles 格式（使用 3d-tiles-renderer）
 - **高级工具**:
   - **测量**: 距离、角度、坐标测量。
   - **剖切**: 实时剖切面，方便查看内部结构。
   - **场景树**: 交互式构件树状结构视图。
   - **属性面板**: 选中构件的详细属性查看。
+  - **碰撞检测**: 识别模型元素之间的碰撞。
+  - **爆炸视图**: 以爆炸形式可视化模型组件。
 - **现代技术栈**: 基于 **React 19**, **Three.js** 和 **TypeScript** 构建。
 - **双语支持**: 内置完善的中英文支持。
 
@@ -123,7 +129,7 @@ npm install @zhangly1403/3dbrowser
 
 您需要将包中的 `libs` 文件夹复制到您项目的 public 目录下。该文件夹包含了解码 IFC 和 OCC 文件所需的 WASM 和 worker 文件。
 
-1. 复制 `node_modules/@zhangly1403/3dbrowser/dist/libs` 到您项目的 `public/libs` 文件夹。
+1. 复制 `node_modules/@zhangly1403/3dbrowser/libs` 到您项目的 `public/libs` 文件夹。
 2. 如果放置在其他位置，请在组件中指定 `libPath` 属性（默认为 `./libs`）。
 
 ## 快速上手
