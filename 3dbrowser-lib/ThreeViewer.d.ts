@@ -1,11 +1,10 @@
-import "./src/styles/index.css";
-import { SceneManager, SceneSettings, PerformancePreset, SceneChunkOptions } from "./src/utils/SceneManager";
-import { Lang } from "./src/theme/Locales";
+import "./styles/index.css";
+import { SceneManager, SceneSettings, PerformancePreset, SceneChunkOptions } from "./utils/scene-manager/SceneManager";
+import { Lang } from "./theme/locales";
 export interface ThreeViewerProps {
     allowDragOpen?: boolean;
     hiddenMenus?: string[];
     libPath?: string;
-    defaultTheme?: 'dark' | 'light';
     defaultLang?: Lang;
     showStats?: boolean;
     showOutline?: boolean;
@@ -18,5 +17,5 @@ export interface ThreeViewerProps {
     performancePreset?: PerformancePreset;
     chunkOptions?: SceneChunkOptions;
 }
-export declare const ThreeViewer: ({ allowDragOpen, hiddenMenus, libPath, defaultTheme, defaultLang, showStats: propShowStats, showOutline: propShowOutline, showProperties: propShowProperties, initialSettings, initialFiles, onSelect: propOnSelect, onLoad, hideDeleteModel, performancePreset, chunkOptions }: ThreeViewerProps) => import("react/jsx-runtime").JSX.Element;
+export declare const ThreeViewer: ({ allowDragOpen, hiddenMenus, libPath, defaultLang, showStats: propShowStats, showOutline: propShowOutline, showProperties: propShowProperties, initialSettings, initialFiles, onSelect: propOnSelect, onLoad, hideDeleteModel, performancePreset, chunkOptions }: ThreeViewerProps) => import("react/jsx-runtime").JSX.Element;
 export default ThreeViewer;

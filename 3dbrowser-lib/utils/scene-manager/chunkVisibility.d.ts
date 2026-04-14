@@ -1,0 +1,70 @@
+import * as THREE from "three";
+import type { ChunkRenderPhase, ChunkRuntimeProfileLike } from "./chunkScheduling";
+export interface ChunkVisibilityEvaluation {
+    shouldSkipSample: boolean;
+    shouldBeVisible: boolean;
+    effectiveVisible: boolean;
+    isPeripheralWhileMoving: boolean;
+    shouldRefreshPeripheral: boolean;
+    centerPriorityWindow: boolean;
+    isPeripheralCandidate: boolean;
+    priority: number | null;
+    dist: number;
+    centrality: number;
+    forwardness: number;
+    pixelSize: number;
+    cacheKey?: string;
+}
+export declare function ensureChunkSpatialState(options: {
+    chunk: any;
+    padding: number;
+    tempSize: THREE.Vector3;
+}): void;
+export declare function evaluateChunkVisibility(options: {
+    chunk: any;
+    chunkIndex: number;
+    totalChunks: number;
+    now: number;
+    phase: ChunkRenderPhase;
+    profile: ChunkRuntimeProfileLike & {
+        movingFocusCentralityThreshold: number;
+        movingFocusPixelThreshold: number;
+        chunkVisibilityHoldMs: number;
+        centerPriorityThreshold: number;
+        forwardPriorityThreshold: number;
+        centerPriorityWindowMs: number;
+    };
+    performanceMode: "balanced" | "smooth" | "quality";
+    isBoxClipped: boolean;
+    inFrustum: boolean;
+    maxRenderDistance: number;
+    cameraPos: THREE.Vector3;
+    cameraForward: THREE.Vector3;
+    projScreenMatrix: THREE.Matrix4;
+    toChunkDirection: THREE.Vector3;
+    tempCenterNdc: THREE.Vector3;
+    viewHeight: number;
+    canvasHeight: number;
+    sampleUnloadedWhileMoving: boolean;
+    movingSampleStride: number;
+    movingSampleSeed: number;
+    resolveShouldRefreshPeripheral: (isPeripheralWhileMoving: boolean) => boolean;
+    chunkWarmupActive: boolean;
+    chunkLoadedCount: number;
+    initialChunkLoadTarget: number;
+    chunkLoadResumeAt: number;
+    chunkMeshCached: boolean;
+}): {
+    shouldSkipSample: boolean;
+    shouldBeVisible: boolean;
+    effectiveVisible: any;
+    isPeripheralWhileMoving: boolean;
+    shouldRefreshPeripheral: boolean;
+    centerPriorityWindow: boolean;
+    isPeripheralCandidate: boolean;
+    priority: number;
+    dist: any;
+    centrality: number;
+    forwardness: number;
+    pixelSize: number;
+};

@@ -1,6 +1,6 @@
 {
   "name": "@zhangly1403/3dbrowser",
-  "version": "1.5.7",
+  "version": "1.6.0",
   "description": "A high-performance 3D model browser based on Three.js, supporting IFC, GLB, and more.",
   "keywords": [
     "threejs",

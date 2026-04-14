@@ -1,8 +1,9 @@
 import { jsx, jsxs, Fragment } from 'react/jsx-runtime';
 import React, { useState, useEffect, useRef, useCallback, useMemo, Component } from 'react';
 import * as THREE from 'three';
+import { Vector3, Matrix3, MathUtils, Box3, Matrix4, Ray } from 'three';
 import { O as OrbitControls } from './loaders-TXHpcosE.js';
-import { c as calculateGeometryMemory, b as buildOctree, a as collectLeafNodes, d as createBatchedMeshFromItemsAsync, e as collectItemsBatched, f as collectItems, g as exportGLB, h as exportLMB } from './utils-BDOQlmUW.js';
+import { c as createBatchedMeshFromItemsAsync, a as calculateGeometryMemory, b as buildOctree, d as collectLeafNodes, e as collectItemsBatched, f as collectItems, g as exportGLB, h as exportLMB } from './utils-DN_d7V9M.js';
 
 function deriveInitialRuntimeFromHardware(cpuCount, preset) {
   const normalizedCpu = Math.max(2, cpuCount);
@@ -54,6 +55,2589 @@ async function readNbimManifest(file, header) {
   return JSON.parse(manifestText);
 }
 
+function ensureRectElement(state) {
+  if (state.rectElement) return state.rectElement;
+  const rectElement = document.createElement("div");
+  rectElement.style.cssText = `
+        position: fixed; border: 1px dashed #00aaff;
+        background: rgba(0, 170, 255, 0.08); pointer-events: none; z-index: 1000;
+    `;
+  document.body.appendChild(rectElement);
+  state.rectElement = rectElement;
+  return rectElement;
+}
+function updateRectElement(state) {
+  const rectElement = ensureRectElement(state);
+  rectElement.style.left = `${Math.min(state.startX, state.endX)}px`;
+  rectElement.style.top = `${Math.min(state.startY, state.endY)}px`;
+  rectElement.style.width = `${Math.abs(state.endX - state.startX)}px`;
+  rectElement.style.height = `${Math.abs(state.endY - state.startY)}px`;
+}
+function createInitialBoxSelectState() {
+  return {
+    active: false,
+    startX: 0,
+    startY: 0,
+    endX: 0,
+    endY: 0,
+    rectElement: null
+  };
+}
+function applyStartBoxSelect(prevState, clientX, clientY) {
+  const state = {
+    ...prevState,
+    active: true,
+    startX: clientX,
+    startY: clientY,
+    endX: clientX,
+    endY: clientY
+  };
+  updateRectElement(state);
+  return { state };
+}
+function applyUpdateBoxSelect(prevState, clientX, clientY) {
+  if (!prevState.active) {
+    return { state: prevState };
+  }
+  const state = {
+    ...prevState,
+    endX: clientX,
+    endY: clientY
+  };
+  updateRectElement(state);
+  return { state };
+}
+function applyCancelBoxSelect(prevState) {
+  if (prevState.rectElement) {
+    prevState.rectElement.remove();
+  }
+  return {
+    state: {
+      ...prevState,
+      active: false,
+      rectElement: null
+    }
+  };
+}
+function applyEndBoxSelect(prevState, canvas, selectByScreenRect) {
+  if (!prevState.active) {
+    return {
+      state: prevState,
+      selected: []
+    };
+  }
+  const { state } = applyCancelBoxSelect(prevState);
+  const { startX, startY, endX, endY } = prevState;
+  const dx = Math.abs(endX - startX);
+  const dy = Math.abs(endY - startY);
+  if (dx < 5 || dy < 5) {
+    return { state, selected: [] };
+  }
+  const rect = canvas.getBoundingClientRect();
+  const x1 = (Math.min(startX, endX) - rect.left) / rect.width * 2 - 1;
+  const y1 = -(Math.max(startY, endY) - rect.top) / rect.height * 2 + 1;
+  const x2 = (Math.max(startX, endX) - rect.left) / rect.width * 2 - 1;
+  const y2 = -(Math.min(startY, endY) - rect.top) / rect.height * 2 + 1;
+  return {
+    state,
+    selected: selectByScreenRect(x1, y1, x2, y2)
+  };
+}
+
+function getChunkReadCacheKey(chunk) {
+  return `${chunk.nbimFileId || "local"}:${chunk.byteOffset || 0}:${chunk.byteLength || 0}`;
+}
+function hasValidChunkBinaryRange(chunk) {
+  return Number.isFinite(chunk?.byteOffset) && Number.isFinite(chunk?.byteLength) && chunk.byteLength > 0;
+}
+function touchChunkReadCache(cacheOrder, cacheKey) {
+  const nextOrder = cacheOrder.filter((key) => key !== cacheKey);
+  nextOrder.push(cacheKey);
+  return nextOrder;
+}
+function putChunkReadCache(options) {
+  const {
+    chunkReadCache,
+    chunkReadCacheOrder,
+    cacheKey,
+    buffer,
+    chunkReadCacheSize
+  } = options;
+  chunkReadCache.set(cacheKey, buffer);
+  let nextOrder = touchChunkReadCache(chunkReadCacheOrder, cacheKey);
+  while (nextOrder.length > chunkReadCacheSize) {
+    const evictKey = nextOrder.shift();
+    if (!evictKey) continue;
+    chunkReadCache.delete(evictKey);
+  }
+  return nextOrder;
+}
+async function readChunkBuffer(options) {
+  const {
+    chunk,
+    nbimFiles,
+    chunkReadCache,
+    chunkReadCacheOrder,
+    chunkReadCacheSize
+  } = options;
+  const cacheKey = getChunkReadCacheKey(chunk);
+  const cached = chunkReadCache.get(cacheKey);
+  if (cached) {
+    return {
+      buffer: cached.slice(0),
+      chunkReadCacheOrder: touchChunkReadCache(chunkReadCacheOrder, cacheKey)
+    };
+  }
+  const file = nbimFiles.get(chunk.nbimFileId);
+  if (!file) {
+    throw new Error(`NBIM file not found for chunk: ${chunk.id}`);
+  }
+  const buffer = await file.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength).arrayBuffer();
+  return {
+    buffer,
+    chunkReadCacheOrder: putChunkReadCache({
+      chunkReadCache,
+      chunkReadCacheOrder,
+      cacheKey,
+      buffer: buffer.slice(0),
+      chunkReadCacheSize
+    })
+  };
+}
+function enqueueChunkPrefetch(options) {
+  const {
+    chunkIds,
+    chunkPrefetchWindow,
+    prefetchQueue,
+    prefetchQueueSet,
+    prefetchInFlight
+  } = options;
+  if (chunkPrefetchWindow <= 0) {
+    return prefetchQueue;
+  }
+  const nextQueue = [...prefetchQueue];
+  for (const chunkId of chunkIds) {
+    if (prefetchQueueSet.has(chunkId)) continue;
+    if (prefetchInFlight.has(chunkId)) continue;
+    nextQueue.push(chunkId);
+    prefetchQueueSet.add(chunkId);
+  }
+  return nextQueue;
+}
+function collectPrefetchCandidates(options) {
+  const {
+    visibleChunks,
+    chunkPrefetchWindow,
+    prefetchPaused,
+    isCameraMoving,
+    prefetchRoundRobinCursor,
+    chunks,
+    processingChunks,
+    chunkReadCache,
+    getChunkIndex
+  } = options;
+  if (chunkPrefetchWindow <= 0 || prefetchPaused || isCameraMoving || visibleChunks.length === 0) {
+    return {
+      chunkIds: [],
+      prefetchRoundRobinCursor
+    };
+  }
+  const toPrefetch = [];
+  for (let index = 0; index < visibleChunks.length && toPrefetch.length < chunkPrefetchWindow; index++) {
+    const pivot = visibleChunks[(prefetchRoundRobinCursor + index) % visibleChunks.length];
+    const pivotIndex = getChunkIndex(pivot.id);
+    if (pivotIndex < 0) continue;
+    const nextChunk = chunks[pivotIndex + 1];
+    if (!nextChunk || nextChunk.loaded || processingChunks.has(nextChunk.id)) continue;
+    if (!nextChunk.nbimFileId || !hasValidChunkBinaryRange(nextChunk)) continue;
+    const cacheKey = getChunkReadCacheKey(nextChunk);
+    if (chunkReadCache.has(cacheKey)) continue;
+    toPrefetch.push(nextChunk.id);
+  }
+  return {
+    chunkIds: toPrefetch,
+    prefetchRoundRobinCursor: prefetchRoundRobinCursor + 1
+  };
+}
+
+function applyUnloadChunk(options) {
+  const { chunk, unregisterOptimizedMeshMapping, cacheChunkMesh, ensureChunkGhost } = options;
+  if (!chunk.loaded || !chunk.mesh) {
+    return {
+      changed: false,
+      chunkLoadedCountDelta: 0
+    };
+  }
+  const mesh = chunk.mesh;
+  unregisterOptimizedMeshMapping(mesh);
+  if (mesh.parent) {
+    mesh.parent.remove(mesh);
+  }
+  cacheChunkMesh(chunk, mesh);
+  ensureChunkGhost(chunk);
+  chunk.mesh = null;
+  chunk.loaded = false;
+  return {
+    changed: true,
+    chunkLoadedCountDelta: -1
+  };
+}
+async function resolveChunkMeshForLoad(options) {
+  const {
+    chunk,
+    sharedMaterial,
+    takeCachedChunkMesh,
+    yieldToMainThread,
+    nbimFiles,
+    hasValidChunkBinaryRange,
+    readChunkBuffer,
+    nbimMeta,
+    runWorkerTask,
+    reconstructBatchedMesh,
+    isCameraMoving,
+    chunkPrefetchWindow,
+    getChunkIndex,
+    chunks,
+    processingChunks
+  } = options;
+  const cachedMesh = takeCachedChunkMesh(chunk.id);
+  if (cachedMesh) {
+    return { mesh: cachedMesh, prefetchCandidates: [] };
+  }
+  if (chunk.node) {
+    const mesh = await createBatchedMeshFromItemsAsync(chunk.node.items, sharedMaterial, {
+      batchSize: 1200,
+      yieldControl: () => yieldToMainThread()
+    });
+    return { mesh, prefetchCandidates: [] };
+  }
+  if (chunk.nbimFileId && nbimFiles.has(chunk.nbimFileId) && hasValidChunkBinaryRange(chunk)) {
+    const buffer = await readChunkBuffer(chunk);
+    const meta = nbimMeta.get(chunk.nbimFileId);
+    const version = meta?.version ?? 8;
+    if (version !== 8) {
+      throw new Error(`Unsupported NBIM version: ${version}. Only V8 is supported.`);
+    }
+    const workerResult = await runWorkerTask({
+      buffer,
+      version,
+      originalUuid: chunk.originalUuid,
+      bimIdTable: meta?.bimIdTable
+    }, [buffer]);
+    const mesh = reconstructBatchedMesh(workerResult, sharedMaterial);
+    const prefetchCandidates = [];
+    if (!isCameraMoving && chunkPrefetchWindow > 0) {
+      const chunkIndex = getChunkIndex(chunk.id);
+      if (chunkIndex >= 0) {
+        for (let i = 1; i <= chunkPrefetchWindow; i++) {
+          const next = chunks[chunkIndex + i];
+          if (!next) break;
+          if (next.loaded || processingChunks.has(next.id)) continue;
+          if (!next.nbimFileId || !hasValidChunkBinaryRange(next)) continue;
+          prefetchCandidates.push(next.id);
+        }
+      }
+    }
+    return { mesh, prefetchCandidates };
+  }
+  return { mesh: null, prefetchCandidates: [] };
+}
+function attachLoadedChunkMesh(options) {
+  const {
+    chunk,
+    mesh,
+    cancelledChunkIds,
+    chunkIdSet,
+    disposeChunkMesh,
+    globalOffset,
+    contentGroup,
+    registerOptimizedMeshMapping
+  } = options;
+  if (cancelledChunkIds.has(chunk.id) || !chunkIdSet.has(chunk.id)) {
+    disposeChunkMesh(mesh);
+    return { attached: false };
+  }
+  mesh.name = chunk.id;
+  mesh.userData.chunkId = chunk.id;
+  mesh.userData.originalUuid = chunk.originalUuid;
+  if (chunk.nbimFileId) {
+    mesh.position.sub(globalOffset);
+    mesh.updateMatrixWorld(true);
+  }
+  let optimizedGroup = contentGroup.getObjectByName(chunk.groupName);
+  if (!optimizedGroup) {
+    optimizedGroup = new THREE.Group();
+    optimizedGroup.name = chunk.groupName;
+    optimizedGroup.userData.isOptimizedGroup = true;
+    optimizedGroup.userData.originalUuid = chunk.originalUuid;
+    contentGroup.add(optimizedGroup);
+  }
+  optimizedGroup.add(mesh);
+  chunk.mesh = mesh;
+  registerOptimizedMeshMapping(mesh);
+  return { attached: true };
+}
+function finalizeLoadedChunk(options) {
+  const {
+    chunk,
+    loadedNow,
+    now,
+    chunkLoadedCount,
+    chunkWarmupActive,
+    initialChunkLoadTarget,
+    deactivateFastPreviewForModel
+  } = options;
+  let nextChunkLoadedCount = chunkLoadedCount;
+  let nextChunkWarmupActive = chunkWarmupActive;
+  let progressChanged = false;
+  if (loadedNow && !chunk.loaded) {
+    chunk.loaded = true;
+    nextChunkLoadedCount++;
+    chunk.lastVisibleAt = now;
+    chunk.lastFocusAt = now;
+    if (chunk.originalUuid) {
+      deactivateFastPreviewForModel(chunk.originalUuid);
+    }
+    if (nextChunkWarmupActive && nextChunkLoadedCount >= initialChunkLoadTarget) {
+      nextChunkWarmupActive = false;
+    }
+    progressChanged = true;
+  }
+  return {
+    nextChunkLoadedCount,
+    nextChunkWarmupActive,
+    progressChanged
+  };
+}
+function cleanupChunkGhost(options) {
+  const { chunkId, ghostGroup, releaseGhostLine } = options;
+  const ghost = ghostGroup.getObjectByName(`ghost_${chunkId}`);
+  if (!ghost) {
+    return { changed: false };
+  }
+  ghostGroup.remove(ghost);
+  releaseGhostLine(ghost);
+  return { changed: true };
+}
+
+function selectChunksToUnload(options) {
+  const {
+    isCameraMoving,
+    loadedChunks,
+    maxLoadedChunks,
+    cameraPos,
+    now,
+    chunkResidencyMs
+  } = options;
+  if (isCameraMoving || loadedChunks.length <= maxLoadedChunks) {
+    return [];
+  }
+  const sortedChunks = [...loadedChunks].sort(
+    (a, b) => b.center.distanceToSquared(cameraPos) - a.center.distanceToSquared(cameraPos)
+  );
+  const targetUnload = sortedChunks.length - maxLoadedChunks;
+  const unloadTargets = [];
+  for (const chunk of sortedChunks) {
+    if (unloadTargets.length >= targetUnload) {
+      break;
+    }
+    const lastTouchedAt = Math.max(chunk.lastVisibleAt || 0, chunk.lastFocusAt || 0);
+    if (now - lastTouchedAt < chunkResidencyMs) {
+      continue;
+    }
+    if (!chunk.mesh || !chunk.mesh.visible) {
+      unloadTargets.push(chunk);
+    }
+  }
+  return unloadTargets;
+}
+function planChunkLoads(options) {
+  const {
+    toLoad,
+    now,
+    chunkLoadResumeAt,
+    maxConcurrentChunkLoads,
+    processingChunkCount,
+    chunkWarmupActive,
+    chunkLoadedCount,
+    initialChunkLoadTarget,
+    warmupChunkBoost,
+    getChunkFrameBudget,
+    phase,
+    profile
+  } = options;
+  if (toLoad.length === 0 || now < chunkLoadResumeAt) {
+    return [];
+  }
+  const sortedChunks = [...toLoad].sort((a, b) => b.priority - a.priority);
+  const available = maxConcurrentChunkLoads - processingChunkCount;
+  if (available <= 0) {
+    return [];
+  }
+  const warmupExtra = chunkWarmupActive && chunkLoadedCount < initialChunkLoadTarget ? warmupChunkBoost : 0;
+  const frameBudget = getChunkFrameBudget(phase, profile, warmupExtra);
+  const count = Math.min(available, frameBudget, sortedChunks.length);
+  return sortedChunks.slice(0, count);
+}
+
+function reconstructBatchedMeshFromWorkerData(options) {
+  const { data, material, resolveUuidByBimId } = options;
+  const { geometries: geoData, instances: instData, originalUuid } = data;
+  const hasAnyIndex = geoData.some((geometry) => geometry.index && geometry.index.length > 0);
+  const geometries = geoData.map((geometryData) => {
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(geometryData.position, 3));
+    geometry.setAttribute("normal", new THREE.BufferAttribute(geometryData.normal, 3));
+    if (geometryData.index && geometryData.index.length > 0) {
+      geometry.setIndex(new THREE.BufferAttribute(geometryData.index, 1));
+    } else if (hasAnyIndex) {
+      const count = geometryData.position.length / 3;
+      const index = new Uint32Array(count);
+      for (let i = 0; i < count; i++) {
+        index[i] = i;
+      }
+      geometry.setIndex(new THREE.BufferAttribute(index, 1));
+    }
+    return geometry;
+  });
+  let totalVerts = 0;
+  let totalIndices = 0;
+  geometries.forEach((geometry) => {
+    totalVerts += geometry.attributes.position.count;
+    if (geometry.index) {
+      totalIndices += geometry.index.count;
+    }
+  });
+  const batchedMesh = new THREE.BatchedMesh(instData.length, totalVerts, totalIndices, material);
+  batchedMesh.frustumCulled = false;
+  batchedMesh.perInstanceFrustumCulling = false;
+  const geometryIds = geometries.map((geometry) => batchedMesh.addGeometry(geometry));
+  const matrix = new THREE.Matrix4();
+  const color = new THREE.Color();
+  const batchIdToUuid = /* @__PURE__ */ new Map();
+  const batchIdToBimId = /* @__PURE__ */ new Map();
+  const batchIdToColor = /* @__PURE__ */ new Map();
+  const batchIdToGeometry = /* @__PURE__ */ new Map();
+  instData.forEach((instance) => {
+    color.setHex(instance.color);
+    matrix.fromArray(instance.matrix);
+    const instanceId = batchedMesh.addInstance(geometryIds[instance.geoIdx]);
+    batchedMesh.setMatrixAt(instanceId, matrix);
+    batchedMesh.setColorAt(instanceId, color);
+    const geometry = geometries[instance.geoIdx];
+    if (!geometry.boundingBox) {
+      geometry.computeBoundingBox();
+    }
+    if (geometry.boundingBox && batchedMesh.setBoundingBoxAt) {
+      batchedMesh.setBoundingBoxAt(instanceId, geometry.boundingBox);
+    }
+    const bimId = instance.bimId;
+    batchIdToUuid.set(instanceId, resolveUuidByBimId(originalUuid, bimId));
+    batchIdToBimId.set(instanceId, bimId);
+    batchIdToColor.set(instanceId, instance.color);
+    batchIdToGeometry.set(instanceId, geometry);
+  });
+  batchedMesh.userData.batchIdToUuid = batchIdToUuid;
+  batchedMesh.userData.batchIdToBimId = batchIdToBimId;
+  batchedMesh.userData.batchIdToColor = batchIdToColor;
+  batchedMesh.userData.batchIdToGeometry = batchIdToGeometry;
+  batchedMesh.computeBoundingBox();
+  batchedMesh.computeBoundingSphere();
+  return batchedMesh;
+}
+
+async function processChunkPrefetchQueue(options) {
+  const {
+    prefetchPaused,
+    isCameraMoving,
+    prefetchQueue,
+    prefetchQueueSet,
+    prefetchInFlight,
+    maxWorkers,
+    getChunkById,
+    chunkReadCache,
+    readChunkBuffer,
+    processQueue
+  } = options;
+  if (prefetchPaused || isCameraMoving || prefetchQueue.length === 0) {
+    return;
+  }
+  const maxParallel = Math.max(1, Math.min(4, Math.floor(maxWorkers / 2)));
+  while (!prefetchPaused && !isCameraMoving && prefetchQueue.length > 0 && prefetchInFlight.size < maxParallel) {
+    const chunkId = prefetchQueue.shift();
+    if (!chunkId) break;
+    prefetchQueueSet.delete(chunkId);
+    const chunk = getChunkById(chunkId);
+    if (!chunk || !chunk.nbimFileId || !hasValidChunkBinaryRange(chunk)) {
+      continue;
+    }
+    const cacheKey = getChunkReadCacheKey(chunk);
+    if (chunkReadCache.has(cacheKey)) {
+      continue;
+    }
+    prefetchInFlight.add(chunkId);
+    void readChunkBuffer(chunk).catch((error) => {
+      debugWarn("SceneManager/prefetch", `prefetch failed for ${chunkId}`, error);
+    }).finally(() => {
+      prefetchInFlight.delete(chunkId);
+      if (prefetchQueue.length > 0) {
+        void processQueue();
+      }
+    });
+  }
+}
+
+function disposeChunkMeshResource(options) {
+  const { mesh, sharedMaterial } = options;
+  if (mesh.geometry) {
+    mesh.geometry.dispose();
+  }
+  if (mesh.material && mesh.material !== sharedMaterial) {
+    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    materials.forEach((material) => material.dispose && material.dispose());
+  }
+}
+function touchChunkMeshCacheOrder(chunkCacheOrder, chunkId) {
+  return [...chunkCacheOrder.filter((id) => id !== chunkId), chunkId];
+}
+function cacheChunkMeshEntry(options) {
+  const {
+    chunk,
+    mesh,
+    chunkMeshCache,
+    chunkCacheOrder,
+    maxCachedChunks,
+    disposeChunkMesh
+  } = options;
+  if (chunkMeshCache.has(chunk.id)) {
+    const oldMesh = chunkMeshCache.get(chunk.id);
+    if (oldMesh !== mesh) {
+      disposeChunkMesh(oldMesh);
+    }
+  }
+  chunkMeshCache.set(chunk.id, mesh);
+  let nextChunkCacheOrder = touchChunkMeshCacheOrder(chunkCacheOrder, chunk.id);
+  while (nextChunkCacheOrder.length > maxCachedChunks) {
+    const evictId = nextChunkCacheOrder.shift();
+    if (!evictId) break;
+    const cached = chunkMeshCache.get(evictId);
+    if (!cached) continue;
+    chunkMeshCache.delete(evictId);
+    disposeChunkMesh(cached);
+  }
+  return {
+    chunkMeshCache,
+    chunkCacheOrder: nextChunkCacheOrder
+  };
+}
+function takeCachedChunkMeshEntry(options) {
+  const { chunkId, chunkMeshCache, chunkCacheOrder } = options;
+  const mesh = chunkMeshCache.get(chunkId) || null;
+  if (!mesh) {
+    return {
+      mesh: null,
+      chunkCacheOrder
+    };
+  }
+  chunkMeshCache.delete(chunkId);
+  return {
+    mesh,
+    chunkCacheOrder: chunkCacheOrder.filter((id) => id !== chunkId)
+  };
+}
+function clearChunkMeshCacheEntries(options) {
+  const { chunkMeshCache, chunkCacheOrder, disposeChunkMesh, filter } = options;
+  for (const [chunkId, mesh] of chunkMeshCache.entries()) {
+    if (filter && !filter(chunkId, mesh)) continue;
+    disposeChunkMesh(mesh);
+    chunkMeshCache.delete(chunkId);
+  }
+  return chunkCacheOrder.filter((chunkId) => chunkMeshCache.has(chunkId));
+}
+function unregisterOptimizedMeshResourceMapping(options) {
+  const { mesh, optimizedMapping } = options;
+  const batchIdToUuid = mesh.userData.batchIdToUuid;
+  if (!batchIdToUuid) return;
+  for (const [batchId, originalUuid] of batchIdToUuid.entries()) {
+    const mapping = optimizedMapping.get(originalUuid);
+    if (!mapping) continue;
+    const index = mapping.findIndex((item) => item.mesh === mesh && item.instanceId === batchId);
+    if (index !== -1) {
+      mapping.splice(index, 1);
+    }
+    if (mapping.length === 0) {
+      optimizedMapping.delete(originalUuid);
+    }
+  }
+}
+function registerOptimizedMeshResourceMapping(options) {
+  const { mesh, optimizedMapping } = options;
+  const batchIdToUuid = mesh.userData.batchIdToUuid;
+  const batchIdToColor = mesh.userData.batchIdToColor;
+  const batchIdToGeometry = mesh.userData.batchIdToGeometry;
+  if (!batchIdToUuid) return;
+  for (const [batchId, originalUuid] of batchIdToUuid.entries()) {
+    if (!optimizedMapping.has(originalUuid)) {
+      optimizedMapping.set(originalUuid, []);
+    }
+    const originalColor = batchIdToColor?.get(batchId) ?? 16777215;
+    const geometry = batchIdToGeometry?.get(batchId);
+    optimizedMapping.get(originalUuid).push({
+      mesh,
+      instanceId: batchId,
+      originalColor,
+      geometry
+    });
+  }
+}
+function acquireGhostLineResource(options) {
+  const { ghostMeshPool, ghostEdgesGeometry, ghostMaterial } = options;
+  const reused = ghostMeshPool.pop();
+  if (reused) {
+    reused.visible = true;
+    return reused;
+  }
+  return new THREE.LineSegments(ghostEdgesGeometry, ghostMaterial);
+}
+function releaseGhostLineResource(options) {
+  const { line, ghostMeshPool } = options;
+  line.visible = false;
+  line.name = "";
+  line.scale.set(1, 1, 1);
+  line.position.set(0, 0, 0);
+  if (line.material instanceof THREE.LineBasicMaterial) {
+    line.material.opacity = 0.3;
+  }
+  ghostMeshPool.push(line);
+}
+function createGhostLineResource(options) {
+  const { name, bounds, acquireGhostLine } = options;
+  const size = new THREE.Vector3();
+  const center = new THREE.Vector3();
+  bounds.getSize(size);
+  bounds.getCenter(center);
+  const edges = acquireGhostLine();
+  edges.name = name;
+  edges.scale.copy(size);
+  edges.position.copy(center);
+  return edges;
+}
+function ensureChunkGhostResource(options) {
+  const { chunk, ghostGroup, createGhostLine } = options;
+  if (ghostGroup.getObjectByName(`ghost_${chunk.id}`)) {
+    return;
+  }
+  const edges = createGhostLine(`ghost_${chunk.id}`, chunk.bounds);
+  ghostGroup.add(edges);
+}
+
+function queueChunkWorkerTask(options) {
+  const { workerQueue, data, transferables, processQueue } = options;
+  return new Promise((resolve, reject) => {
+    workerQueue.push({ resolve, reject, data, transferables });
+    processQueue();
+  });
+}
+function processChunkWorkerQueue(options) {
+  const {
+    activeWorkerCount,
+    maxWorkers,
+    workerQueue,
+    workers,
+    createWorker,
+    getActiveWorkerCount,
+    onActiveWorkerCountChange,
+    processQueue
+  } = options;
+  if (activeWorkerCount >= maxWorkers || workerQueue.length === 0) {
+    return;
+  }
+  const task = workerQueue.shift();
+  onActiveWorkerCountChange(activeWorkerCount + 1);
+  const worker = workers.pop() ?? createWorker();
+  const onMessage = (event) => {
+    worker.removeEventListener("message", onMessage);
+    worker.removeEventListener("error", onError);
+    workers.push(worker);
+    onActiveWorkerCountChange(Math.max(0, getActiveWorkerCount() - 1));
+    if (event.data.type === "success") {
+      task.resolve(event.data.result);
+    } else {
+      task.reject(new Error(event.data.error));
+    }
+    processQueue();
+  };
+  const onError = (event) => {
+    worker.removeEventListener("message", onMessage);
+    worker.removeEventListener("error", onError);
+    onActiveWorkerCountChange(Math.max(0, getActiveWorkerCount() - 1));
+    task.reject(new Error(event.message));
+    processQueue();
+  };
+  worker.addEventListener("message", onMessage);
+  worker.addEventListener("error", onError);
+  worker.postMessage(task.data, task.transferables);
+}
+function disposeChunkWorkerPool(options) {
+  const { workers, workerQueue, rejectReason } = options;
+  for (const worker of workers) {
+    try {
+      worker.terminate();
+    } catch (error) {
+      console.warn("Worker terminate failed:", error);
+    }
+  }
+  if (workerQueue.length > 0) {
+    const pending = workerQueue.splice(0, workerQueue.length);
+    pending.forEach((task) => task.reject(new Error(rejectReason)));
+  }
+}
+
+function ensureChunkSpatialState(options) {
+  const { chunk, padding, tempSize } = options;
+  if (!chunk.paddedBounds || chunk._padding !== padding) {
+    const size = chunk.bounds.getSize(tempSize);
+    const paddedBounds = chunk.bounds.clone();
+    paddedBounds.expandByVector(size.multiplyScalar(padding));
+    chunk.paddedBounds = paddedBounds;
+    chunk._padding = padding;
+  }
+  if (!chunk.center) {
+    chunk.center = chunk.bounds.getCenter(new THREE.Vector3());
+  }
+}
+function evaluateChunkVisibility(options) {
+  const {
+    chunk,
+    chunkIndex,
+    totalChunks,
+    now,
+    phase,
+    profile,
+    performanceMode,
+    isBoxClipped,
+    maxRenderDistance,
+    cameraPos,
+    cameraForward,
+    projScreenMatrix,
+    toChunkDirection,
+    tempCenterNdc,
+    viewHeight,
+    canvasHeight,
+    sampleUnloadedWhileMoving,
+    movingSampleStride,
+    movingSampleSeed,
+    resolveShouldRefreshPeripheral,
+    chunkWarmupActive,
+    chunkLoadedCount,
+    initialChunkLoadTarget,
+    chunkLoadResumeAt,
+    chunkMeshCached
+  } = options;
+  toChunkDirection.copy(chunk.center).sub(cameraPos);
+  const dist = toChunkDirection.length();
+  const inRange = dist < maxRenderDistance;
+  if (sampleUnloadedWhileMoving && !chunk.loaded && chunkIndex % movingSampleStride !== movingSampleSeed) {
+    return {
+      shouldSkipSample: true,
+      shouldBeVisible: false,
+      effectiveVisible: false,
+      isPeripheralWhileMoving: false,
+      shouldRefreshPeripheral: true,
+      centerPriorityWindow: false,
+      isPeripheralCandidate: false,
+      priority: null,
+      dist,
+      centrality: 0,
+      forwardness: 0,
+      pixelSize: 0
+    };
+  }
+  const boxSize = chunk.bounds.getSize(new THREE.Vector3()).length();
+  const pixelSize = boxSize / viewHeight * canvasHeight;
+  const centerNdc = tempCenterNdc.copy(chunk.center).applyMatrix4(projScreenMatrix);
+  const ndcDistance = Math.sqrt(centerNdc.x * centerNdc.x + centerNdc.y * centerNdc.y);
+  const centrality = 1 - Math.min(1, ndcDistance);
+  const forwardness = dist > 1e-5 ? Math.max(0, cameraForward.dot(toChunkDirection.divideScalar(dist))) : 1;
+  const isTooSmall = pixelSize < 4;
+  const shouldHidePeripheralWhileMoving = phase === "moving" && centrality < profile.movingFocusCentralityThreshold && pixelSize < profile.movingFocusPixelThreshold;
+  const shouldBeVisible = options.inFrustum && !isBoxClipped && inRange && !isTooSmall && !shouldHidePeripheralWhileMoving;
+  const lastTouchedAt = Math.max(chunk.lastVisibleAt || 0, chunk.lastFocusAt || 0);
+  const shouldKeepVisibleWhileMoving = phase === "moving" && options.inFrustum && !isBoxClipped && inRange && !isTooSmall && now - lastTouchedAt < profile.chunkVisibilityHoldMs;
+  const isPeripheralWhileMoving = centrality < profile.movingCoreCentralityThreshold && pixelSize < profile.movingCorePixelThreshold && forwardness < profile.movingCoreForwardThreshold;
+  const shouldRefreshPeripheral = resolveShouldRefreshPeripheral(isPeripheralWhileMoving);
+  const effectiveVisible = phase === "moving" && isPeripheralWhileMoving && !shouldRefreshPeripheral ? chunk.lastEffectiveVisible ?? chunk.mesh?.visible ?? false : shouldBeVisible || shouldKeepVisibleWhileMoving;
+  const centerPriorityWindow = chunkWarmupActive || now < chunkLoadResumeAt + profile.centerPriorityWindowMs;
+  const isPeripheralCandidate = centrality < profile.centerPriorityThreshold && forwardness < profile.forwardPriorityThreshold && pixelSize < 96;
+  let priority = null;
+  if (!chunk.loaded && shouldBeVisible) {
+    const viewportBoost = centrality > 0.8 ? 4.5 : centrality > 0.62 ? 2.8 : 1;
+    const sizeScore = Math.min(8, pixelSize / 120);
+    const distanceScore = 1e3 / (dist + 1);
+    const forwardScore = forwardness * 550;
+    const cacheBoost = chunkMeshCached ? 420 : 0;
+    const warmupBoost = chunkWarmupActive && chunkLoadedCount < initialChunkLoadTarget ? centrality > 0.65 ? 1500 : centrality > 0.45 ? 500 : 0 : 0;
+    const movingPriorityBoost = phase === "moving" ? centrality > 0.65 || forwardness > 0.7 ? 900 : centrality > 0.4 ? 250 : -250 : 0;
+    const shouldSkipForPriority = phase === "moving" && centrality < 0.08 && pixelSize < 18 || phase === "moving" && isPeripheralWhileMoving && !shouldRefreshPeripheral || phase !== "moving" && centerPriorityWindow && isPeripheralCandidate || phase === "moving" && performanceMode === "smooth" && centrality < 0.3 && pixelSize < 54 && forwardness < 0.62;
+    if (!shouldSkipForPriority) {
+      priority = movingPriorityBoost + cacheBoost + warmupBoost + forwardScore + viewportBoost * 1e3 + sizeScore * 120 + distanceScore + centrality * 300;
+    }
+  }
+  return {
+    shouldSkipSample: false,
+    shouldBeVisible,
+    effectiveVisible,
+    isPeripheralWhileMoving,
+    shouldRefreshPeripheral,
+    centerPriorityWindow,
+    isPeripheralCandidate,
+    priority,
+    dist,
+    centrality,
+    forwardness,
+    pixelSize
+  };
+}
+
+function reportChunkProgressIfNeeded(options) {
+  const { now, total, loaded, lastReportedProgress, lastChunkProgressReportAt } = options;
+  const changed = loaded !== lastReportedProgress.loaded || total !== lastReportedProgress.total;
+  const shouldFlush = total === 0 || total > 0 && loaded >= total;
+  const intervalReached = now - lastChunkProgressReportAt >= 48;
+  return {
+    shouldNotify: changed && (intervalReached || shouldFlush),
+    nextProgress: { loaded, total },
+    nextReportedAt: shouldFlush || intervalReached ? now : lastChunkProgressReportAt
+  };
+}
+function selectChunkRuntimeProfile(options) {
+  const { chunkCount, compact, balanced, massive } = options;
+  if (chunkCount > 2e3) return massive;
+  if (chunkCount > 600) return balanced;
+  return compact;
+}
+function computeChunkFrameBudget(options) {
+  const {
+    forceMaxChunkLoadSpeed,
+    maxChunkLoadsPerFrame,
+    performanceMode,
+    chunkCount,
+    phase,
+    profile,
+    warmupExtra
+  } = options;
+  if (forceMaxChunkLoadSpeed) {
+    return maxChunkLoadsPerFrame + warmupExtra;
+  }
+  const isHugeScene = chunkCount > 2e3;
+  const isLargeScene = chunkCount > 600;
+  if (phase === "moving") {
+    const baseMovingBudget = Math.max(
+      profile.movingLoadBudgetMin,
+      Math.min(profile.movingLoadBudgetMax, Math.floor(maxChunkLoadsPerFrame / 4))
+    );
+    if (performanceMode === "smooth") {
+      if (isHugeScene) return Math.max(1, Math.floor(baseMovingBudget * 0.35));
+      if (isLargeScene) return Math.max(1, Math.floor(baseMovingBudget * 0.5));
+      return Math.max(1, Math.floor(baseMovingBudget * 0.7));
+    }
+    if (isHugeScene) return Math.max(1, Math.floor(baseMovingBudget * 0.55));
+    if (isLargeScene) return Math.max(1, Math.floor(baseMovingBudget * 0.75));
+    return baseMovingBudget;
+  }
+  if (phase === "recovery") {
+    const recoveryBudget = Math.max(
+      profile.recoveryLoadBudgetMin,
+      Math.min(
+        profile.recoveryLoadBudgetMax,
+        Math.floor(maxChunkLoadsPerFrame * profile.recoveryLoadBudgetRatio)
+      )
+    );
+    const recoveryBoost = performanceMode === "smooth" ? Math.max(2, Math.floor(recoveryBudget * 0.6)) : 0;
+    return recoveryBudget + recoveryBoost + warmupExtra;
+  }
+  return maxChunkLoadsPerFrame + warmupExtra;
+}
+function isMovingPeripheralChunk(options) {
+  const { centrality, pixelSize, forwardness, profile } = options;
+  return centrality < profile.movingCoreCentralityThreshold && pixelSize < profile.movingCorePixelThreshold && forwardness < profile.movingCoreForwardThreshold;
+}
+function updatePeripheralRefreshWindow(options) {
+  const {
+    now,
+    isCameraMoving,
+    chunkIndex,
+    totalChunks,
+    profile,
+    movingPeripheralCursor,
+    movingPeripheralLastRefreshAt
+  } = options;
+  if (!isCameraMoving || totalChunks === 0) {
+    return {
+      shouldRefresh: true,
+      movingPeripheralCursor,
+      movingPeripheralLastRefreshAt
+    };
+  }
+  let nextCursor = movingPeripheralCursor;
+  let nextLastRefreshAt = movingPeripheralLastRefreshAt;
+  if (now - nextLastRefreshAt >= profile.movingPeripheralRefreshMs) {
+    const batchSize2 = Math.min(
+      totalChunks,
+      Math.max(profile.movingPeripheralMinBatchSize, Math.ceil(totalChunks * profile.movingPeripheralBatchRatio))
+    );
+    nextCursor = (nextCursor + batchSize2) % totalChunks;
+    nextLastRefreshAt = now;
+  }
+  const batchSize = Math.min(
+    totalChunks,
+    Math.max(profile.movingPeripheralMinBatchSize, Math.ceil(totalChunks * profile.movingPeripheralBatchRatio))
+  );
+  const start = nextCursor;
+  const end = start + batchSize;
+  const shouldRefresh = end <= totalChunks ? chunkIndex >= start && chunkIndex < end : chunkIndex >= start || chunkIndex < end % totalChunks;
+  return {
+    shouldRefresh,
+    movingPeripheralCursor: nextCursor,
+    movingPeripheralLastRefreshAt: nextLastRefreshAt
+  };
+}
+
+const CLIP_HELPER_COLORS = [16711680, 16711680, 65280, 65280, 255, 255];
+function clonePlanes(planes) {
+  return planes.map((plane) => plane.clone());
+}
+function updatePlaneHelper(helper, normal, position, width, height, isEnabled, clipHelperVisible) {
+  if (!helper) return;
+  const helperVisible = isEnabled && clipHelperVisible;
+  helper.visible = helperVisible;
+  helper.scale.set(Math.max(width, 1e-3), Math.max(height, 1e-3), 1);
+  helper.position.copy(position);
+  helper.lookAt(position.clone().add(normal));
+  helper.children.forEach((child) => {
+    child.visible = helperVisible;
+  });
+}
+function applySetupClipping(context) {
+  const clippingPlanes = [
+    new THREE.Plane(new THREE.Vector3(1, 0, 0), 0),
+    new THREE.Plane(new THREE.Vector3(-1, 0, 0), 0),
+    new THREE.Plane(new THREE.Vector3(0, 1, 0), 0),
+    new THREE.Plane(new THREE.Vector3(0, -1, 0), 0),
+    new THREE.Plane(new THREE.Vector3(0, 0, 1), 0),
+    new THREE.Plane(new THREE.Vector3(0, 0, -1), 0)
+  ];
+  context.renderer.clippingPlanes = [];
+  context.clipHelpersGroup.clear();
+  const clipPlaneHelpers = CLIP_HELPER_COLORS.map((color) => {
+    const geometry = new THREE.PlaneGeometry(1, 1);
+    const material = new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: context.state.clipHelperOpacity,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -4,
+      polygonOffsetUnits: -4,
+      clippingPlanes: []
+    });
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.visible = false;
+    mesh.renderOrder = 9999;
+    const edges = new THREE.EdgesGeometry(geometry);
+    const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({
+      color,
+      transparent: true,
+      opacity: Math.min(1, context.state.clipHelperOpacity + 0.08),
+      depthWrite: false
+    }));
+    line.visible = false;
+    line.renderOrder = 1e4;
+    mesh.add(line);
+    context.clipHelpersGroup.add(mesh);
+    return mesh;
+  });
+  return {
+    state: {
+      ...context.state,
+      clippingPlanes,
+      clipPlaneHelpers
+    },
+    needsRender: false
+  };
+}
+function applySetClipHelperOptions(context, options) {
+  const state = {
+    ...context.state,
+    clippingPlanes: clonePlanes(context.state.clippingPlanes),
+    clipPlaneHelpers: [...context.state.clipPlaneHelpers],
+    clipHelperVisible: typeof options.visible === "boolean" ? options.visible : context.state.clipHelperVisible,
+    clipHelperOpacity: typeof options.opacity === "number" && !Number.isNaN(options.opacity) ? THREE.MathUtils.clamp(options.opacity, 0.05, 0.35) : context.state.clipHelperOpacity
+  };
+  state.clipPlaneHelpers.forEach((helper) => {
+    const surfaceMaterial = helper.material;
+    surfaceMaterial.opacity = state.clipHelperOpacity;
+    surfaceMaterial.needsUpdate = true;
+    helper.children.forEach((child) => {
+      const lineMaterial = child.material;
+      if (!lineMaterial) return;
+      lineMaterial.opacity = Math.min(1, state.clipHelperOpacity + 0.08);
+      lineMaterial.needsUpdate = true;
+    });
+  });
+  state.clipPlaneHelpers.forEach((helper, index) => {
+    const plane = context.state.clippingPlanes[index];
+    const isPlaneActive = !!plane && Number.isFinite(plane.constant) && plane.constant !== Infinity;
+    const helperVisible = state.clipHelperVisible && context.renderer.clippingPlanes.length > 0 && isPlaneActive;
+    helper.visible = helperVisible;
+    helper.children.forEach((child) => {
+      child.visible = helperVisible;
+    });
+  });
+  return { state, needsRender: true };
+}
+function applyUpdateClippingPlanes(context, bounds, values, active) {
+  if (bounds.isEmpty()) {
+    return { state: context.state, needsRender: false };
+  }
+  const clippingPlanes = clonePlanes(context.state.clippingPlanes);
+  const clipPlaneHelpers = [...context.state.clipPlaneHelpers];
+  const state = { ...context.state, clippingPlanes, clipPlaneHelpers };
+  const { min, max } = bounds;
+  const size = max.clone().sub(min);
+  const xMin = min.x + values.x[0] / 100 * size.x;
+  const xMax = min.x + values.x[1] / 100 * size.x;
+  const yMin = min.y + values.y[0] / 100 * size.y;
+  const yMax = min.y + values.y[1] / 100 * size.y;
+  const zMin = min.z + values.z[0] / 100 * size.z;
+  const zMax = min.z + values.z[1] / 100 * size.z;
+  const isEnabled = context.renderer.clippingPlanes.length > 0;
+  const clippedBoxMin = new THREE.Vector3(
+    active.x ? xMin : min.x,
+    active.y ? yMin : min.y,
+    active.z ? zMin : min.z
+  );
+  const clippedBoxMax = new THREE.Vector3(
+    active.x ? xMax : max.x,
+    active.y ? yMax : max.y,
+    active.z ? zMax : max.z
+  );
+  const clippedCenter = clippedBoxMin.clone().add(clippedBoxMax).multiplyScalar(0.5);
+  const clippedSize = clippedBoxMax.clone().sub(clippedBoxMin);
+  const epsilon = 5e-4;
+  if (active.x) {
+    clippingPlanes[0].constant = -xMin;
+    clippingPlanes[1].constant = xMax;
+    updatePlaneHelper(
+      clipPlaneHelpers[0],
+      new THREE.Vector3(1, 0, 0),
+      new THREE.Vector3(xMin + epsilon, clippedCenter.y, clippedCenter.z),
+      clippedSize.z,
+      clippedSize.y,
+      isEnabled,
+      state.clipHelperVisible
+    );
+    updatePlaneHelper(
+      clipPlaneHelpers[1],
+      new THREE.Vector3(-1, 0, 0),
+      new THREE.Vector3(xMax - epsilon, clippedCenter.y, clippedCenter.z),
+      clippedSize.z,
+      clippedSize.y,
+      isEnabled,
+      state.clipHelperVisible
+    );
+  } else {
+    clippingPlanes[0].constant = Infinity;
+    clippingPlanes[1].constant = Infinity;
+    if (clipPlaneHelpers[0]) clipPlaneHelpers[0].visible = false;
+    if (clipPlaneHelpers[1]) clipPlaneHelpers[1].visible = false;
+  }
+  if (active.y) {
+    clippingPlanes[2].constant = -yMin;
+    clippingPlanes[3].constant = yMax;
+    updatePlaneHelper(
+      clipPlaneHelpers[2],
+      new THREE.Vector3(0, 1, 0),
+      new THREE.Vector3(clippedCenter.x, yMin + epsilon, clippedCenter.z),
+      clippedSize.x,
+      clippedSize.z,
+      isEnabled,
+      state.clipHelperVisible
+    );
+    updatePlaneHelper(
+      clipPlaneHelpers[3],
+      new THREE.Vector3(0, -1, 0),
+      new THREE.Vector3(clippedCenter.x, yMax - epsilon, clippedCenter.z),
+      clippedSize.x,
+      clippedSize.z,
+      isEnabled,
+      state.clipHelperVisible
+    );
+  } else {
+    clippingPlanes[2].constant = Infinity;
+    clippingPlanes[3].constant = Infinity;
+    if (clipPlaneHelpers[2]) clipPlaneHelpers[2].visible = false;
+    if (clipPlaneHelpers[3]) clipPlaneHelpers[3].visible = false;
+  }
+  if (active.z) {
+    clippingPlanes[4].constant = -zMin;
+    clippingPlanes[5].constant = zMax;
+    updatePlaneHelper(
+      clipPlaneHelpers[4],
+      new THREE.Vector3(0, 0, 1),
+      new THREE.Vector3(clippedCenter.x, clippedCenter.y, zMin + epsilon),
+      clippedSize.x,
+      clippedSize.y,
+      isEnabled,
+      state.clipHelperVisible
+    );
+    updatePlaneHelper(
+      clipPlaneHelpers[5],
+      new THREE.Vector3(0, 0, -1),
+      new THREE.Vector3(clippedCenter.x, clippedCenter.y, zMax - epsilon),
+      clippedSize.x,
+      clippedSize.y,
+      isEnabled,
+      state.clipHelperVisible
+    );
+  } else {
+    clippingPlanes[4].constant = Infinity;
+    clippingPlanes[5].constant = Infinity;
+    if (clipPlaneHelpers[4]) clipPlaneHelpers[4].visible = false;
+    if (clipPlaneHelpers[5]) clipPlaneHelpers[5].visible = false;
+  }
+  return { state, needsRender: true };
+}
+function isBoxClippedByPlanes(planes, box) {
+  for (const plane of planes) {
+    if (plane.constant === Infinity) continue;
+    const planeNormal = plane.normal;
+    const maxPoint = new THREE.Vector3(
+      planeNormal.x > 0 ? box.max.x : box.min.x,
+      planeNormal.y > 0 ? box.max.y : box.min.y,
+      planeNormal.z > 0 ? box.max.z : box.min.z
+    );
+    if (plane.distanceToPoint(maxPoint) < 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function disposeGeometryAndMaterial(object) {
+  object.geometry?.dispose?.();
+  const materials = object.material ? Array.isArray(object.material) ? object.material : [object.material] : [];
+  materials.forEach((material) => material?.dispose?.());
+}
+function disposeSceneManagerResources(context) {
+  context.cancelDeferredStructureBuild();
+  context.clearLocateFocus();
+  if (context.animationFrameId !== null) {
+    cancelAnimationFrame(context.animationFrameId);
+  }
+  context.onAnimationFrameDisposed();
+  if (context.logicTimer) {
+    clearInterval(context.logicTimer);
+  }
+  disposeChunkWorkerPool({
+    workers: context.workers,
+    workerQueue: context.workerQueue,
+    rejectReason: "SceneManager disposed"
+  });
+  context.onWorkersDisposed();
+  context.onQueuesReset();
+  context.onStateCachesReset();
+  context.clearChunkCache();
+  while (context.ghostGroup.children.length > 0) {
+    const ghost = context.ghostGroup.children[0];
+    context.ghostGroup.remove(ghost);
+    context.releaseGhostLine(ghost);
+  }
+  context.controls.dispose();
+  disposeGeometryAndMaterial(context.selectionBox);
+  disposeGeometryAndMaterial(context.highlightMesh);
+  disposeGeometryAndMaterial(context.tempMarker);
+  context.dotTexture.dispose();
+  context.sharedMaterial.dispose();
+  context.ghostEdgesGeometry.dispose();
+  context.ghostMaterial.dispose();
+  context.renderer.dispose();
+}
+
+function resolveWorldMatrix(mesh, instanceId) {
+  const matrix = new THREE.Matrix4();
+  if (instanceId !== void 0 && mesh.isInstancedMesh) {
+    mesh.getMatrixAt(instanceId, matrix);
+    return matrix;
+  }
+  return matrix.copy(mesh.matrixWorld);
+}
+function computeGeometryVolume(geometry, mesh, instanceId) {
+  const position = geometry.attributes.position;
+  const index = geometry.index;
+  const worldMatrix = resolveWorldMatrix(mesh, instanceId);
+  const vertexA = new THREE.Vector3();
+  const vertexB = new THREE.Vector3();
+  const vertexC = new THREE.Vector3();
+  const cross = new THREE.Vector3();
+  let volume = 0;
+  if (index) {
+    for (let i = 0; i < index.count; i += 3) {
+      vertexA.fromBufferAttribute(position, index.getX(i)).applyMatrix4(worldMatrix);
+      vertexB.fromBufferAttribute(position, index.getX(i + 1)).applyMatrix4(worldMatrix);
+      vertexC.fromBufferAttribute(position, index.getX(i + 2)).applyMatrix4(worldMatrix);
+      volume += vertexA.dot(cross.crossVectors(vertexB, vertexC)) / 6;
+    }
+  } else {
+    for (let i = 0; i < position.count; i += 3) {
+      vertexA.fromBufferAttribute(position, i).applyMatrix4(worldMatrix);
+      vertexB.fromBufferAttribute(position, i + 1).applyMatrix4(worldMatrix);
+      vertexC.fromBufferAttribute(position, i + 2).applyMatrix4(worldMatrix);
+      volume += vertexA.dot(cross.crossVectors(vertexB, vertexC)) / 6;
+    }
+  }
+  return Math.abs(volume);
+}
+function computeGeometryArea(geometry, mesh, instanceId) {
+  const position = geometry.attributes.position;
+  const index = geometry.index;
+  const worldMatrix = resolveWorldMatrix(mesh, instanceId);
+  const vertexA = new THREE.Vector3();
+  const vertexB = new THREE.Vector3();
+  const vertexC = new THREE.Vector3();
+  const edgeAB = new THREE.Vector3();
+  const edgeAC = new THREE.Vector3();
+  let area = 0;
+  if (index) {
+    for (let i = 0; i < index.count; i += 3) {
+      vertexA.fromBufferAttribute(position, index.getX(i)).applyMatrix4(worldMatrix);
+      vertexB.fromBufferAttribute(position, index.getX(i + 1)).applyMatrix4(worldMatrix);
+      vertexC.fromBufferAttribute(position, index.getX(i + 2)).applyMatrix4(worldMatrix);
+      area += edgeAB.subVectors(vertexB, vertexA).cross(edgeAC.subVectors(vertexC, vertexA)).length() / 2;
+    }
+  } else {
+    for (let i = 0; i < position.count; i += 3) {
+      vertexA.fromBufferAttribute(position, i).applyMatrix4(worldMatrix);
+      vertexB.fromBufferAttribute(position, i + 1).applyMatrix4(worldMatrix);
+      vertexC.fromBufferAttribute(position, i + 2).applyMatrix4(worldMatrix);
+      area += edgeAB.subVectors(vertexB, vertexA).cross(edgeAC.subVectors(vertexC, vertexA)).length() / 2;
+    }
+  }
+  return area;
+}
+function getObjectGeometryDataFromScene(options) {
+  const { uuid, optimizedMapping, contentGroup } = options;
+  let area = 0;
+  let volume = 0;
+  const mappings = optimizedMapping.get(uuid);
+  if (mappings && mappings.length > 0) {
+    mappings.forEach((mapping) => {
+      if (!mapping.geometry) return;
+      area += computeGeometryArea(mapping.geometry, mapping.mesh, mapping.instanceId);
+      volume += computeGeometryVolume(mapping.geometry, mapping.mesh, mapping.instanceId);
+    });
+    return { area, volume };
+  }
+  const object = contentGroup.getObjectByProperty("uuid", uuid);
+  if (object && object.isMesh) {
+    const mesh = object;
+    if (mesh.geometry) {
+      area = computeGeometryArea(mesh.geometry, mesh);
+      volume = computeGeometryVolume(mesh.geometry, mesh);
+    }
+  }
+  return { area, volume };
+}
+
+function stripFileExtension(name) {
+  return name.replace(/\.[^./\\]+$/, "");
+}
+function sanitizeFileStem(name) {
+  const sanitized = name.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, " ").trim();
+  return sanitized || "model";
+}
+
+const INVALID_DISPLAY_LABELS = /* @__PURE__ */ new Set(["", "n/a", "na", "undefined", "null", "-", "--"]);
+function sanitizeDisplayLabel(...candidates) {
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+    const trimmed = candidate.trim();
+    if (INVALID_DISPLAY_LABELS.has(trimmed.toLowerCase())) continue;
+    return trimmed;
+  }
+  return "";
+}
+function countStructureRenderableNodes(node) {
+  if (!node) return 0;
+  let count = node.type === "Mesh" ? 1 : 0;
+  if (node.children) {
+    for (const child of node.children) {
+      count += countStructureRenderableNodes(child);
+    }
+  }
+  return count;
+}
+function sanitizeStructureUserData(userData) {
+  if (!userData || typeof userData !== "object") return void 0;
+  const sanitized = {};
+  if (userData.originalUuid !== void 0) sanitized.originalUuid = String(userData.originalUuid);
+  if (userData.expressID !== void 0) sanitized.expressID = userData.expressID;
+  if (userData.modelID !== void 0) sanitized.modelID = userData.modelID;
+  return Object.keys(sanitized).length > 0 ? sanitized : void 0;
+}
+function buildExportStructureTree(structureRoot) {
+  const usedIds = /* @__PURE__ */ new Set();
+  const assignId = (rawName, fallback) => {
+    const base = rawName && rawName.trim() ? rawName.trim() : fallback;
+    if (!usedIds.has(base)) {
+      usedIds.add(base);
+      return base;
+    }
+    let suffix = 2;
+    while (usedIds.has(`${base}_${suffix}`)) suffix++;
+    const resolvedId = `${base}_${suffix}`;
+    usedIds.add(resolvedId);
+    return resolvedId;
+  };
+  const rootId = assignId(structureRoot?.name, structureRoot?.id ?? "Root");
+  const rootCopy = {
+    id: rootId,
+    name: structureRoot?.name,
+    type: structureRoot?.type,
+    visible: structureRoot?.visible !== false,
+    children: []
+  };
+  if (structureRoot?.bimId !== void 0) rootCopy.bimId = structureRoot.bimId;
+  if (structureRoot?.chunkId !== void 0) rootCopy.chunkId = structureRoot.chunkId;
+  const rootUserData = sanitizeStructureUserData(structureRoot?.userData);
+  if (rootUserData) rootCopy.userData = rootUserData;
+  const stack = [{ src: structureRoot, dst: rootCopy }];
+  while (stack.length > 0) {
+    const { src, dst } = stack.pop();
+    const children = Array.isArray(src?.children) ? src.children : [];
+    for (const child of children) {
+      const childId = assignId(child?.name, child?.id ?? "Node");
+      const childCopy = {
+        id: childId,
+        name: child?.name,
+        type: child?.type,
+        visible: child?.visible !== false,
+        children: []
+      };
+      if (child?.bimId !== void 0) childCopy.bimId = child.bimId;
+      if (child?.chunkId !== void 0) childCopy.chunkId = child.chunkId;
+      const childUserData = sanitizeStructureUserData(child?.userData);
+      if (childUserData) childCopy.userData = childUserData;
+      dst.children.push(childCopy);
+      stack.push({ src: child, dst: childCopy });
+    }
+  }
+  return rootCopy;
+}
+function encodeNbimManifest(manifest, structureRoot) {
+  let manifestString;
+  try {
+    manifestString = JSON.stringify(manifest);
+  } catch {
+    manifestString = JSON.stringify({
+      globalBounds: manifest.globalBounds,
+      chunks: manifest.chunks,
+      structureTree: {
+        id: structureRoot.id,
+        name: structureRoot.name,
+        type: structureRoot.type,
+        children: structureRoot.children ? [] : []
+      },
+      bimIdTable: manifest.bimIdTable,
+      bimProperties: {}
+    });
+  }
+  return new TextEncoder().encode(manifestString);
+}
+function deriveDefaultNbimStem(contentGroup) {
+  const names = [];
+  contentGroup.children.forEach((child) => {
+    if (child.userData?.isOptimizedGroup) return;
+    if (child.name.startsWith("optimized_")) return;
+    const rawName = (typeof child.userData?.modelName === "string" ? child.userData.modelName : "") || (child.children?.[0]?.name || "") || child.name;
+    const baseName = sanitizeFileStem(stripFileExtension(rawName));
+    names.push(baseName);
+  });
+  const uniqueNames = Array.from(new Set(names));
+  if (uniqueNames.length === 1) return uniqueNames[0];
+  const now = /* @__PURE__ */ new Date();
+  const pad = (value) => String(value).padStart(2, "0");
+  const suffix = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+  return `批量导出_${suffix}`;
+}
+function groupNbimPropertiesByOwner(manifestBimProperties, rootId) {
+  const propertyKeys = Object.keys(manifestBimProperties);
+  const ownerSet = /* @__PURE__ */ new Set();
+  propertyKeys.forEach((key) => {
+    const separatorIndex = key.indexOf("::");
+    if (separatorIndex > 0) ownerSet.add(key.slice(0, separatorIndex));
+  });
+  const defaultOwner = ownerSet.size === 1 ? [...ownerSet][0] : rootId;
+  const grouped = /* @__PURE__ */ new Map();
+  if (ownerSet.size >= 1) {
+    if (ownerSet.size === 1) {
+      grouped.set(defaultOwner, manifestBimProperties);
+    } else {
+      propertyKeys.forEach((key) => {
+        const separatorIndex = key.indexOf("::");
+        const owner = separatorIndex > 0 ? key.slice(0, separatorIndex) : rootId;
+        if (!grouped.has(owner)) grouped.set(owner, {});
+        grouped.get(owner)[key] = manifestBimProperties[key];
+      });
+    }
+  } else {
+    grouped.set(rootId, manifestBimProperties);
+  }
+  return {
+    defaultOwner,
+    grouped
+  };
+}
+function createNbimContainerGroup(options) {
+  const { fileName, modelRootName, rootId } = options;
+  const fileGroup = new THREE.Group();
+  fileGroup.name = `file_${rootId}`;
+  fileGroup.userData.originalUuid = rootId;
+  const fileBaseName = sanitizeFileStem(stripFileExtension(fileName));
+  fileGroup.userData.modelName = sanitizeFileStem(
+    sanitizeDisplayLabel(modelRootName && modelRootName !== "Root" ? modelRootName : "", fileBaseName, rootId) || fileBaseName
+  );
+  return fileGroup;
+}
+function collectIfcModelReferences(contentGroup) {
+  const ifcApiByModel = /* @__PURE__ */ new Map();
+  const ifcManagerByModel = /* @__PURE__ */ new Map();
+  contentGroup.traverse((object) => {
+    if (object.userData?.ifcAPI && object.userData?.modelID !== void 0 && object.userData?.originalUuid) {
+      ifcApiByModel.set(String(object.userData.originalUuid), {
+        ifcApi: object.userData.ifcAPI,
+        modelID: object.userData.modelID
+      });
+    }
+    if (object.userData?.ifcManager && object.userData?.modelID !== void 0 && object.userData?.originalUuid) {
+      ifcManagerByModel.set(String(object.userData.originalUuid), {
+        ifcManager: object.userData.ifcManager,
+        modelID: object.userData.modelID
+      });
+    }
+  });
+  return {
+    ifcApiByModel,
+    ifcManagerByModel
+  };
+}
+async function collectNbimBimProperties(options) {
+  const { structureRoot, ifcApiByModel, ifcManagerByModel } = options;
+  const bimProperties = {};
+  const stack = [structureRoot];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    const originalUuid = node.userData?.originalUuid ? String(node.userData.originalUuid) : "";
+    if (node.bimId) {
+      const key = `${originalUuid}::${node.bimId}`;
+      if (!bimProperties[key]) {
+        bimProperties[key] = { uuid: node.id, name: node.name };
+        const expressID = node.userData?.expressID;
+        if (expressID !== void 0 && ifcApiByModel.has(originalUuid)) {
+          try {
+            const { ifcApi, modelID } = ifcApiByModel.get(originalUuid);
+            const entity = ifcApi.GetLine(modelID, Number(expressID));
+            if (entity) {
+              bimProperties[key].ifcType = entity.is_a || "";
+              bimProperties[key].globalId = entity.GlobalId?.value || "";
+              bimProperties[key].ifcName = entity.Name?.value || "";
+            }
+          } catch {
+          }
+        }
+        if (expressID !== void 0 && ifcManagerByModel.has(originalUuid)) {
+          try {
+            const { ifcManager, modelID } = ifcManagerByModel.get(originalUuid);
+            const fullProps = await ifcManager.getItemProperties(modelID, Number(expressID));
+            const rawGroups = fullProps?.rawGroups || fullProps?.groups || null;
+            const normalizedGroups = fullProps?.normalizedGroups || null;
+            if (rawGroups && Object.keys(rawGroups).length > 0) {
+              bimProperties[key].ifcRawGroups = rawGroups;
+            }
+            if (normalizedGroups && Object.keys(normalizedGroups).length > 0) {
+              bimProperties[key].ifcNormalizedGroups = normalizedGroups;
+            }
+          } catch {
+          }
+        }
+      }
+    }
+    if (node.children && node.children.length > 0) {
+      for (let index = node.children.length - 1; index >= 0; index--) {
+        stack.push(node.children[index]);
+      }
+    }
+  }
+  return bimProperties;
+}
+function decodeChunkBinaryV8(buffer, bimIdTable) {
+  const dataView = new DataView(buffer);
+  let offset = 0;
+  const geometryCount = dataView.getUint32(offset, true);
+  offset += 4;
+  const geometries = [];
+  for (let i = 0; i < geometryCount; i++) {
+    const vertexCount = dataView.getUint32(offset, true);
+    offset += 4;
+    const indexCount = dataView.getUint32(offset, true);
+    offset += 4;
+    const positions = new Float32Array(buffer, offset, vertexCount * 3);
+    offset += vertexCount * 12;
+    const normals = new Float32Array(buffer, offset, vertexCount * 3);
+    offset += vertexCount * 12;
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(positions), 3));
+    geometry.setAttribute("normal", new THREE.BufferAttribute(new Float32Array(normals), 3));
+    if (indexCount > 0) {
+      const indices = new Uint32Array(buffer, offset, indexCount);
+      offset += indexCount * 4;
+      geometry.setIndex(new THREE.BufferAttribute(new Uint32Array(indices), 1));
+    }
+    geometries.push(geometry);
+  }
+  const instanceCount = dataView.getUint32(offset, true);
+  offset += 4;
+  const matrix = new THREE.Matrix4();
+  const instances = [];
+  for (let i = 0; i < instanceCount; i++) {
+    const bimIdIndex = dataView.getUint32(offset, true);
+    offset += 4;
+    const typeIndex = dataView.getUint32(offset, true);
+    offset += 4;
+    const color = dataView.getUint32(offset, true);
+    offset += 4;
+    for (let elementIndex = 0; elementIndex < 16; elementIndex++) {
+      matrix.elements[elementIndex] = dataView.getFloat32(offset, true);
+      offset += 4;
+    }
+    const geometryIndex = dataView.getUint32(offset, true);
+    offset += 4;
+    instances.push({
+      bimId: bimIdTable[bimIdIndex] ?? String(bimIdIndex),
+      typeIndex,
+      color,
+      matrix: matrix.clone(),
+      geometry: geometries[geometryIndex]
+    });
+  }
+  return instances;
+}
+async function prepareNbimExportChunks(options) {
+  const {
+    chunks,
+    nbimFiles,
+    nbimMeta,
+    bimIdToIndex,
+    hasValidChunkBinaryRange,
+    generateChunkBinaryV8
+  } = options;
+  const chunkBlobs = [];
+  const exportChunks = chunks.map((chunk) => ({
+    id: chunk.id,
+    bounds: {
+      min: { x: chunk.bounds.min.x, y: chunk.bounds.min.y, z: chunk.bounds.min.z },
+      max: { x: chunk.bounds.max.x, y: chunk.bounds.max.y, z: chunk.bounds.max.z }
+    },
+    originalUuid: chunk.originalUuid ? String(chunk.originalUuid) : void 0,
+    byteOffset: 0,
+    byteLength: 0
+  }));
+  let currentOffset = 1024;
+  for (let index = 0; index < chunks.length; index++) {
+    const chunk = chunks[index];
+    const exportChunk = exportChunks[index];
+    let buffer = null;
+    if (chunk.node) {
+      buffer = generateChunkBinaryV8(chunk.node.items, bimIdToIndex);
+    } else if (chunk.nbimFileId && nbimFiles.has(chunk.nbimFileId) && hasValidChunkBinaryRange(chunk)) {
+      const file = nbimFiles.get(chunk.nbimFileId);
+      const raw = await file.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength).arrayBuffer();
+      const meta = nbimMeta.get(chunk.nbimFileId);
+      const version = meta?.version ?? 8;
+      if (version !== 8) {
+        throw new Error(`Unsupported NBIM version: ${version}. Only V8 is supported.`);
+      }
+      const instances = decodeChunkBinaryV8(raw, meta?.bimIdTable || []);
+      const items = instances.map((instance) => ({
+        uuid: "",
+        bimId: instance.bimId,
+        typeIndex: instance.typeIndex,
+        color: instance.color,
+        matrix: instance.matrix,
+        geometry: instance.geometry
+      }));
+      buffer = generateChunkBinaryV8(items, bimIdToIndex);
+    }
+    if (!buffer) {
+      continue;
+    }
+    const uint8 = new Uint8Array(buffer);
+    chunkBlobs.push(uint8);
+    exportChunk.byteOffset = currentOffset;
+    exportChunk.byteLength = uint8.byteLength;
+    currentOffset += uint8.byteLength;
+  }
+  return {
+    chunkBlobs,
+    exportChunks,
+    currentOffset
+  };
+}
+
+function applyNbimGlobalBounds(options) {
+  const { globalBounds, precomputedBounds, sceneBounds, globalOffset } = options;
+  if (!globalBounds) {
+    return {
+      precomputedBounds,
+      sceneBounds,
+      globalOffset,
+      initializedOffset: false
+    };
+  }
+  const newBounds = new THREE.Box3(
+    new THREE.Vector3(globalBounds.min.x, globalBounds.min.y, globalBounds.min.z),
+    new THREE.Vector3(globalBounds.max.x, globalBounds.max.y, globalBounds.max.z)
+  );
+  let initializedOffset = false;
+  const nextGlobalOffset = globalOffset.clone();
+  if (nextGlobalOffset.length() === 0) {
+    newBounds.getCenter(nextGlobalOffset);
+    initializedOffset = true;
+  }
+  const nextPrecomputedBounds = precomputedBounds.clone();
+  if (nextPrecomputedBounds.isEmpty()) {
+    nextPrecomputedBounds.copy(newBounds);
+  } else {
+    nextPrecomputedBounds.union(newBounds);
+  }
+  return {
+    precomputedBounds: nextPrecomputedBounds,
+    sceneBounds: nextPrecomputedBounds.clone(),
+    globalOffset: nextGlobalOffset,
+    initializedOffset
+  };
+}
+function appendNbimStructure(options) {
+  const { structureRoot, modelRoot } = options;
+  if (!structureRoot.children) structureRoot.children = [];
+  if (!modelRoot) return structureRoot;
+  if (modelRoot.children && modelRoot.name === "Root") {
+    structureRoot.children.push(...modelRoot.children);
+  } else {
+    structureRoot.children.push(modelRoot);
+  }
+  return structureRoot;
+}
+function buildNbimQuickStats(options) {
+  const { manifestStats, modelRoot, chunks } = options;
+  return manifestStats || {
+    meshes: countStructureRenderableNodes(modelRoot),
+    faces: 0,
+    memory: parseFloat(((chunks || []).reduce((sum, chunk) => sum + (chunk.byteLength || 0), 0) / (1024 * 1024)).toFixed(2))
+  };
+}
+function populateNbimNodeMappings(options) {
+  const { modelRoot, defaultOwner, nodeMap, bimIdToNodeIds } = options;
+  if (!modelRoot) return;
+  const traverse = (node) => {
+    if (!node.userData) node.userData = {};
+    const nodeOriginalUuid = node.userData?.originalUuid ? String(node.userData.originalUuid) : defaultOwner;
+    node.userData.originalUuid = nodeOriginalUuid;
+    if (!nodeMap.has(node.id)) nodeMap.set(node.id, []);
+    nodeMap.get(node.id).push(node);
+    if (node.bimId) {
+      const key = `${nodeOriginalUuid}::${node.bimId}`;
+      if (!bimIdToNodeIds.has(key)) bimIdToNodeIds.set(key, []);
+      bimIdToNodeIds.get(key).push(node.id);
+    }
+    if (node.children) node.children.forEach(traverse);
+  };
+  traverse(modelRoot);
+}
+async function registerNbimChunks(options) {
+  const {
+    chunkEntries,
+    globalOffset,
+    chunkPadding,
+    rootId,
+    fileId,
+    immediateGhostLimit,
+    registrationBatchSize,
+    onProgress,
+    registerChunk,
+    createGhostLine,
+    addGhostLine,
+    yieldToMainThread
+  } = options;
+  if (chunkEntries.length === 0) {
+    throw new Error("NBIM 文件没有可渲染分块，可能格式有问题");
+  }
+  const chunkOffset = globalOffset.lengthSq() > 0 ? globalOffset.clone().negate() : null;
+  const deferredGhostSpecs = [];
+  for (let index = 0; index < chunkEntries.length; index++) {
+    const chunkEntry = chunkEntries[index];
+    if (!chunkEntry?.bounds || typeof chunkEntry.byteOffset !== "number" || typeof chunkEntry.byteLength !== "number") {
+      throw new Error("NBIM 分块数据不完整，可能格式有问题");
+    }
+    const bounds = new THREE.Box3(
+      new THREE.Vector3(chunkEntry.bounds.min.x, chunkEntry.bounds.min.y, chunkEntry.bounds.min.z),
+      new THREE.Vector3(chunkEntry.bounds.max.x, chunkEntry.bounds.max.y, chunkEntry.bounds.max.z)
+    );
+    if (chunkOffset) {
+      bounds.translate(chunkOffset);
+    }
+    const chunkId = chunkEntry.id;
+    const center = bounds.getCenter(new THREE.Vector3());
+    const paddedBounds = bounds.clone();
+    const padSize = bounds.getSize(new THREE.Vector3()).multiplyScalar(chunkPadding);
+    paddedBounds.expandByVector(padSize);
+    registerChunk({
+      id: chunkId,
+      bounds,
+      paddedBounds,
+      _padding: chunkPadding,
+      center,
+      loaded: false,
+      byteOffset: chunkEntry.byteOffset,
+      byteLength: chunkEntry.byteLength,
+      nbimFileId: fileId,
+      groupName: `optimized_${rootId}`,
+      originalUuid: chunkEntry.originalUuid ? String(chunkEntry.originalUuid) : rootId
+    });
+    if (index < immediateGhostLimit) {
+      addGhostLine(createGhostLine(`ghost_${chunkId}`, bounds));
+    } else {
+      deferredGhostSpecs.push({ chunkId, bounds });
+    }
+    if ((index + 1) % registrationBatchSize === 0) {
+      if (onProgress) {
+        const ratio = Math.max(0, Math.min(1, (index + 1) / chunkEntries.length));
+        onProgress(30 + Math.round(ratio * 40), "正在初始化分块...");
+      }
+      await yieldToMainThread();
+    }
+  }
+  return {
+    deferredGhostSpecs
+  };
+}
+function finalizeNbimLoad(options) {
+  const { chunkCount, hasManifestStats, hasManifestChunks } = options;
+  return {
+    chunkWarmupActive: true,
+    initialChunkLoadTarget: chunkCount > 200 ? 44 : chunkCount > 80 ? 30 : 16,
+    shouldEstimateStats: !hasManifestStats && hasManifestChunks
+  };
+}
+
+function getHighlightColor(settings) {
+  return new THREE.Color(settings.highlightColor || "#ff9f1c");
+}
+function restoreHighlightedInstanceColors(context, uuids) {
+  for (const id of uuids) {
+    const mappings = context.optimizedMapping.get(id);
+    if (!mappings) continue;
+    mappings.forEach((mapping) => {
+      mapping.mesh.setColorAt(mapping.instanceId, new THREE.Color(mapping.originalColor));
+      if (mapping.mesh.instanceColor) {
+        mapping.mesh.instanceColor.needsUpdate = true;
+      }
+    });
+  }
+}
+function applyHighlightedInstanceColors(context, uuids) {
+  const highlightColor = getHighlightColor(context.settings);
+  for (const id of uuids) {
+    const mappings = context.optimizedMapping.get(id);
+    if (!mappings) continue;
+    mappings.forEach((mapping) => {
+      mapping.mesh.setColorAt(mapping.instanceId, highlightColor);
+      if (mapping.mesh.instanceColor) {
+        mapping.mesh.instanceColor.needsUpdate = true;
+      }
+    });
+  }
+}
+function updateSelectionHelpers(context, target) {
+  context.selectionBox.visible = false;
+  context.highlightMesh.visible = false;
+  if (target.size === 0) {
+    return;
+  }
+  const union = new THREE.Box3();
+  const tmpBox = new THREE.Box3();
+  const tmpMatrix = new THREE.Matrix4();
+  const addObjectBounds = (id) => {
+    const mappings = context.optimizedMapping.get(id);
+    if (mappings && mappings.length > 0) {
+      const mapping = mappings[0];
+      if (mapping.geometry) {
+        if (!mapping.geometry.boundingBox) mapping.geometry.computeBoundingBox();
+        tmpBox.copy(mapping.geometry.boundingBox);
+        mapping.mesh.getMatrixAt(mapping.instanceId, tmpMatrix);
+        tmpMatrix.premultiply(mapping.mesh.matrixWorld);
+        tmpBox.applyMatrix4(tmpMatrix);
+        union.union(tmpBox);
+      }
+      return;
+    }
+    const object = context.contentGroup.getObjectByProperty("uuid", id);
+    if (!object) return;
+    object.updateMatrixWorld(true);
+    if (object.userData.boundingBox) {
+      tmpBox.copy(object.userData.boundingBox).applyMatrix4(object.matrixWorld);
+    } else {
+      tmpBox.setFromObject(object);
+    }
+    union.union(tmpBox);
+  };
+  for (const id of target) addObjectBounds(id);
+  if (!union.isEmpty()) {
+    context.selectionBox.box.copy(union);
+    const locatingFocus = !!(context.state.locateFocusUuid && target.has(context.state.locateFocusUuid));
+    if (locatingFocus) {
+      const pad = Math.max(union.getSize(new THREE.Vector3()).length() * 0.048, 0.22);
+      context.selectionBox.box.expandByScalar(pad);
+    }
+    context.selectionBox.visible = locatingFocus || !!context.settings.highlightShowBox;
+  }
+  const focusId = context.state.lastSelectedUuid;
+  if (!focusId) return;
+  const focusMappings = context.optimizedMapping.get(focusId);
+  if (focusMappings && focusMappings.length > 0) {
+    context.highlightMesh.visible = false;
+    return;
+  }
+  const focusObject = context.contentGroup.getObjectByProperty("uuid", focusId);
+  if (!focusObject || !focusObject.isMesh) return;
+  focusObject.updateMatrixWorld(true);
+  context.highlightMesh.geometry = focusObject.geometry;
+  const worldPosition = new THREE.Vector3();
+  const worldQuaternion = new THREE.Quaternion();
+  const worldScale = new THREE.Vector3();
+  focusObject.matrixWorld.decompose(worldPosition, worldQuaternion, worldScale);
+  worldScale.multiplyScalar(1.035);
+  context.highlightMesh.position.copy(worldPosition);
+  context.highlightMesh.quaternion.copy(worldQuaternion);
+  context.highlightMesh.scale.copy(worldScale);
+  context.highlightMesh.visible = true;
+}
+function hasSameLocateResultSet(currentSet, uuids) {
+  if (currentSet.size !== uuids.length) return false;
+  for (const uuid of uuids) {
+    if (!currentSet.has(uuid)) return false;
+  }
+  return true;
+}
+function expandLocateTargets(contentMap, ids) {
+  const expanded = /* @__PURE__ */ new Set();
+  const queue = [...ids];
+  const visited = /* @__PURE__ */ new Set();
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || visited.has(current)) continue;
+    visited.add(current);
+    expanded.add(current);
+    const nodes = contentMap.get(current);
+    if (!nodes || nodes.length === 0) continue;
+    for (const node of nodes) {
+      if (!node.children || node.children.length === 0) continue;
+      for (const child of node.children) {
+        if (!visited.has(child.id)) queue.push(child.id);
+      }
+    }
+  }
+  return expanded;
+}
+function applyHighlightObjects(context, uuids) {
+  context.clearClashPairHighlight();
+  const target = new Set(uuids.filter(Boolean));
+  const preserveLocateTint = context.state.locateResultSet.size > 0;
+  if (!preserveLocateTint) {
+    restoreHighlightedInstanceColors(context, [...context.state.highlightedUuids].filter((id) => !target.has(id)));
+    applyHighlightedInstanceColors(context, [...target].filter((id) => !context.state.highlightedUuids.has(id)));
+  }
+  context.state.highlightedUuids = target;
+  context.state.lastSelectedUuid = uuids.length > 0 ? uuids[uuids.length - 1] : null;
+  updateSelectionHelpers(context, target);
+  return { needsRender: true };
+}
+function applyClearLocateFocus(context) {
+  context.clearClashPairHighlight();
+  context.locateObjectMaterialCache.forEach((material, uuid) => {
+    const object = context.contentGroup.getObjectByProperty("uuid", uuid);
+    if (!object || !object.isMesh && !object.isBatchedMesh) return;
+    object.material = material;
+  });
+  context.locateObjectMaterialCache.clear();
+  context.locateMaterialCache.clear();
+  context.locateDimmedInstances.forEach(({ mesh, instanceId, originalColor }) => {
+    mesh.setColorAt(instanceId, new THREE.Color(originalColor));
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  });
+  context.locateDimmedInstances.clear();
+  context.state.locateResultSet.clear();
+  context.state.locateFocusUuid = null;
+  context.state.highlightedUuids = /* @__PURE__ */ new Set();
+  context.state.lastSelectedUuid = null;
+  context.selectionBox.visible = false;
+  context.highlightMesh.visible = false;
+  return { needsRender: true };
+}
+function applySetLocateResultSet(context, uuids, focusUuid = null, options) {
+  context.clearClashPairHighlight();
+  const normalized = Array.from(new Set(uuids.filter(Boolean)));
+  if (normalized.length === 0) {
+    return applyClearLocateFocus(context);
+  }
+  const selectedSet = new Set(normalized);
+  const expandedTargets = expandLocateTargets(context.nodeMap, normalized);
+  const expandedList = Array.from(expandedTargets);
+  const rootColorByExpandedId = /* @__PURE__ */ new Map();
+  const colorEntries = options?.highlightColors || {};
+  normalized.forEach((rootId) => {
+    const colorHex = colorEntries[rootId];
+    if (!colorHex) return;
+    const rootColor = new THREE.Color(colorHex);
+    const expandedFromRoot = expandLocateTargets(context.nodeMap, [rootId]);
+    expandedFromRoot.forEach((id) => rootColorByExpandedId.set(id, rootColor));
+  });
+  if (hasSameLocateResultSet(context.state.locateResultSet, expandedList)) {
+    const nextFocus = focusUuid && context.state.locateResultSet.has(focusUuid) ? focusUuid : expandedList[0];
+    context.state.locateFocusUuid = nextFocus;
+    return applyHighlightObjects(context, nextFocus ? [nextFocus] : []);
+  }
+  applyClearLocateFocus(context);
+  context.state.locateResultSet = expandedTargets;
+  context.state.locateFocusUuid = focusUuid && expandedTargets.has(focusUuid) ? focusUuid : expandedList[0];
+  const focusKey = context.state.locateFocusUuid;
+  const dimmedColor = new THREE.Color("#b7bec9");
+  const accentColor = getHighlightColor(context.settings);
+  context.contentGroup.traverse((child) => {
+    const mesh = child;
+    if (!mesh.isMesh || !mesh.material) return;
+    if (!context.locateObjectMaterialCache.has(child.uuid)) {
+      context.locateObjectMaterialCache.set(child.uuid, mesh.material);
+    }
+    const sourceMaterials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    const isMatched = expandedTargets.has(child.uuid);
+    const isFocus = isMatched && focusKey !== null && child.uuid === focusKey;
+    const matchedColor = rootColorByExpandedId.get(child.uuid) || accentColor;
+    const nextMaterials = sourceMaterials.map((material) => {
+      if (!material) return material;
+      const cloned = material.clone();
+      if ("transparent" in cloned) cloned.transparent = false;
+      if ("opacity" in cloned) cloned.opacity = 1;
+      if ("depthWrite" in cloned) cloned.depthWrite = true;
+      if ("color" in cloned && cloned.color) {
+        const baseColor = cloned.color.clone();
+        if (isMatched) {
+          cloned.color.copy(baseColor.lerp(matchedColor, isFocus ? 0.93 : 0.76));
+        } else {
+          cloned.transparent = true;
+          cloned.opacity = 0.18;
+          cloned.depthWrite = false;
+          cloned.color.copy(baseColor.lerp(dimmedColor, 0.84));
+        }
+      }
+      if ("emissive" in cloned && cloned.emissive) {
+        if (isMatched) cloned.emissive.copy(matchedColor.clone().multiplyScalar(isFocus ? 0.4 : 0.12));
+        else cloned.emissive.set(0);
+      }
+      if ("roughness" in cloned && !isMatched) cloned.roughness = Math.max(0.9, cloned.roughness ?? 0.9);
+      if ("metalness" in cloned && !isMatched) cloned.metalness = Math.min(0.02, cloned.metalness ?? 0.02);
+      cloned.needsUpdate = true;
+      return cloned;
+    });
+    mesh.material = Array.isArray(mesh.material) ? nextMaterials : nextMaterials[0];
+  });
+  context.contentGroup.traverse((child) => {
+    const batched = child;
+    if (!batched.isBatchedMesh || !batched.material) return;
+    if (!context.locateObjectMaterialCache.has(child.uuid)) {
+      context.locateObjectMaterialCache.set(child.uuid, batched.material);
+    }
+    const owner = batched.userData?.originalUuid ? String(batched.userData.originalUuid) : "";
+    const batchIdToUuid = batched.userData?.batchIdToUuid;
+    let hasMatchedInstance = false;
+    let hasFocusInstance = false;
+    let instanceMatchColor = owner ? rootColorByExpandedId.get(owner) || null : null;
+    if (batchIdToUuid && batchIdToUuid.size > 0) {
+      for (const instanceUuid of batchIdToUuid.values()) {
+        if (!hasMatchedInstance && expandedTargets.has(instanceUuid)) hasMatchedInstance = true;
+        if (!hasFocusInstance && focusKey !== null && instanceUuid === focusKey) hasFocusInstance = true;
+        if (!instanceMatchColor && expandedTargets.has(instanceUuid)) {
+          instanceMatchColor = rootColorByExpandedId.get(instanceUuid) || null;
+        }
+        if (hasMatchedInstance && hasFocusInstance) break;
+      }
+    }
+    const ownerExplicitSelected = owner ? selectedSet.has(owner) : false;
+    const isMatched = expandedTargets.has(child.uuid) || hasMatchedInstance || ownerExplicitSelected;
+    const isFocus = context.state.locateFocusUuid !== null && context.state.locateFocusUuid === child.uuid || hasFocusInstance || ownerExplicitSelected && context.state.locateFocusUuid !== null && context.state.locateFocusUuid === owner;
+    const sourceMaterials = Array.isArray(batched.material) ? batched.material : [batched.material];
+    const matchedColor = instanceMatchColor || accentColor;
+    const nextMaterials = sourceMaterials.map((material) => {
+      if (!material) return material;
+      const cloned = material.clone();
+      if ("transparent" in cloned) cloned.transparent = false;
+      if ("opacity" in cloned) cloned.opacity = 1;
+      if ("depthWrite" in cloned) cloned.depthWrite = true;
+      if ("color" in cloned && cloned.color) {
+        const baseColor = cloned.color.clone();
+        if (isMatched) {
+          cloned.color.copy(baseColor.lerp(matchedColor, isFocus ? 0.92 : 0.7));
+        } else {
+          cloned.transparent = true;
+          cloned.opacity = 0.16;
+          cloned.depthWrite = false;
+          cloned.color.copy(baseColor.lerp(dimmedColor, 0.86));
+        }
+      }
+      if ("emissive" in cloned && cloned.emissive) {
+        if (isMatched) cloned.emissive.copy(matchedColor.clone().multiplyScalar(isFocus ? 0.36 : 0.12));
+        else cloned.emissive.set(0);
+      }
+      if ("roughness" in cloned && !isMatched) cloned.roughness = Math.max(0.9, cloned.roughness ?? 0.9);
+      if ("metalness" in cloned && !isMatched) cloned.metalness = Math.min(0.02, cloned.metalness ?? 0.02);
+      cloned.needsUpdate = true;
+      return cloned;
+    });
+    batched.material = Array.isArray(batched.material) ? nextMaterials : nextMaterials[0];
+  });
+  context.optimizedMapping.forEach((mappings, originalUuid) => {
+    const isMatched = expandedTargets.has(originalUuid);
+    const isFocus = isMatched && focusKey !== null && originalUuid === focusKey;
+    const matchedColor = rootColorByExpandedId.get(originalUuid) || accentColor;
+    mappings.forEach((mapping) => {
+      const key = `${mapping.mesh.uuid}:${mapping.instanceId}`;
+      context.locateDimmedInstances.set(key, {
+        mesh: mapping.mesh,
+        instanceId: mapping.instanceId,
+        originalColor: mapping.originalColor
+      });
+      const sourceColor = new THREE.Color(mapping.originalColor);
+      const tint = isFocus ? 0.93 : isMatched ? 0.76 : 0.82;
+      const targetColor = isMatched ? matchedColor : dimmedColor;
+      mapping.mesh.setColorAt(mapping.instanceId, sourceColor.lerp(targetColor, tint));
+      if (mapping.mesh.instanceColor) mapping.mesh.instanceColor.needsUpdate = true;
+    });
+  });
+  return applyHighlightObjects(context, context.state.locateFocusUuid ? [context.state.locateFocusUuid] : []);
+}
+
+function createMarker(point, parent, dotTexture) {
+  const markerGeometry = new THREE.BufferGeometry().setAttribute(
+    "position",
+    new THREE.Float32BufferAttribute([point.x, point.y, point.z], 3)
+  );
+  const markerMaterial = new THREE.PointsMaterial({
+    color: 16711680,
+    size: 8,
+    map: dotTexture,
+    transparent: true,
+    alphaTest: 0.5,
+    depthTest: false
+  });
+  const marker = new THREE.Points(markerGeometry, markerMaterial);
+  marker.renderOrder = 999;
+  parent.add(marker);
+}
+function createLine(points, parent) {
+  const geometry = new THREE.BufferGeometry().setFromPoints(points);
+  const material = new THREE.LineBasicMaterial({ color: 16711680, depthTest: false, linewidth: 2 });
+  const line = new THREE.Line(geometry, material);
+  line.renderOrder = 998;
+  parent.add(line);
+}
+function createLabel(text, position) {
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+  if (!context) return new THREE.Sprite();
+  const fontSize = 48;
+  const padding = 24;
+  context.font = `Bold ${fontSize}px "Segoe UI", Arial, sans-serif`;
+  const textWidth = context.measureText(text).width;
+  canvas.width = textWidth + padding * 2;
+  canvas.height = fontSize + padding;
+  context.shadowColor = "rgba(0, 0, 0, 0.5)";
+  context.shadowBlur = 10;
+  context.fillStyle = "rgba(30, 30, 30, 0.9)";
+  const radius = 8;
+  const roundedContext = context;
+  if (roundedContext.roundRect) {
+    roundedContext.roundRect(5, 5, canvas.width - 10, canvas.height - 10, radius);
+  } else {
+    context.rect(5, 5, canvas.width - 10, canvas.height - 10);
+  }
+  context.fill();
+  context.shadowBlur = 0;
+  context.strokeStyle = "#ff0000";
+  context.lineWidth = 2;
+  context.stroke();
+  context.font = `Bold ${fontSize}px "Segoe UI", Arial, sans-serif`;
+  context.fillStyle = "#ffffff";
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  context.fillText(text, canvas.width / 2, canvas.height / 2);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.minFilter = THREE.LinearFilter;
+  texture.magFilter = THREE.LinearFilter;
+  const material = new THREE.SpriteMaterial({
+    map: texture,
+    depthTest: false,
+    sizeAttenuation: false
+  });
+  const sprite = new THREE.Sprite(material);
+  sprite.position.copy(position);
+  const baseScale = 0.5;
+  sprite.scale.set(baseScale * (canvas.width / canvas.height), baseScale, 1);
+  sprite.renderOrder = 1001;
+  sprite.userData = { type: "label" };
+  return sprite;
+}
+function clearPreviewVisuals(context, state) {
+  if (state.previewLine) {
+    context.measureGroup.remove(state.previewLine);
+    state.previewLine = null;
+  }
+  if (state.previewPolygon) {
+    context.measureGroup.remove(state.previewPolygon);
+    state.previewPolygon = null;
+  }
+  context.tempMarker.visible = false;
+}
+function applyClearMeasurementPreview(context, resetPoints = true) {
+  const state = {
+    ...context.state,
+    currentMeasurePoints: resetPoints ? [] : [...context.state.currentMeasurePoints]
+  };
+  clearPreviewVisuals(context, state);
+  for (let i = context.measureGroup.children.length - 1; i >= 0; i--) {
+    const child = context.measureGroup.children[i];
+    if (!child.name.startsWith("measure_")) {
+      context.measureGroup.remove(child);
+    }
+  }
+  return {
+    state,
+    needsRender: true
+  };
+}
+function applyUpdateMeasurePreview(context, hoverPoint) {
+  const state = {
+    ...context.state,
+    currentMeasurePoints: [...context.state.currentMeasurePoints]
+  };
+  clearPreviewVisuals(context, state);
+  const points = [...state.currentMeasurePoints];
+  if (hoverPoint) points.push(hoverPoint);
+  if (points.length < 2) {
+    return { state, needsRender: false };
+  }
+  const geometry = new THREE.BufferGeometry().setFromPoints(points);
+  const material = new THREE.LineDashedMaterial({
+    color: 16711680,
+    dashSize: 5,
+    gapSize: 2,
+    depthTest: false
+  });
+  state.previewLine = new THREE.Line(geometry, material);
+  state.previewLine.computeLineDistances();
+  state.previewLine.renderOrder = 998;
+  context.measureGroup.add(state.previewLine);
+  return { state, needsRender: false };
+}
+function applyUpdateMeasureHover(context, clientX, clientY) {
+  const state = {
+    ...context.state,
+    currentMeasurePoints: [...context.state.currentMeasurePoints]
+  };
+  if (state.measureType === "none") {
+    context.tempMarker.visible = false;
+    return { state, needsRender: false };
+  }
+  const intersect = context.getRayIntersects(clientX, clientY);
+  if (!intersect) {
+    context.tempMarker.visible = false;
+    if (state.previewLine) state.previewLine.visible = false;
+    return { state, needsRender: true };
+  }
+  const point = intersect.point;
+  const position = context.tempMarker.geometry.attributes.position;
+  position.setXYZ(0, point.x, point.y, point.z);
+  position.needsUpdate = true;
+  context.tempMarker.visible = true;
+  if (state.currentMeasurePoints.length === 0) {
+    return { state, needsRender: true };
+  }
+  const previewResult = applyUpdateMeasurePreview(context, point);
+  return {
+    state: previewResult.state,
+    needsRender: true
+  };
+}
+function applyFinalizeMeasurement(context) {
+  const state = {
+    ...context.state,
+    currentMeasurePoints: [...context.state.currentMeasurePoints]
+  };
+  const id = `measure_${Date.now()}`;
+  const group = new THREE.Group();
+  group.name = id;
+  state.currentMeasurePoints.forEach((point) => createMarker(point, group, context.dotTexture));
+  let value = "";
+  let displayValue = "";
+  const type = state.measureType;
+  const labelPosition = new THREE.Vector3();
+  if (state.measureType === "dist") {
+    const [p1, p2] = state.currentMeasurePoints;
+    const distance = p1.distanceTo(p2);
+    const dx = Math.abs(p2.x - p1.x);
+    const dy = Math.abs(p2.y - p1.y);
+    const dz = Math.abs(p2.z - p1.z);
+    displayValue = distance.toFixed(3);
+    value = `${displayValue} (Δx:${dx.toFixed(2)}, Δy:${dy.toFixed(2)}, Δz:${dz.toFixed(2)})`;
+    createLine(state.currentMeasurePoints, group);
+    labelPosition.copy(p1).add(p2).multiplyScalar(0.5);
+  } else if (state.measureType === "angle") {
+    const [p1, center, p2] = state.currentMeasurePoints;
+    const v1 = p1.clone().sub(center).normalize();
+    const v2 = p2.clone().sub(center).normalize();
+    const angle = v1.angleTo(v2) * (180 / Math.PI);
+    displayValue = `${angle.toFixed(2)}°`;
+    value = displayValue;
+    createLine(state.currentMeasurePoints, group);
+    labelPosition.copy(center);
+  } else {
+    const [point] = state.currentMeasurePoints;
+    displayValue = `(${point.x.toFixed(2)}, ${point.y.toFixed(2)}, ${point.z.toFixed(2)})`;
+    value = displayValue;
+    labelPosition.copy(point);
+  }
+  group.add(createLabel(displayValue, labelPosition));
+  context.measureGroup.add(group);
+  context.measureRecords.set(id, {
+    id,
+    type,
+    val: value,
+    group,
+    modelUuid: state.currentMeasureModelUuid || void 0
+  });
+  const cleared = applyClearMeasurementPreview(
+    {
+      ...context,
+      state: {
+        ...state,
+        currentMeasurePoints: [],
+        currentMeasureModelUuid: null
+      }
+    },
+    false
+  );
+  const nextState = {
+    ...cleared.state,
+    currentMeasurePoints: [],
+    currentMeasureModelUuid: null
+  };
+  if (context.onMeasureUpdate) {
+    context.onMeasureUpdate(Array.from(context.measureRecords.values()));
+  }
+  return {
+    state: nextState,
+    needsRender: true,
+    completed: { id, type, val: value }
+  };
+}
+function applyAddMeasurePoint(context, point, modelUuid) {
+  if (context.state.measureType === "none") {
+    return { state: context.state, needsRender: false, completed: null };
+  }
+  const state = {
+    ...context.state,
+    currentMeasurePoints: [...context.state.currentMeasurePoints, point],
+    currentMeasureModelUuid: modelUuid ?? context.state.currentMeasureModelUuid
+  };
+  createMarker(point, context.measureGroup, context.dotTexture);
+  const shouldFinalize = state.measureType === "dist" && state.currentMeasurePoints.length === 2 || state.measureType === "angle" && state.currentMeasurePoints.length === 3 || state.measureType === "coord";
+  if (shouldFinalize) {
+    return applyFinalizeMeasurement({ ...context, state });
+  }
+  const previewResult = applyUpdateMeasurePreview({ ...context, state });
+  return {
+    state: previewResult.state,
+    needsRender: true,
+    completed: null
+  };
+}
+function applyHighlightMeasurement(context, id) {
+  context.measureRecords.forEach((record, recordId) => {
+    const isHighlighted = recordId === id;
+    const color = isHighlighted ? 65280 : 16711680;
+    record.group.traverse((child) => {
+      if (child instanceof THREE.Line || child instanceof THREE.LineLoop) {
+        child.material.color.set(color);
+      } else if (child instanceof THREE.Points) {
+        child.material.color.set(color);
+      } else if (child instanceof THREE.Sprite) {
+        child.material.color.set(isHighlighted ? 65280 : 16777215);
+      } else if (child instanceof THREE.Mesh && child.material instanceof THREE.MeshBasicMaterial) {
+        child.material.color.set(color);
+      } else if (child instanceof THREE.Box3Helper) {
+        child.material.color.set(color);
+      }
+    });
+  });
+  return {
+    state: context.state,
+    needsRender: true
+  };
+}
+function applyPickMeasurement(context, clientX, clientY) {
+  const rect = context.canvas.getBoundingClientRect();
+  context.mouse.x = (clientX - rect.left) / rect.width * 2 - 1;
+  context.mouse.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+  context.raycaster.setFromCamera(context.mouse, context.camera);
+  const previousThreshold = context.raycaster.params.Line?.threshold || 0;
+  if (context.raycaster.params.Line) {
+    context.raycaster.params.Line.threshold = 5;
+  }
+  const intersects = context.raycaster.intersectObjects(context.measureGroup.children, true);
+  if (context.raycaster.params.Line) {
+    context.raycaster.params.Line.threshold = previousThreshold;
+  }
+  if (intersects.length === 0) {
+    return null;
+  }
+  let object = intersects[0].object;
+  while (object.parent && !object.name.startsWith("measure_")) {
+    object = object.parent;
+  }
+  return object.name.startsWith("measure_") ? object.name : null;
+}
+
+function buildInteractableList(context) {
+  const interactableList = [];
+  if (context.chunks.length > 0) {
+    context.chunks.forEach((chunk) => {
+      if (chunk.loaded && chunk.mesh && chunk.mesh.visible) {
+        interactableList.push(chunk.mesh);
+      }
+    });
+  }
+  const traverseLimit = (object, depth) => {
+    if (depth > 10) return;
+    if (!object.visible) return;
+    if (object.userData.chunkId) return;
+    if (object.isMesh || object.isBatchedMesh) {
+      if (!object.userData.isOptimized) {
+        interactableList.push(object);
+      }
+      return;
+    }
+    if (object.children.length === 0) return;
+    for (const child of object.children) {
+      traverseLimit(child, depth + 1);
+    }
+  };
+  for (const child of context.contentGroup.children) {
+    if (child.userData.isOptimizedGroup) continue;
+    traverseLimit(child, 0);
+  }
+  return interactableList;
+}
+function createProxyObjectForBatchedHit(context, batchedMesh, batchId, originalUuid) {
+  const nodes = context.nodeMap.get(originalUuid);
+  const node = nodes?.[0];
+  const proxy = new THREE.Object3D();
+  proxy.uuid = originalUuid;
+  if (node) {
+    proxy.name = node.name;
+    proxy.type = node.type;
+    proxy.isMesh = node.type === "Mesh";
+  }
+  proxy.getWorldPosition = (vector) => {
+    const matrix2 = new THREE.Matrix4();
+    batchedMesh.getMatrixAt(batchId, matrix2);
+    matrix2.premultiply(batchedMesh.matrixWorld);
+    return vector.setFromMatrixPosition(matrix2);
+  };
+  const matrix = new THREE.Matrix4();
+  batchedMesh.getMatrixAt(batchId, matrix);
+  proxy.position.setFromMatrixPosition(matrix);
+  return proxy;
+}
+function ensureInteractableList(context) {
+  if (context.interactableListValid) {
+    return {
+      interactableList: context.interactableList,
+      interactableListValid: true
+    };
+  }
+  return {
+    interactableList: buildInteractableList(context),
+    interactableListValid: true
+  };
+}
+function applyGetRayIntersects(context, clientX, clientY) {
+  const rect = context.canvas.getBoundingClientRect();
+  context.mouse.x = (clientX - rect.left) / rect.width * 2 - 1;
+  context.mouse.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+  context.raycaster.setFromCamera(context.mouse, context.camera);
+  const state = ensureInteractableList(context);
+  const intersects = context.raycaster.intersectObjects(state.interactableList, false);
+  if (intersects.length === 0) {
+    return { intersect: null, state };
+  }
+  const hit = intersects[0];
+  if (!hit.object.isBatchedMesh) {
+    return { intersect: hit, state };
+  }
+  const batchedMesh = hit.object;
+  const batchId = hit.batchId !== void 0 ? hit.batchId : hit.instanceId;
+  if (batchId === void 0) {
+    return { intersect: hit, state };
+  }
+  const originalUuid = batchedMesh.userData.batchIdToUuid?.get(batchId);
+  if (!originalUuid) {
+    return { intersect: hit, state };
+  }
+  const originalObject = context.contentGroup.getObjectByProperty("uuid", originalUuid);
+  hit.object = originalObject ?? createProxyObjectForBatchedHit(context, batchedMesh, batchId, originalUuid);
+  return { intersect: hit, state };
+}
+function selectInteractablesByScreenRect(context, x1, y1, x2, y2) {
+  const minX = Math.min(x1, x2);
+  const maxX = Math.max(x1, x2);
+  const minY = Math.min(y1, y2);
+  const maxY = Math.max(y1, y2);
+  const originalMatrix = context.camera.projectionMatrix.clone();
+  const newMatrix = new THREE.Matrix4();
+  const selectWidth = maxX - minX;
+  const selectHeight = maxY - minY;
+  const scaleX = selectWidth / 2;
+  const scaleY = selectHeight / 2;
+  const centerX = (maxX + minX) / 2;
+  const centerY = (maxY + minY) / 2;
+  const translateMatrix = new THREE.Matrix4().makeTranslation(-centerX, -centerY, 0);
+  const scaleMatrix = new THREE.Matrix4().makeScale(1 / scaleX, 1 / scaleY, 1);
+  newMatrix.multiplyMatrices(scaleMatrix, translateMatrix);
+  const modifiedProjectionMatrix = newMatrix.multiply(originalMatrix);
+  const frustum = new THREE.Frustum();
+  const viewMatrix = context.camera.matrixWorldInverse;
+  const projViewMatrix = modifiedProjectionMatrix.clone().multiply(viewMatrix);
+  frustum.setFromProjectionMatrix(projViewMatrix);
+  const selected = [];
+  const box = new THREE.Box3();
+  const tmpMatrix = new THREE.Matrix4();
+  for (const object of context.interactableList) {
+    if (object.isBatchedMesh) {
+      const batchedMesh = object;
+      const batchIdToUuid = batchedMesh.userData.batchIdToUuid;
+      const batchIdToGeometry = batchedMesh.userData.batchIdToGeometry;
+      if (!batchIdToUuid || !batchIdToGeometry) continue;
+      for (const [batchId, uuid] of batchIdToUuid) {
+        try {
+          const geometry = batchIdToGeometry.get(batchId);
+          if (!geometry) continue;
+          batchedMesh.getMatrixAt(batchId, tmpMatrix);
+          tmpMatrix.premultiply(batchedMesh.matrixWorld);
+          const geometryBox = new THREE.Box3();
+          if (!geometry.boundingBox) geometry.computeBoundingBox();
+          geometryBox.copy(geometry.boundingBox).applyMatrix4(tmpMatrix);
+          if (frustum.intersectsBox(geometryBox)) {
+            selected.push(uuid);
+          }
+        } catch {
+        }
+      }
+      continue;
+    }
+    box.setFromObject(object);
+    if (frustum.intersectsBox(box)) {
+      selected.push(object.uuid);
+    }
+  }
+  return selected;
+}
+
+function resolveBimIdByUuid({
+  uuid,
+  nodeMap,
+  bimIdToNodeIds
+}) {
+  const nodes = nodeMap.get(uuid);
+  if (nodes && nodes.length > 0 && nodes[0].bimId) {
+    return nodes[0].bimId;
+  }
+  for (const [key, nodeIds] of bimIdToNodeIds.entries()) {
+    if (nodeIds.includes(uuid)) {
+      const parts = key.split("::");
+      return parts.length > 1 ? parts[1] : null;
+    }
+  }
+  return null;
+}
+function resolveNodeUuidByBimId(bimId, bimIdToNodeIds) {
+  for (const [key, nodeIds] of bimIdToNodeIds.entries()) {
+    if (key.endsWith(`::${bimId}`) && nodeIds.length > 0) {
+      return nodeIds[0];
+    }
+  }
+  return null;
+}
+function resolveSelectionUuid(rawUuid, nodeMap, bimIdToNodeIds) {
+  if (nodeMap.has(rawUuid)) return rawUuid;
+  return resolveNodeUuidByBimId(rawUuid, bimIdToNodeIds) || rawUuid;
+}
+function resolveNbimNode(id, nodeMap) {
+  const direct = nodeMap.get(id);
+  return direct && direct.length > 0 ? direct[0] : null;
+}
+function resolveNbimPropertyEntry({
+  id,
+  nodeMap,
+  nbimPropsByOriginalUuid
+}) {
+  const node = resolveNbimNode(id, nodeMap);
+  if (!node || !node.bimId) return null;
+  const originalUuid = node.userData?.originalUuid ? String(node.userData.originalUuid) : "";
+  if (!originalUuid) return null;
+  const map = nbimPropsByOriginalUuid.get(originalUuid);
+  if (!map) return null;
+  return {
+    entry: map[`${originalUuid}::${node.bimId}`],
+    node
+  };
+}
+function resolveNbimFlatProperties(args) {
+  const resolved = resolveNbimPropertyEntry(args);
+  if (!resolved?.entry || typeof resolved.entry !== "object") return resolved?.entry || null;
+  const { ifcRawGroups, ifcNormalizedGroups, ...flatProps } = resolved.entry;
+  return flatProps;
+}
+function resolveNbimIfcPropertyGroups(args, mode = "raw") {
+  const resolved = resolveNbimPropertyEntry(args);
+  if (!resolved?.entry || typeof resolved.entry !== "object") return null;
+  const rawGroups = resolved.entry.ifcRawGroups;
+  const normalizedGroups = resolved.entry.ifcNormalizedGroups;
+  if (mode === "normalized") {
+    return normalizedGroups || rawGroups || null;
+  }
+  return rawGroups || normalizedGroups || null;
+}
+
 function estimateTextureMemoryMb(root) {
   let textureMemory = 0;
   const textures = /* @__PURE__ */ new Set();
@@ -79,6 +2663,211 @@ function estimateTextureMemoryMb(root) {
   return parseFloat(textureMemory.toFixed(2));
 }
 
+function collectSceneManagerStats(context) {
+  const drawCalls = context.renderer.info.render.calls;
+  const textureMemory = estimateTextureMemoryMb(context.contentGroup);
+  return {
+    meshes: context.originalStats.meshes,
+    faces: context.originalStats.faces,
+    memory: parseFloat(context.originalStats.memory.toFixed(2)),
+    textureMemory,
+    drawCalls,
+    chunksLoaded: context.chunkLoadedCount,
+    chunksTotal: context.chunksLength,
+    chunksQueued: context.processingChunkCount,
+    pixelRatio: Number(context.activePixelRatio.toFixed(2))
+  };
+}
+
+function syncStructureNodeVisibility(nodeMap, rootNode, visible) {
+  const setNodeVisible = (node) => {
+    node.visible = visible;
+    node.children?.forEach(setNodeVisible);
+  };
+  rootNode.children?.forEach(setNodeVisible);
+  nodeMap.forEach((nodes) => {
+    nodes.forEach((node) => {
+      node.visible = visible;
+    });
+  });
+}
+function applyOptimizedMappingsVisibility(optimizedMapping, visible) {
+  optimizedMapping.forEach((mappings) => {
+    mappings.forEach((mapping) => {
+      mapping.mesh.setVisibleAt(mapping.instanceId, visible);
+    });
+  });
+}
+function applyRenderableVisibility(object, visible) {
+  if (object.name === "Helpers" || object.name === "Measure") return;
+  if (object.isMesh && object.userData.isOptimized) {
+    object.visible = false;
+    return;
+  }
+  object.visible = visible;
+}
+function ensureParentChainVisible(object, scene) {
+  let parent = object?.parent;
+  while (parent && parent !== scene) {
+    parent.visible = true;
+    parent = parent.parent;
+  }
+}
+function collectHighlightedDescendants(highlightedUuids, uuid, object, nodes) {
+  const idsToUnhighlight = [];
+  if (highlightedUuids.has(uuid)) {
+    idsToUnhighlight.push(uuid);
+  }
+  if (object) {
+    object.traverse((child) => {
+      if (highlightedUuids.has(child.uuid)) {
+        idsToUnhighlight.push(child.uuid);
+      }
+    });
+    return idsToUnhighlight;
+  }
+  if (nodes && nodes.length > 0) {
+    const walk = (node) => {
+      if (highlightedUuids.has(node.id)) idsToUnhighlight.push(node.id);
+      node.children?.forEach(walk);
+    };
+    walk(nodes[0]);
+  }
+  return idsToUnhighlight;
+}
+function syncNodeBranchVisibility(nodeMap, node, visible) {
+  node.visible = visible;
+  node.children?.forEach((child) => syncNodeBranchVisibility(nodeMap, child, visible));
+  const mirrored = nodeMap.get(node.id);
+  mirrored?.forEach((item) => {
+    item.visible = visible;
+  });
+}
+function applyObjectMappingVisibility(optimizedMapping, objectOrNodeId, visible) {
+  const mappings = optimizedMapping.get(objectOrNodeId);
+  if (!mappings) return;
+  mappings.forEach((mapping) => {
+    mapping.mesh.setVisibleAt(mapping.instanceId, visible);
+  });
+}
+function applySetAllVisibility(context, visible) {
+  syncStructureNodeVisibility(context.nodeMap, context.structureRoot, visible);
+  applyOptimizedMappingsVisibility(context.optimizedMapping, visible);
+  context.contentGroup.traverse((object) => {
+    applyRenderableVisibility(object, visible);
+  });
+  return {
+    needsBoundsUpdate: true,
+    needsExplodeRefresh: true,
+    needsRender: true
+  };
+}
+function applySetObjectVisibility(context, uuid, visible, showParents = true) {
+  const nodes = context.nodeMap.get(uuid);
+  nodes?.forEach((node) => syncNodeBranchVisibility(context.nodeMap, node, visible));
+  const object = context.contentGroup.getObjectByProperty("uuid", uuid);
+  if (visible && object && showParents) {
+    ensureParentChainVisible(object, context.scene);
+  }
+  const idsToUnhighlight = !visible ? collectHighlightedDescendants(context.highlightedUuids, uuid, object, nodes) : [];
+  if (!object) {
+    if (nodes && nodes.length > 0) {
+      const walk = (node) => {
+        applyObjectMappingVisibility(context.optimizedMapping, node.id, visible);
+        node.children?.forEach(walk);
+      };
+      walk(nodes[0]);
+    }
+    return {
+      needsBoundsUpdate: true,
+      needsExplodeRefresh: false,
+      needsRender: true,
+      nextHighlightedUuids: idsToUnhighlight.length > 0 ? Array.from(new Set([...context.highlightedUuids].filter((id) => !idsToUnhighlight.includes(id)))) : void 0
+    };
+  }
+  object.traverse((child) => {
+    if (child.name === "Helpers" || child.name === "Measure") return;
+    applyRenderableVisibility(child, visible);
+    applyObjectMappingVisibility(context.optimizedMapping, child.uuid, visible);
+  });
+  return {
+    needsBoundsUpdate: true,
+    needsExplodeRefresh: false,
+    needsRender: true,
+    nextHighlightedUuids: idsToUnhighlight.length > 0 ? Array.from(new Set([...context.highlightedUuids].filter((id) => !idsToUnhighlight.includes(id)))) : void 0
+  };
+}
+function applyVisibilityBatch(context, changes, options = {}) {
+  if (changes.length === 0) {
+    return {
+      needsBoundsUpdate: false,
+      needsExplodeRefresh: false,
+      needsRender: false
+    };
+  }
+  let highlighted = new Set(context.highlightedUuids);
+  let needsRender = false;
+  changes.forEach((change) => {
+    const result = applySetObjectVisibility(
+      {
+        ...context,
+        highlightedUuids: highlighted
+      },
+      change.uuid,
+      change.visible,
+      change.showParents ?? true
+    );
+    if (result.nextHighlightedUuids) {
+      highlighted = new Set(result.nextHighlightedUuids);
+    }
+    needsRender = needsRender || result.needsRender;
+  });
+  return {
+    needsBoundsUpdate: options.recomputeBounds ?? true,
+    needsExplodeRefresh: options.refreshExplode ?? false,
+    needsRender,
+    nextHighlightedUuids: Array.from(highlighted)
+  };
+}
+function applyIsolateObjects(context, uuids, setObjectVisibility) {
+  applySetAllVisibility(context, false);
+  const affectedBatchedMeshes = /* @__PURE__ */ new Set();
+  uuids.forEach((uuid) => {
+    setObjectVisibility(uuid, true);
+    const nodes = context.nodeMap.get(uuid);
+    if (nodes) {
+      nodes.forEach((node) => {
+        const showChildrenRecursive = (currentNode) => {
+          if (currentNode.id !== uuid) {
+            setObjectVisibility(currentNode.id, true);
+          }
+          currentNode.children?.forEach(showChildrenRecursive);
+        };
+        showChildrenRecursive(node);
+      });
+    }
+    const mappings = context.optimizedMapping.get(uuid);
+    mappings?.forEach((mapping) => {
+      affectedBatchedMeshes.add(mapping.mesh);
+    });
+  });
+  affectedBatchedMeshes.forEach((mesh) => {
+    mesh.visible = true;
+    ensureParentChainVisible(mesh, context.scene);
+  });
+  uuids.forEach((uuid) => {
+    const object = context.contentGroup.getObjectByProperty("uuid", uuid);
+    if (object) {
+      ensureParentChainVisible(object, context.scene);
+    }
+  });
+  return {
+    needsBoundsUpdate: true,
+    needsExplodeRefresh: true,
+    needsRender: true
+  };
+}
+
 const DEFAULT_SCENE_CHUNK_OPTIONS = {
   chunkReadCacheSize: 128,
   chunkPrefetchWindow: 0,
@@ -102,19 +2891,8 @@ function resolveSceneChunkOptions(options) {
   };
 }
 
-const CHUNK_PROGRESS_REPORT_INTERVAL_MS = 48;
 const NBIM_CHUNK_REGISTRATION_BATCH = 220;
 const GHOST_VISIBLE_FIRST_BATCH = 180;
-const INVALID_DISPLAY_LABELS = /* @__PURE__ */ new Set(["", "n/a", "na", "undefined", "null", "-", "--"]);
-function sanitizeDisplayLabel(...candidates) {
-  for (const candidate of candidates) {
-    if (typeof candidate !== "string") continue;
-    const trimmed = candidate.trim();
-    if (INVALID_DISPLAY_LABELS.has(trimmed.toLowerCase())) continue;
-    return trimmed;
-  }
-  return "";
-}
 class SceneManager {
   constructor(canvas, options = {}) {
     this.structureRoot = { id: "root", name: "Root", type: "Group", children: [] };
@@ -127,6 +2905,9 @@ class SceneManager {
     this.locateMaterialCache = /* @__PURE__ */ new Map();
     this.locateObjectMaterialCache = /* @__PURE__ */ new Map();
     this.locateDimmedInstances = /* @__PURE__ */ new Map();
+    this.clashPairObjectMaterialCache = /* @__PURE__ */ new Map();
+    this.clashPairInstanceColorCache = /* @__PURE__ */ new Map();
+    this.clashPairUuids = /* @__PURE__ */ new Set();
     this.highlightPulseColor = new THREE.Color("#ffffff");
     this.explodeEnabled = false;
     this.explodeStrength = 0;
@@ -142,14 +2923,7 @@ class SceneManager {
     this.previewLine = null;
     this.previewPolygon = null;
     this.measureRecords = /* @__PURE__ */ new Map();
-    this.boxSelectState = {
-      active: false,
-      startX: 0,
-      startY: 0,
-      endX: 0,
-      endY: 0,
-      rectElement: null
-    };
+    this.boxSelectState = createInitialBoxSelectState();
     this.clippingPlanes = [];
     this.clipPlaneHelpers = [];
     this.clipHelperVisible = false;
@@ -174,6 +2948,7 @@ class SceneManager {
       performanceMode: "balanced",
       highlightColor: "#ff9f1c",
       highlightShowBox: false,
+      backLightInt: 0.5,
       maxRenderDistance: 1e6
       // 增加默认渲染距离到 1km (针对 mm 单位)
     };
@@ -419,8 +3194,7 @@ class SceneManager {
       this.interactionShadowRestoreAt = 0;
       this.movingPeripheralLastRefreshAt = 0;
       this.movingPeripheralCursor = 0;
-      this.cullingDirty = true;
-      this.requestRender();
+      this.markSceneDirty({ needsCulling: true });
     });
     this.controls.addEventListener("change", () => {
       const profile = this.getChunkRuntimeProfile();
@@ -429,8 +3203,7 @@ class SceneManager {
       this.chunkLoadResumeAt = performance.now() + profile.resumeAfterMoveMs;
       this.postMoveRecoveryUntil = 0;
       this.interactionShadowRestoreAt = 0;
-      this.cullingDirty = true;
-      this.requestRender();
+      this.markSceneDirty({ needsCulling: true });
     });
     this.controls.addEventListener("end", () => {
       const now = performance.now();
@@ -442,33 +3215,16 @@ class SceneManager {
       this.interactionShadowRestoreAt = now + this.interactionShadowRestoreDelayMs;
       this.movingPeripheralLastRefreshAt = 0;
       this.movingPeripheralCursor = 0;
-      this.cullingDirty = true;
-      this.requestRender();
+      this.markSceneDirty({ needsCulling: true });
     });
     this.ambientLight = new THREE.AmbientLight(16251131, this.settings.ambientInt);
     this.scene.add(this.ambientLight);
     this.dirLight = new THREE.DirectionalLight(16776438, this.settings.dirInt);
     this.dirLight.position.set(60, 45, 110);
     this.scene.add(this.dirLight);
-    this.backLight = new THREE.DirectionalLight(15331062, 0.5);
+    this.backLight = new THREE.DirectionalLight(15331062, this.settings.backLightInt ?? 0.5);
     this.backLight.position.set(-40, -35, 30);
     this.scene.add(this.backLight);
-    this.sunLight = new THREE.DirectionalLight(16774373, 1.5);
-    this.sunLight.position.set(100, 100, 50);
-    this.sunLight.visible = false;
-    this.sunLight.castShadow = true;
-    this.sunLight.shadow.mapSize.width = 2048;
-    this.sunLight.shadow.mapSize.height = 2048;
-    this.sunLight.shadow.camera.near = 0.1;
-    this.sunLight.shadow.camera.far = 500;
-    this.sunLight.shadow.camera.left = -100;
-    this.sunLight.shadow.camera.right = 100;
-    this.sunLight.shadow.camera.top = 100;
-    this.sunLight.shadow.camera.bottom = -100;
-    this.sunLight.shadow.bias = -5e-4;
-    this.sunLight.shadow.normalBias = 0.02;
-    this.scene.add(this.sunLight);
-    this.scene.add(this.sunLight.target);
     const box = new THREE.Box3(new THREE.Vector3(), new THREE.Vector3());
     this.selectionBox = new THREE.Box3Helper(box, new THREE.Color(16776960));
     this.selectionBox.visible = false;
@@ -507,7 +3263,7 @@ class SceneManager {
     this.raycaster.params.Line.threshold = 2;
     this.mouse = new THREE.Vector2();
     this.animate = this.animate.bind(this);
-    this.requestRender();
+    this.markSceneDirty();
   }
   registerChunk(chunk) {
     this.chunks.push(chunk);
@@ -539,6 +3295,26 @@ class SceneManager {
     this.animateFramePending = true;
     this.animationFrameId = requestAnimationFrame(this.animate);
   }
+  markSceneDirty(options = {}) {
+    const {
+      needsRender = true,
+      needsBoundsUpdate = false,
+      needsCulling = false,
+      invalidateInteractables = false
+    } = options;
+    if (invalidateInteractables) {
+      this.interactableListValid = false;
+    }
+    if (needsBoundsUpdate) {
+      this._needsBoundsUpdate = true;
+    }
+    if (needsCulling) {
+      this.cullingDirty = true;
+    }
+    if (needsRender) {
+      this.requestRender();
+    }
+  }
   updateSettings(newSettings) {
     this.settings = { ...this.settings, ...newSettings };
     this.applyHighlightSettings();
@@ -550,12 +3326,10 @@ class SceneManager {
     }
     this.ambientLight.intensity = this.settings.ambientInt;
     this.dirLight.intensity = this.settings.dirInt;
+    this.backLight.intensity = this.settings.backLightInt ?? 0.5;
     this.renderer.outputColorSpace = this.settings.colorSpace === "linear" ? THREE.LinearSRGBColorSpace : THREE.SRGBColorSpace;
     this.renderer.toneMapping = this.settings.toneMapping === "none" ? THREE.NoToneMapping : this.settings.toneMapping === "neutral" ? THREE.NeutralToneMapping : THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = this.settings.exposure ?? 1;
-    if (newSettings.sunEnabled !== void 0 || newSettings.sunLatitude !== void 0 || newSettings.sunLongitude !== void 0 || newSettings.sunTime !== void 0 || newSettings.sunShadow !== void 0) {
-      this.updateSunPosition();
-    }
     this.renderer.setClearColor(this.settings.bgColor);
     if (newSettings.frustumCulling !== void 0) {
       this.contentGroup.traverse((obj) => {
@@ -570,94 +3344,7 @@ class SceneManager {
       this.maxRenderDistance = newSettings.maxRenderDistance;
       this.checkCullingAndLoad();
     }
-    if (newSettings.shadowQuality !== void 0 || newSettings.sunShadow !== void 0) {
-      this.updateSunShadow();
-    }
     this.renderer.render(this.scene, this.camera);
-  }
-  // 根据经纬度和时间计算太阳位置
-  updateSunPosition() {
-    const lat = this.settings.sunLatitude || 0;
-    const lng = this.settings.sunLongitude || 0;
-    const time = this.settings.sunTime !== void 0 ? this.settings.sunTime : 12;
-    const enabled = this.settings.sunEnabled !== false;
-    let bounds = this.computeTotalBounds(true);
-    if (bounds.isEmpty()) {
-      bounds = this.computeTotalBounds(false);
-    }
-    const center = !bounds.isEmpty() ? bounds.getCenter(new THREE.Vector3()) : new THREE.Vector3();
-    const size = !bounds.isEmpty() ? bounds.getSize(new THREE.Vector3()) : new THREE.Vector3(100, 100, 100);
-    const sceneSpan = Math.max(size.x, size.y, size.z, 100);
-    this.sunLight.visible = enabled;
-    if (!enabled) {
-      this.dirLight.intensity = this.settings.dirInt;
-      this.ambientLight.intensity = this.settings.ambientInt;
-      this.backLight.intensity = 0.5;
-      return;
-    }
-    const hourAngle = (time - 12) * 15 * (Math.PI / 180);
-    const sunElevation = 90 - Math.abs(lat) + 23.5 * Math.sin((time - 6) * 15 * (Math.PI / 180));
-    const elevationRad = sunElevation * (Math.PI / 180);
-    const azimuthAngle = hourAngle + lng * Math.PI / 180;
-    const distance = Math.max(sceneSpan * 2.2, 120);
-    const x = distance * Math.cos(elevationRad) * Math.sin(azimuthAngle);
-    const y = distance * Math.sin(elevationRad);
-    const z = distance * Math.cos(elevationRad) * Math.cos(azimuthAngle);
-    this.sunLight.position.set(center.x + x, center.y + Math.max(y, sceneSpan * 0.15), center.z + z);
-    this.sunLight.target.position.copy(center);
-    this.sunLight.target.updateMatrixWorld();
-    const intensity = Math.max(0.2, Math.sin(elevationRad)) * 2;
-    this.sunLight.intensity = intensity;
-    const sunColor = new THREE.Color();
-    if (time < 7 || time > 18) {
-      sunColor.setHex(16755302);
-    } else if (time < 9 || time > 16) {
-      sunColor.setHex(16764040);
-    } else {
-      sunColor.setHex(16774373);
-    }
-    this.sunLight.color = sunColor;
-    this.dirLight.intensity = this.settings.dirInt * 0.18;
-    this.ambientLight.intensity = this.settings.ambientInt * 0.65;
-    this.backLight.intensity = 0.22;
-    this.updateSunShadow(bounds, center, sceneSpan);
-  }
-  // 更新阴影设置
-  updateSunShadow(bounds, center, sceneSpan) {
-    const shadowEnabled = this.settings.shadowQuality !== "off" && this.settings.sunShadow === true && this.settings.sunEnabled !== false;
-    const shadowMapSize = this.settings.shadowQuality === "high" ? 4096 : this.settings.shadowQuality === "low" ? 1024 : 2048;
-    if (shadowEnabled) {
-      this.renderer.shadowMap.enabled = true;
-      this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-      this.sunLight.shadow.mapSize.width = shadowMapSize;
-      this.sunLight.shadow.mapSize.height = shadowMapSize;
-      this.sunLight.shadow.bias = -15e-5;
-      this.sunLight.shadow.normalBias = 0.02;
-      const effectiveBounds = bounds && !bounds.isEmpty() ? bounds : this.computeTotalBounds(true);
-      const effectiveCenter = center || (!effectiveBounds.isEmpty() ? effectiveBounds.getCenter(new THREE.Vector3()) : new THREE.Vector3());
-      const effectiveSize = sceneSpan || (!effectiveBounds.isEmpty() ? effectiveBounds.getSize(new THREE.Vector3()).length() : 100);
-      const radius = Math.max(effectiveSize * 0.7, 40);
-      this.sunLight.shadow.camera.left = -radius;
-      this.sunLight.shadow.camera.right = radius;
-      this.sunLight.shadow.camera.top = radius;
-      this.sunLight.shadow.camera.bottom = -radius;
-      this.sunLight.shadow.camera.near = 0.5;
-      this.sunLight.shadow.camera.far = Math.max(radius * 6, 500);
-      this.sunLight.shadow.camera.updateProjectionMatrix();
-      this.contentGroup.traverse((obj) => {
-        if (obj.isMesh) {
-          const mesh = obj;
-          mesh.castShadow = true;
-          mesh.receiveShadow = true;
-        }
-      });
-      this.sunLight.castShadow = true;
-      this.sunLight.target.position.copy(effectiveCenter);
-      this.sunLight.target.updateMatrixWorld();
-    } else {
-      this.renderer.shadowMap.enabled = false;
-      this.sunLight.castShadow = false;
-    }
   }
   createCircleTexture() {
     const size = 64;
@@ -746,28 +3433,10 @@ class SceneManager {
     const rect = this.canvas.getBoundingClientRect();
     this.renderer.setSize(Math.max(1, rect.width), Math.max(1, rect.height), false);
   }
-  isSunShadowConfigured() {
-    return this.settings.shadowQuality !== "off" && this.settings.sunShadow === true && this.settings.sunEnabled !== false;
-  }
   updateInteractionPerformance(now) {
-    const mode = this.settings.performanceMode ?? "balanced";
-    const shadowConfigured = this.isSunShadowConfigured();
-    const allowShadowDowngrade = mode !== "quality";
-    if (this.isCameraMoving) {
-      if (allowShadowDowngrade && shadowConfigured && this.renderer.shadowMap.enabled) {
-        this.renderer.shadowMap.enabled = false;
-        this.interactionShadowDowngraded = true;
-      }
-      return;
-    }
-    if (!this.interactionShadowDowngraded) return;
-    if (!shadowConfigured) {
+    if (this.interactionShadowDowngraded && now >= this.interactionShadowRestoreAt) {
       this.interactionShadowDowngraded = false;
-      return;
     }
-    if (now < this.interactionShadowRestoreAt) return;
-    this.renderer.shadowMap.enabled = true;
-    this.interactionShadowDowngraded = false;
   }
   initHardwareProfile() {
     const nav = navigator;
@@ -813,16 +3482,6 @@ class SceneManager {
       faces: Math.floor(faces),
       memory: parseFloat(memory.toFixed(2))
     };
-  }
-  countStructureRenderableNodes(node) {
-    if (!node) return 0;
-    let count = node.type === "Mesh" ? 1 : 0;
-    if (node.children) {
-      for (const child of node.children) {
-        count += this.countStructureRenderableNodes(child);
-      }
-    }
-    return count;
   }
   async estimateNbimStats(file, chunks, version) {
     let meshes = 0;
@@ -884,195 +3543,133 @@ class SceneManager {
     this.originalStatsByModel.delete(originalUuid);
   }
   disposeChunkMesh(mesh) {
-    if (mesh.geometry) mesh.geometry.dispose();
-    if (mesh.material && mesh.material !== this.sharedMaterial) {
-      const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-      materials.forEach((m) => m.dispose && m.dispose());
-    }
+    disposeChunkMeshResource({
+      mesh,
+      sharedMaterial: this.sharedMaterial
+    });
   }
   touchChunkCache(chunkId) {
-    this.chunkCacheOrder = this.chunkCacheOrder.filter((id) => id !== chunkId);
-    this.chunkCacheOrder.push(chunkId);
+    this.chunkCacheOrder = touchChunkMeshCacheOrder(this.chunkCacheOrder, chunkId);
   }
   cacheChunkMesh(chunk, mesh) {
-    if (this.chunkMeshCache.has(chunk.id)) {
-      const oldMesh = this.chunkMeshCache.get(chunk.id);
-      if (oldMesh !== mesh) this.disposeChunkMesh(oldMesh);
-    }
-    this.chunkMeshCache.set(chunk.id, mesh);
-    this.touchChunkCache(chunk.id);
-    while (this.chunkCacheOrder.length > this.maxCachedChunks) {
-      const evictId = this.chunkCacheOrder.shift();
-      if (!evictId) break;
-      const cached = this.chunkMeshCache.get(evictId);
-      if (!cached) continue;
-      this.chunkMeshCache.delete(evictId);
-      this.disposeChunkMesh(cached);
-    }
+    const result = cacheChunkMeshEntry({
+      chunk,
+      mesh,
+      chunkMeshCache: this.chunkMeshCache,
+      chunkCacheOrder: this.chunkCacheOrder,
+      maxCachedChunks: this.maxCachedChunks,
+      disposeChunkMesh: (nextMesh) => this.disposeChunkMesh(nextMesh)
+    });
+    this.chunkCacheOrder = result.chunkCacheOrder;
   }
   takeCachedChunkMesh(chunkId) {
-    const mesh = this.chunkMeshCache.get(chunkId) || null;
-    if (!mesh) return null;
-    this.chunkMeshCache.delete(chunkId);
-    this.chunkCacheOrder = this.chunkCacheOrder.filter((id) => id !== chunkId);
-    return mesh;
+    const result = takeCachedChunkMeshEntry({
+      chunkId,
+      chunkMeshCache: this.chunkMeshCache,
+      chunkCacheOrder: this.chunkCacheOrder
+    });
+    this.chunkCacheOrder = result.chunkCacheOrder;
+    return result.mesh;
   }
   clearChunkCache(filter) {
-    for (const [chunkId, mesh] of this.chunkMeshCache.entries()) {
-      if (filter && !filter(chunkId, mesh)) continue;
-      this.disposeChunkMesh(mesh);
-      this.chunkMeshCache.delete(chunkId);
-    }
-    this.chunkCacheOrder = this.chunkCacheOrder.filter((chunkId) => this.chunkMeshCache.has(chunkId));
-  }
-  getChunkReadCacheKey(chunk) {
-    return `${chunk.nbimFileId || "local"}:${chunk.byteOffset || 0}:${chunk.byteLength || 0}`;
+    this.chunkCacheOrder = clearChunkMeshCacheEntries({
+      chunkMeshCache: this.chunkMeshCache,
+      chunkCacheOrder: this.chunkCacheOrder,
+      disposeChunkMesh: (mesh) => this.disposeChunkMesh(mesh),
+      filter
+    });
   }
   hasValidChunkBinaryRange(chunk) {
-    return Number.isFinite(chunk?.byteOffset) && Number.isFinite(chunk?.byteLength) && chunk.byteLength > 0;
-  }
-  touchChunkReadCache(cacheKey) {
-    this.chunkReadCacheOrder = this.chunkReadCacheOrder.filter((key) => key !== cacheKey);
-    this.chunkReadCacheOrder.push(cacheKey);
-  }
-  putChunkReadCache(cacheKey, buffer) {
-    this.chunkReadCache.set(cacheKey, buffer);
-    this.touchChunkReadCache(cacheKey);
-    while (this.chunkReadCacheOrder.length > this.resolvedChunkOptions.chunkReadCacheSize) {
-      const evictKey = this.chunkReadCacheOrder.shift();
-      if (!evictKey) continue;
-      this.chunkReadCache.delete(evictKey);
-    }
+    return hasValidChunkBinaryRange(chunk);
   }
   async readChunkBuffer(chunk) {
-    const cacheKey = this.getChunkReadCacheKey(chunk);
-    const cached = this.chunkReadCache.get(cacheKey);
-    if (cached) {
-      this.touchChunkReadCache(cacheKey);
-      return cached.slice(0);
-    }
-    const file = this.nbimFiles.get(chunk.nbimFileId);
-    if (!file) throw new Error(`NBIM file not found for chunk: ${chunk.id}`);
-    const buffer = await file.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength).arrayBuffer();
-    this.putChunkReadCache(cacheKey, buffer.slice(0));
-    return buffer;
+    const result = await readChunkBuffer({
+      chunk,
+      nbimFiles: this.nbimFiles,
+      chunkReadCache: this.chunkReadCache,
+      chunkReadCacheOrder: this.chunkReadCacheOrder,
+      chunkReadCacheSize: this.resolvedChunkOptions.chunkReadCacheSize
+    });
+    this.chunkReadCacheOrder = result.chunkReadCacheOrder;
+    return result.buffer;
   }
   enqueueChunkPrefetch(chunkIds) {
-    if (this.resolvedChunkOptions.chunkPrefetchWindow <= 0) return;
-    for (const chunkId of chunkIds) {
-      if (this.prefetchQueueSet.has(chunkId)) continue;
-      if (this.prefetchInFlight.has(chunkId)) continue;
-      this.prefetchQueue.push(chunkId);
-      this.prefetchQueueSet.add(chunkId);
-    }
+    this.prefetchQueue = enqueueChunkPrefetch({
+      chunkIds,
+      chunkPrefetchWindow: this.resolvedChunkOptions.chunkPrefetchWindow,
+      prefetchQueue: this.prefetchQueue,
+      prefetchQueueSet: this.prefetchQueueSet,
+      prefetchInFlight: this.prefetchInFlight
+    });
   }
   schedulePrefetchFromVisibleChunks(visibleChunks) {
-    if (this.resolvedChunkOptions.chunkPrefetchWindow <= 0) return;
-    if (this.prefetchPaused || this.isCameraMoving) return;
-    if (visibleChunks.length === 0) return;
-    const windowSize = this.resolvedChunkOptions.chunkPrefetchWindow;
-    const toPrefetch = [];
-    for (let i = 0; i < visibleChunks.length && toPrefetch.length < windowSize; i++) {
-      const pivot = visibleChunks[(this.prefetchRoundRobinCursor + i) % visibleChunks.length];
-      const pivotIndex = this.getChunkIndex(pivot.id);
-      if (pivotIndex < 0) continue;
-      const nextChunk = this.chunks[pivotIndex + 1];
-      if (!nextChunk || nextChunk.loaded || this.processingChunks.has(nextChunk.id)) continue;
-      if (!nextChunk.nbimFileId || !this.hasValidChunkBinaryRange(nextChunk)) continue;
-      const cacheKey = this.getChunkReadCacheKey(nextChunk);
-      if (this.chunkReadCache.has(cacheKey)) continue;
-      toPrefetch.push(nextChunk.id);
-    }
-    this.prefetchRoundRobinCursor++;
-    this.enqueueChunkPrefetch(toPrefetch);
+    const result = collectPrefetchCandidates({
+      visibleChunks,
+      chunkPrefetchWindow: this.resolvedChunkOptions.chunkPrefetchWindow,
+      prefetchPaused: this.prefetchPaused,
+      isCameraMoving: this.isCameraMoving,
+      prefetchRoundRobinCursor: this.prefetchRoundRobinCursor,
+      chunks: this.chunks,
+      processingChunks: this.processingChunks,
+      chunkReadCache: this.chunkReadCache,
+      getChunkIndex: (chunkId) => this.getChunkIndex(chunkId)
+    });
+    this.prefetchRoundRobinCursor = result.prefetchRoundRobinCursor;
+    this.enqueueChunkPrefetch(result.chunkIds);
     void this.processPrefetchQueue();
   }
   async processPrefetchQueue() {
-    if (this.prefetchPaused || this.isCameraMoving) return;
-    if (this.prefetchQueue.length === 0) return;
-    const maxParallel = Math.max(1, Math.min(4, Math.floor(this.maxWorkers / 2)));
-    while (!this.prefetchPaused && !this.isCameraMoving && this.prefetchQueue.length > 0 && this.prefetchInFlight.size < maxParallel) {
-      const chunkId = this.prefetchQueue.shift();
-      if (!chunkId) break;
-      this.prefetchQueueSet.delete(chunkId);
-      const chunk = this.getChunkById(chunkId);
-      if (!chunk || !chunk.nbimFileId || !this.hasValidChunkBinaryRange(chunk)) continue;
-      const cacheKey = this.getChunkReadCacheKey(chunk);
-      if (this.chunkReadCache.has(cacheKey)) continue;
-      this.prefetchInFlight.add(chunkId);
-      void this.readChunkBuffer(chunk).catch((error) => {
-        debugWarn("SceneManager/prefetch", `prefetch failed for ${chunkId}`, error);
-      }).finally(() => {
-        this.prefetchInFlight.delete(chunkId);
-        if (!this.prefetchPaused && !this.isCameraMoving && this.prefetchQueue.length > 0) {
-          void this.processPrefetchQueue();
-        }
-      });
-    }
+    await processChunkPrefetchQueue({
+      prefetchPaused: this.prefetchPaused,
+      isCameraMoving: this.isCameraMoving,
+      prefetchQueue: this.prefetchQueue,
+      prefetchQueueSet: this.prefetchQueueSet,
+      prefetchInFlight: this.prefetchInFlight,
+      maxWorkers: this.maxWorkers,
+      getChunkById: (chunkId) => this.getChunkById(chunkId),
+      chunkReadCache: this.chunkReadCache,
+      readChunkBuffer: (chunk) => this.readChunkBuffer(chunk),
+      processQueue: () => this.processPrefetchQueue()
+    });
   }
   unregisterOptimizedMeshMapping(bm) {
-    const batchIdToUuid = bm.userData.batchIdToUuid;
-    if (!batchIdToUuid) return;
-    for (const [batchId, originalUuid] of batchIdToUuid.entries()) {
-      const mapping = this.optimizedMapping.get(originalUuid);
-      if (!mapping) continue;
-      const index = mapping.findIndex((m) => m.mesh === bm && m.instanceId === batchId);
-      if (index !== -1) mapping.splice(index, 1);
-      if (mapping.length === 0) this.optimizedMapping.delete(originalUuid);
-    }
+    unregisterOptimizedMeshResourceMapping({
+      mesh: bm,
+      optimizedMapping: this.optimizedMapping
+    });
   }
   registerOptimizedMeshMapping(bm) {
-    const batchIdToUuid = bm.userData.batchIdToUuid;
-    const batchIdToColor = bm.userData.batchIdToColor;
-    const batchIdToGeometry = bm.userData.batchIdToGeometry;
-    if (!batchIdToUuid) return;
-    for (const [batchId, originalUuid] of batchIdToUuid.entries()) {
-      if (!this.optimizedMapping.has(originalUuid)) {
-        this.optimizedMapping.set(originalUuid, []);
-      }
-      const originalColor = batchIdToColor?.get(batchId) ?? 16777215;
-      const geometry = batchIdToGeometry?.get(batchId);
-      this.optimizedMapping.get(originalUuid).push({
-        mesh: bm,
-        instanceId: batchId,
-        originalColor,
-        geometry
-      });
-    }
+    registerOptimizedMeshResourceMapping({
+      mesh: bm,
+      optimizedMapping: this.optimizedMapping
+    });
   }
   acquireGhostLine() {
-    const reused = this.ghostMeshPool.pop();
-    if (reused) {
-      reused.visible = true;
-      return reused;
-    }
-    return new THREE.LineSegments(this.ghostEdgesGeometry, this.ghostMaterial);
+    return acquireGhostLineResource({
+      ghostMeshPool: this.ghostMeshPool,
+      ghostEdgesGeometry: this.ghostEdgesGeometry,
+      ghostMaterial: this.ghostMaterial
+    });
   }
   releaseGhostLine(line) {
-    line.visible = false;
-    line.name = "";
-    line.scale.set(1, 1, 1);
-    line.position.set(0, 0, 0);
-    if (line.material instanceof THREE.LineBasicMaterial) {
-      line.material.opacity = 0.3;
-    }
-    this.ghostMeshPool.push(line);
+    releaseGhostLineResource({
+      line,
+      ghostMeshPool: this.ghostMeshPool
+    });
   }
   createGhostLine(name, bounds) {
-    const size = new THREE.Vector3();
-    const center = new THREE.Vector3();
-    bounds.getSize(size);
-    bounds.getCenter(center);
-    const edges = this.acquireGhostLine();
-    edges.name = name;
-    edges.scale.copy(size);
-    edges.position.copy(center);
-    return edges;
+    return createGhostLineResource({
+      name,
+      bounds,
+      acquireGhostLine: () => this.acquireGhostLine()
+    });
   }
   ensureChunkGhost(chunk) {
-    if (this.ghostGroup.getObjectByName(`ghost_${chunk.id}`)) return;
-    const edges = this.createGhostLine(`ghost_${chunk.id}`, chunk.bounds);
-    this.ghostGroup.add(edges);
+    ensureChunkGhostResource({
+      chunk,
+      ghostGroup: this.ghostGroup,
+      createGhostLine: (name, bounds) => this.createGhostLine(name, bounds)
+    });
   }
   attachStructureRoot(modelRoot) {
     if (modelRoot.name === "Root" && modelRoot.children && modelRoot.children.length > 0) {
@@ -1171,6 +3768,7 @@ class SceneManager {
     if (ghostSpecs.length === 0) return;
     for (let start = 0; start < ghostSpecs.length; start += this.chunkGhostBatchSize) {
       const end = Math.min(ghostSpecs.length, start + this.chunkGhostBatchSize);
+      let addedAnyGhost = false;
       for (let index = start; index < end; index++) {
         const spec = ghostSpecs[index];
         const chunk = this.getChunkById(spec.chunkId);
@@ -1178,6 +3776,10 @@ class SceneManager {
         if (this.ghostGroup.getObjectByName(`ghost_${spec.chunkId}`)) continue;
         const edges = this.createGhostLine(`ghost_${spec.chunkId}`, spec.bounds);
         this.ghostGroup.add(edges);
+        addedAnyGhost = true;
+      }
+      if (addedAnyGhost) {
+        this.markSceneDirty();
       }
       if (end < ghostSpecs.length) {
         await this.yieldToMainThread();
@@ -1329,22 +3931,26 @@ class SceneManager {
     this.renderer.render(this.scene, this.camera);
   }
   reportChunkProgress() {
-    const now = performance.now();
-    const total = this.chunks.length;
-    const loaded = this.chunkLoadedCount;
-    const changed = loaded !== this.lastReportedProgress.loaded || total !== this.lastReportedProgress.total;
-    const shouldFlush = total === 0 || total > 0 && loaded >= total;
-    const intervalReached = now - this.lastChunkProgressReportAt >= CHUNK_PROGRESS_REPORT_INTERVAL_MS;
-    if (this.onChunkProgress && changed && (intervalReached || shouldFlush)) {
-      this.lastReportedProgress = { loaded, total };
-      this.lastChunkProgressReportAt = now;
-      this.onChunkProgress(loaded, total);
+    const result = reportChunkProgressIfNeeded({
+      now: performance.now(),
+      total: this.chunks.length,
+      loaded: this.chunkLoadedCount,
+      lastReportedProgress: this.lastReportedProgress,
+      lastChunkProgressReportAt: this.lastChunkProgressReportAt
+    });
+    if (this.onChunkProgress && result.shouldNotify) {
+      this.lastReportedProgress = result.nextProgress;
+      this.lastChunkProgressReportAt = result.nextReportedAt;
+      this.onChunkProgress(result.nextProgress.loaded, result.nextProgress.total);
     }
   }
   getChunkRuntimeProfile(chunkCount = this.chunks.length) {
-    if (chunkCount > 2e3) return this.chunkRuntimeProfiles.massive;
-    if (chunkCount > 600) return this.chunkRuntimeProfiles.balanced;
-    return this.chunkRuntimeProfiles.compact;
+    return selectChunkRuntimeProfile({
+      chunkCount,
+      compact: this.chunkRuntimeProfiles.compact,
+      balanced: this.chunkRuntimeProfiles.balanced,
+      massive: this.chunkRuntimeProfiles.massive
+    });
   }
   isInPostMoveRecovery(now) {
     return !this.isCameraMoving && now < this.postMoveRecoveryUntil;
@@ -1373,63 +3979,37 @@ class SceneManager {
     return "idle";
   }
   getChunkFrameBudget(phase, profile, warmupExtra) {
-    if (this.forceMaxChunkLoadSpeed) {
-      return this.maxChunkLoadsPerFrame + warmupExtra;
-    }
-    const mode = this.settings.performanceMode ?? "balanced";
-    const chunkCount = this.chunks.length;
-    const isHugeScene = chunkCount > 2e3;
-    const isLargeScene = chunkCount > 600;
-    if (phase === "moving") {
-      const baseMovingBudget = Math.max(
-        profile.movingLoadBudgetMin,
-        Math.min(profile.movingLoadBudgetMax, Math.floor(this.maxChunkLoadsPerFrame / 4))
-      );
-      if (mode === "smooth") {
-        if (isHugeScene) return Math.max(1, Math.floor(baseMovingBudget * 0.35));
-        if (isLargeScene) return Math.max(1, Math.floor(baseMovingBudget * 0.5));
-        return Math.max(1, Math.floor(baseMovingBudget * 0.7));
-      }
-      if (isHugeScene) return Math.max(1, Math.floor(baseMovingBudget * 0.55));
-      if (isLargeScene) return Math.max(1, Math.floor(baseMovingBudget * 0.75));
-      return baseMovingBudget;
-    }
-    if (phase === "recovery") {
-      const recoveryBudget = Math.max(
-        profile.recoveryLoadBudgetMin,
-        Math.min(
-          profile.recoveryLoadBudgetMax,
-          Math.floor(this.maxChunkLoadsPerFrame * profile.recoveryLoadBudgetRatio)
-        )
-      );
-      const recoveryBoost = mode === "smooth" ? Math.max(2, Math.floor(recoveryBudget * 0.6)) : 0;
-      return recoveryBudget + recoveryBoost + warmupExtra;
-    }
-    return this.maxChunkLoadsPerFrame + warmupExtra;
+    return computeChunkFrameBudget({
+      forceMaxChunkLoadSpeed: this.forceMaxChunkLoadSpeed,
+      maxChunkLoadsPerFrame: this.maxChunkLoadsPerFrame,
+      performanceMode: this.settings.performanceMode ?? "balanced",
+      chunkCount: this.chunks.length,
+      phase,
+      profile,
+      warmupExtra
+    });
   }
   isMovingPeripheralChunk(centrality, pixelSize, forwardness, profile) {
-    return centrality < profile.movingCoreCentralityThreshold && pixelSize < profile.movingCorePixelThreshold && forwardness < profile.movingCoreForwardThreshold;
+    return isMovingPeripheralChunk({
+      centrality,
+      pixelSize,
+      forwardness,
+      profile
+    });
   }
   shouldRefreshPeripheralChunk(now, chunkIndex, totalChunks, profile) {
-    if (!this.isCameraMoving || totalChunks === 0) return true;
-    if (now - this.movingPeripheralLastRefreshAt >= profile.movingPeripheralRefreshMs) {
-      const batchSize2 = Math.min(
-        totalChunks,
-        Math.max(profile.movingPeripheralMinBatchSize, Math.ceil(totalChunks * profile.movingPeripheralBatchRatio))
-      );
-      this.movingPeripheralCursor = (this.movingPeripheralCursor + batchSize2) % totalChunks;
-      this.movingPeripheralLastRefreshAt = now;
-    }
-    const batchSize = Math.min(
+    const result = updatePeripheralRefreshWindow({
+      now,
+      isCameraMoving: this.isCameraMoving,
+      chunkIndex,
       totalChunks,
-      Math.max(profile.movingPeripheralMinBatchSize, Math.ceil(totalChunks * profile.movingPeripheralBatchRatio))
-    );
-    const start = this.movingPeripheralCursor;
-    const end = start + batchSize;
-    if (end <= totalChunks) {
-      return chunkIndex >= start && chunkIndex < end;
-    }
-    return chunkIndex >= start || chunkIndex < end % totalChunks;
+      profile,
+      movingPeripheralCursor: this.movingPeripheralCursor,
+      movingPeripheralLastRefreshAt: this.movingPeripheralLastRefreshAt
+    });
+    this.movingPeripheralCursor = result.movingPeripheralCursor;
+    this.movingPeripheralLastRefreshAt = result.movingPeripheralLastRefreshAt;
+    return result.shouldRefresh;
   }
   checkCullingAndLoad(now = performance.now()) {
     if (!this.chunkLoadingEnabled) return;
@@ -1454,6 +4034,7 @@ class SceneManager {
     const toLoad = [];
     const loadedChunks = [];
     const isClippingActive = this.renderer.clippingPlanes.length > 0;
+    let sceneMutated = false;
     const totalChunks = this.chunks.length;
     const cullingLoopStart = performance.now();
     const cullingTimeBudgetMs = phase === "moving" ? this.cullingTimeBudgetMovingMs : phase === "recovery" ? this.cullingTimeBudgetRecoveryMs : this.cullingTimeBudgetIdleMs;
@@ -1473,111 +4054,108 @@ class SceneManager {
           break;
         }
       }
-      if (!c.paddedBounds || c._padding !== padding) {
-        const size = c.bounds.getSize(tempSize);
-        const pb = c.bounds.clone();
-        pb.expandByVector(size.multiplyScalar(padding));
-        c.paddedBounds = pb;
-        c._padding = padding;
-      }
-      if (!c.center) c.center = c.bounds.getCenter(new THREE.Vector3());
+      ensureChunkSpatialState({
+        chunk: c,
+        padding,
+        tempSize
+      });
       const inFrustum = this.frustum.intersectsBox(c.paddedBounds);
       const isClipped = isClippingActive && this.isBoxClipped(c.bounds);
-      toChunkDirection.copy(c.center).sub(cameraPos);
-      const dist = toChunkDirection.length();
-      const inRange = dist < this.maxRenderDistance;
-      if (sampleUnloadedWhileMoving && !c.loaded && chunkIndex % movingSampleStride !== movingSampleSeed) {
+      const evaluation = evaluateChunkVisibility({
+        chunk: c,
+        chunkIndex,
+        totalChunks,
+        now,
+        phase,
+        profile,
+        performanceMode: mode,
+        isBoxClipped: isClipped,
+        inFrustum,
+        maxRenderDistance: this.maxRenderDistance,
+        cameraPos,
+        cameraForward,
+        projScreenMatrix: this.projScreenMatrix,
+        toChunkDirection,
+        tempCenterNdc,
+        viewHeight,
+        canvasHeight,
+        sampleUnloadedWhileMoving,
+        movingSampleStride,
+        movingSampleSeed,
+        resolveShouldRefreshPeripheral: (isPeripheralWhileMoving) => !isPeripheralWhileMoving || this.shouldRefreshPeripheralChunk(now, chunkIndex, totalChunks, profile),
+        chunkWarmupActive: this.chunkWarmupActive,
+        chunkLoadedCount: this.chunkLoadedCount,
+        initialChunkLoadTarget: this.initialChunkLoadTarget,
+        chunkLoadResumeAt: this.chunkLoadResumeAt,
+        chunkMeshCached: this.chunkMeshCache.has(c.id)
+      });
+      if (evaluation.shouldSkipSample) {
         continue;
       }
-      const boxSize = c.bounds.getSize(tempSize).length();
-      const pixelSize = boxSize / viewHeight * canvasHeight;
-      const centerNDC = tempCenterNdc.copy(c.center).applyMatrix4(this.projScreenMatrix);
-      const ndcDistance = Math.sqrt(centerNDC.x * centerNDC.x + centerNDC.y * centerNDC.y);
-      const centrality = 1 - Math.min(1, ndcDistance);
-      const forwardness = dist > 1e-5 ? Math.max(0, cameraForward.dot(toChunkDirection.divideScalar(dist))) : 1;
-      const isTooSmall = pixelSize < 4;
-      const shouldHidePeripheralWhileMoving = phase === "moving" && centrality < profile.movingFocusCentralityThreshold && pixelSize < profile.movingFocusPixelThreshold;
-      const shouldBeVisible = inFrustum && !isClipped && inRange && !isTooSmall && !shouldHidePeripheralWhileMoving;
-      const lastTouchedAt = Math.max(c.lastVisibleAt || 0, c.lastFocusAt || 0);
-      const shouldKeepVisibleWhileMoving = phase === "moving" && inFrustum && !isClipped && inRange && !isTooSmall && now - lastTouchedAt < profile.chunkVisibilityHoldMs;
-      const isPeripheralWhileMoving = this.isMovingPeripheralChunk(centrality, pixelSize, forwardness, profile);
-      const shouldRefreshPeripheral = !isPeripheralWhileMoving || this.shouldRefreshPeripheralChunk(now, chunkIndex, totalChunks, profile);
-      const effectiveVisible = phase === "moving" && isPeripheralWhileMoving && !shouldRefreshPeripheral ? c.lastEffectiveVisible ?? c.mesh?.visible ?? false : shouldBeVisible || shouldKeepVisibleWhileMoving;
-      const centerPriorityWindow = this.chunkWarmupActive || now < this.chunkLoadResumeAt + profile.centerPriorityWindowMs;
-      const isPeripheralCandidate = centrality < profile.centerPriorityThreshold && forwardness < profile.forwardPriorityThreshold && pixelSize < 96;
-      if (effectiveVisible) {
+      if (evaluation.effectiveVisible) {
         c.lastVisibleAt = now;
       }
-      if (centrality > 0.42 || forwardness > 0.55) {
+      if (evaluation.centrality > 0.42 || evaluation.forwardness > 0.55) {
         c.lastFocusAt = now;
       }
-      c.lastEffectiveVisible = effectiveVisible;
+      c.lastEffectiveVisible = evaluation.effectiveVisible;
       if (c.loaded) {
         loadedChunks.push(c);
         if (c.mesh) {
-          if (c.mesh.visible !== effectiveVisible) {
-            c.mesh.visible = effectiveVisible;
+          if (c.mesh.visible !== evaluation.effectiveVisible) {
+            c.mesh.visible = evaluation.effectiveVisible;
+            sceneMutated = true;
           }
         } else {
           const optimizedGroup = this.contentGroup.getObjectByName(c.groupName);
           const bm = optimizedGroup?.getObjectByName(c.id);
           if (bm) {
             c.mesh = bm;
-            bm.visible = effectiveVisible;
+            bm.visible = evaluation.effectiveVisible;
+            sceneMutated = true;
           }
         }
-      } else if (!this.processingChunks.has(c.id) && shouldBeVisible) {
-        const viewportBoost = centrality > 0.8 ? 4.5 : centrality > 0.62 ? 2.8 : 1;
-        const sizeScore = Math.min(8, pixelSize / 120);
-        const distanceScore = 1e3 / (dist + 1);
-        const forwardScore = forwardness * 550;
-        const cacheBoost = this.chunkMeshCache.has(c.id) ? 420 : 0;
-        const warmupBoost = this.chunkWarmupActive && this.chunkLoadedCount < this.initialChunkLoadTarget ? centrality > 0.65 ? 1500 : centrality > 0.45 ? 500 : 0 : 0;
-        const movingPriorityBoost = phase === "moving" ? centrality > 0.65 || forwardness > 0.7 ? 900 : centrality > 0.4 ? 250 : -250 : 0;
-        if (phase === "moving" && centrality < 0.08 && pixelSize < 18) {
-          continue;
-        }
-        if (phase === "moving" && isPeripheralWhileMoving && !shouldRefreshPeripheral) {
-          continue;
-        }
-        if (phase !== "moving" && centerPriorityWindow && isPeripheralCandidate) {
-          continue;
-        }
-        if (phase === "moving" && (this.settings.performanceMode ?? "balanced") === "smooth") {
-          if (centrality < 0.3 && pixelSize < 54 && forwardness < 0.62) {
-            continue;
-          }
-        }
-        c.priority = movingPriorityBoost + cacheBoost + warmupBoost + forwardScore + viewportBoost * 1e3 + sizeScore * 120 + distanceScore + centrality * 300;
+      } else if (!this.processingChunks.has(c.id) && evaluation.shouldBeVisible && evaluation.priority !== null) {
+        c.priority = evaluation.priority;
         toLoad.push(c);
       }
     }
     if (!abortedByBudget) {
       this.cullingScanCursor = (startIndex + totalChunks) % Math.max(totalChunks, 1);
     }
-    if (!this.isCameraMoving && loadedChunks.length > this.maxLoadedChunks) {
-      loadedChunks.sort((a, b) => b.center.distanceToSquared(cameraPos) - a.center.distanceToSquared(cameraPos));
-      let unloadedCount = 0;
-      const targetUnload = loadedChunks.length - this.maxLoadedChunks;
-      for (const c of loadedChunks) {
-        if (unloadedCount >= targetUnload) break;
-        const lastTouchedAt = Math.max(c.lastVisibleAt || 0, c.lastFocusAt || 0);
-        if (now - lastTouchedAt < this.chunkResidencyMs) continue;
-        if (!c.mesh || !c.mesh.visible) {
-          this.unloadChunk(c);
-          unloadedCount++;
-        }
-      }
+    const unloadTargets = selectChunksToUnload({
+      isCameraMoving: this.isCameraMoving,
+      loadedChunks,
+      maxLoadedChunks: this.maxLoadedChunks,
+      cameraPos,
+      now,
+      chunkResidencyMs: this.chunkResidencyMs
+    });
+    for (const chunk of unloadTargets) {
+      this.unloadChunk(chunk);
     }
-    if (toLoad.length > 0 && performance.now() >= this.chunkLoadResumeAt) {
-      toLoad.sort((a, b) => b.priority - a.priority);
-      const available = this.maxConcurrentChunkLoads - this.processingChunks.size;
-      const warmupExtra = this.chunkWarmupActive && this.chunkLoadedCount < this.initialChunkLoadTarget ? this.warmupChunkBoost : 0;
-      const frameBudget = this.getChunkFrameBudget(phase, profile, warmupExtra);
-      const count = Math.min(available, frameBudget, toLoad.length);
-      for (let i = 0; i < count; i++) {
-        this.loadChunk(toLoad[i]);
-      }
+    if (unloadTargets.length > 0) {
+      sceneMutated = true;
+    }
+    const loadPlan = planChunkLoads({
+      toLoad,
+      now: performance.now(),
+      chunkLoadResumeAt: this.chunkLoadResumeAt,
+      maxConcurrentChunkLoads: this.maxConcurrentChunkLoads,
+      processingChunkCount: this.processingChunks.size,
+      chunkWarmupActive: this.chunkWarmupActive,
+      chunkLoadedCount: this.chunkLoadedCount,
+      initialChunkLoadTarget: this.initialChunkLoadTarget,
+      warmupChunkBoost: this.warmupChunkBoost,
+      getChunkFrameBudget: (nextPhase, nextProfile, warmupExtra) => this.getChunkFrameBudget(nextPhase, nextProfile, warmupExtra),
+      phase,
+      profile
+    });
+    for (const chunk of loadPlan) {
+      this.loadChunk(chunk);
+    }
+    if (loadPlan.length > 0) {
+      sceneMutated = true;
     }
     this.schedulePrefetchFromVisibleChunks(loadedChunks);
     if (!this.forceMaxChunkLoadSpeed) ;
@@ -1586,160 +4164,155 @@ class SceneManager {
     }
     if (this.chunkWarmupActive && this.chunkLoadedCount >= this.initialChunkLoadTarget) {
       this.chunkWarmupActive = false;
+      sceneMutated = true;
+    }
+    if (sceneMutated || abortedByBudget) {
+      this.markSceneDirty();
     }
   }
   async runWorkerTask(data, transferables) {
-    return new Promise((resolve, reject) => {
-      this.workerQueue.push({ resolve, reject, data, transferables });
-      this.processWorkerQueue();
+    return queueChunkWorkerTask({
+      workerQueue: this.workerQueue,
+      data,
+      transferables,
+      processQueue: () => this.processWorkerQueue()
     });
   }
   processWorkerQueue() {
-    if (this.activeWorkerCount >= this.maxWorkers || this.workerQueue.length === 0) return;
-    const task = this.workerQueue.shift();
-    this.activeWorkerCount++;
-    let worker = this.workers.pop();
-    if (!worker) {
-      worker = new Worker(new URL(/* @vite-ignore */ ""+new URL('assets/chunkWorker-46LMRdEv.js', import.meta.url).href+"", import.meta.url), { type: "module" });
-    }
-    const onMessage = (e) => {
-      worker.removeEventListener("message", onMessage);
-      worker.removeEventListener("error", onError);
-      this.workers.push(worker);
-      this.activeWorkerCount--;
-      if (e.data.type === "success") {
-        task.resolve(e.data.result);
-      } else {
-        task.reject(new Error(e.data.error));
-      }
-      this.processWorkerQueue();
-    };
-    const onError = (e) => {
-      worker.removeEventListener("message", onMessage);
-      worker.removeEventListener("error", onError);
-      this.activeWorkerCount--;
-      task.reject(new Error(e.message));
-      this.processWorkerQueue();
-    };
-    worker.addEventListener("message", onMessage);
-    worker.addEventListener("error", onError);
-    worker.postMessage(task.data, task.transferables);
+    processChunkWorkerQueue({
+      activeWorkerCount: this.activeWorkerCount,
+      maxWorkers: this.maxWorkers,
+      workerQueue: this.workerQueue,
+      workers: this.workers,
+      createWorker: () => {
+        return new Worker(new URL(/* @vite-ignore */ ""+new URL('assets/chunkWorker-46LMRdEv.js', import.meta.url).href+"", import.meta.url), { type: "module" });
+      },
+      getActiveWorkerCount: () => this.activeWorkerCount,
+      onActiveWorkerCountChange: (count) => {
+        this.activeWorkerCount = count;
+      },
+      processQueue: () => this.processWorkerQueue()
+    });
   }
   unloadChunk(chunk) {
-    if (!chunk.loaded || !chunk.mesh) return;
-    const bm = chunk.mesh;
-    this.unregisterOptimizedMeshMapping(bm);
-    if (bm.parent) bm.parent.remove(bm);
-    this.cacheChunkMesh(chunk, bm);
-    this.ensureChunkGhost(chunk);
-    chunk.mesh = null;
-    chunk.loaded = false;
-    this.chunkLoadedCount = Math.max(0, this.chunkLoadedCount - 1);
-    this.interactableListValid = false;
-    this._needsBoundsUpdate = true;
-    this.cullingDirty = true;
+    const result = applyUnloadChunk({
+      chunk,
+      unregisterOptimizedMeshMapping: (mesh) => this.unregisterOptimizedMeshMapping(mesh),
+      cacheChunkMesh: (nextChunk, mesh) => this.cacheChunkMesh(nextChunk, mesh),
+      ensureChunkGhost: (nextChunk) => this.ensureChunkGhost(nextChunk)
+    });
+    if (!result.changed) return;
+    this.chunkLoadedCount = Math.max(0, this.chunkLoadedCount + result.chunkLoadedCountDelta);
+    this.markSceneDirty({
+      invalidateInteractables: true,
+      needsBoundsUpdate: true,
+      needsCulling: true
+    });
   }
   async loadChunk(chunk) {
     this.processingChunks.add(chunk.id);
+    this.markSceneDirty();
     try {
-      let bm = null;
       let loadedNow = false;
-      const cachedMesh = this.takeCachedChunkMesh(chunk.id);
-      if (cachedMesh) {
-        bm = cachedMesh;
-      } else if (chunk.node) {
-        bm = await createBatchedMeshFromItemsAsync(chunk.node.items, this.sharedMaterial, {
-          batchSize: 1200,
-          yieldControl: () => this.yieldToMainThread()
-        });
-      } else if (chunk.nbimFileId && this.nbimFiles.has(chunk.nbimFileId) && this.hasValidChunkBinaryRange(chunk)) {
-        const buffer = await this.readChunkBuffer(chunk);
-        const meta = this.nbimMeta.get(chunk.nbimFileId);
-        const version = meta?.version ?? 8;
-        if (version !== 8) {
-          throw new Error(`Unsupported NBIM version: ${version}. Only V8 is supported.`);
-        }
-        const workerResult = await this.runWorkerTask({
-          buffer,
-          version,
-          originalUuid: chunk.originalUuid,
-          bimIdTable: meta?.bimIdTable
-        }, [buffer]);
-        bm = this.reconstructBatchedMesh(workerResult, this.sharedMaterial);
-        if (!this.isCameraMoving && this.resolvedChunkOptions.chunkPrefetchWindow > 0) {
-          const chunkIndex = this.getChunkIndex(chunk.id);
-          if (chunkIndex >= 0) {
-            const candidates = [];
-            for (let i = 1; i <= this.resolvedChunkOptions.chunkPrefetchWindow; i++) {
-              const next = this.chunks[chunkIndex + i];
-              if (!next) break;
-              if (next.loaded || this.processingChunks.has(next.id)) continue;
-              if (!next.nbimFileId || !this.hasValidChunkBinaryRange(next)) continue;
-              candidates.push(next.id);
-            }
-            this.enqueueChunkPrefetch(candidates);
-            void this.processPrefetchQueue();
+      let needsRender = false;
+      let needsBoundsUpdate = false;
+      let invalidateInteractables = false;
+      let needsCulling = false;
+      const { mesh: bm, prefetchCandidates } = await resolveChunkMeshForLoad({
+        chunk,
+        sharedMaterial: this.sharedMaterial,
+        takeCachedChunkMesh: (chunkId) => this.takeCachedChunkMesh(chunkId),
+        yieldToMainThread: () => this.yieldToMainThread(),
+        nbimFiles: this.nbimFiles,
+        hasValidChunkBinaryRange: (nextChunk) => this.hasValidChunkBinaryRange(nextChunk),
+        readChunkBuffer: (nextChunk) => this.readChunkBuffer(nextChunk),
+        nbimMeta: this.nbimMeta,
+        runWorkerTask: (data, transferables) => this.runWorkerTask(data, transferables),
+        reconstructBatchedMesh: (data, material) => reconstructBatchedMeshFromWorkerData({
+          data,
+          material,
+          resolveUuidByBimId: (originalUuid, bimId) => {
+            const key = `${originalUuid}::${bimId}`;
+            const nodeIds = this.bimIdToNodeIds.get(key);
+            return nodeIds?.[0] || bimId || originalUuid;
           }
-        }
+        }),
+        isCameraMoving: this.isCameraMoving,
+        chunkPrefetchWindow: this.resolvedChunkOptions.chunkPrefetchWindow,
+        getChunkIndex: (chunkId) => this.getChunkIndex(chunkId),
+        chunks: this.chunks,
+        processingChunks: this.processingChunks
+      });
+      if (prefetchCandidates.length > 0) {
+        this.enqueueChunkPrefetch(prefetchCandidates);
+        void this.processPrefetchQueue();
       }
       if (bm) {
-        if (this.cancelledChunkIds.has(chunk.id) || !this.chunkIdSet.has(chunk.id)) {
-          this.disposeChunkMesh(bm);
-          return;
+        const attached = attachLoadedChunkMesh({
+          chunk,
+          mesh: bm,
+          cancelledChunkIds: this.cancelledChunkIds,
+          chunkIdSet: this.chunkIdSet,
+          disposeChunkMesh: (mesh) => this.disposeChunkMesh(mesh),
+          globalOffset: this.globalOffset,
+          contentGroup: this.contentGroup,
+          registerOptimizedMeshMapping: (mesh) => this.registerOptimizedMeshMapping(mesh)
+        });
+        loadedNow = attached.attached;
+        if (loadedNow) {
+          invalidateInteractables = true;
+          needsBoundsUpdate = true;
+          needsRender = true;
         }
-        bm.name = chunk.id;
-        bm.userData.chunkId = chunk.id;
-        bm.userData.originalUuid = chunk.originalUuid;
-        if (chunk.nbimFileId) {
-          bm.position.sub(this.globalOffset);
-          bm.updateMatrixWorld(true);
-        }
-        let optimizedGroup = this.contentGroup.getObjectByName(chunk.groupName);
-        if (!optimizedGroup) {
-          optimizedGroup = new THREE.Group();
-          optimizedGroup.name = chunk.groupName;
-          optimizedGroup.userData.isOptimizedGroup = true;
-          optimizedGroup.userData.originalUuid = chunk.originalUuid;
-          this.contentGroup.add(optimizedGroup);
-        }
-        optimizedGroup.add(bm);
-        chunk.mesh = bm;
-        loadedNow = true;
-        this.interactableListValid = false;
-        this._needsBoundsUpdate = true;
-        this.registerOptimizedMeshMapping(bm);
       }
-      if (loadedNow && !chunk.loaded) {
-        chunk.loaded = true;
-        this.chunkLoadedCount++;
-        chunk.lastVisibleAt = performance.now();
-        chunk.lastFocusAt = chunk.lastVisibleAt;
-        if (chunk.originalUuid) {
-          this.deactivateFastPreviewForModel(chunk.originalUuid);
-        }
-        if (this.chunkWarmupActive && this.chunkLoadedCount >= this.initialChunkLoadTarget) {
-          this.chunkWarmupActive = false;
-        }
+      const finalized = finalizeLoadedChunk({
+        chunk,
+        loadedNow,
+        now: performance.now(),
+        chunkLoadedCount: this.chunkLoadedCount,
+        chunkWarmupActive: this.chunkWarmupActive,
+        initialChunkLoadTarget: this.initialChunkLoadTarget,
+        deactivateFastPreviewForModel: (originalUuid) => this.deactivateFastPreviewForModel(originalUuid)
+      });
+      this.chunkLoadedCount = finalized.nextChunkLoadedCount;
+      this.chunkWarmupActive = finalized.nextChunkWarmupActive;
+      if (finalized.progressChanged) {
         this.reportChunkProgress();
-        this.cullingDirty = true;
+        needsCulling = true;
+        needsRender = true;
       }
       this.cancelledChunkIds.delete(chunk.id);
-      const ghost = this.ghostGroup.getObjectByName(`ghost_${chunk.id}`);
-      if (ghost) {
-        this.ghostGroup.remove(ghost);
-        this.releaseGhostLine(ghost);
+      const ghostCleanup = cleanupChunkGhost({
+        chunkId: chunk.id,
+        ghostGroup: this.ghostGroup,
+        releaseGhostLine: (line) => this.releaseGhostLine(line)
+      });
+      if (ghostCleanup.changed) {
+        needsRender = true;
+      }
+      if (needsRender) {
+        this.markSceneDirty({
+          invalidateInteractables,
+          needsBoundsUpdate,
+          needsCulling
+        });
       }
     } catch (err) {
       console.error(`加载分块 ${chunk.id} 失败:`, err);
     } finally {
       this.processingChunks.delete(chunk.id);
+      this.markSceneDirty();
     }
   }
   setChunkLoadingEnabled(enabled) {
     this.chunkLoadingEnabled = enabled;
     this.prefetchPaused = !enabled;
     this.cullingDirty = true;
-    if (enabled) this.checkCullingAndLoad();
+    if (enabled) {
+      this.checkCullingAndLoad();
+      return;
+    }
+    this.markSceneDirty();
   }
   applyNbimScaleTuning(chunkCount) {
     const userChunkOptions = this.options.chunkOptions || {};
@@ -1965,7 +4538,10 @@ class SceneManager {
     fileGroup.add(object);
     object.visible = keepVisible;
     this.contentGroup.add(fileGroup);
-    this.interactableListValid = false;
+    this.markSceneDirty({
+      invalidateInteractables: true,
+      needsRender: false
+    });
   }
   async prepareModelChunkStage(object, meshCount, onProgress) {
     if (onProgress) onProgress(10, "正在收集构件...");
@@ -2031,6 +4607,7 @@ class SceneManager {
     if (!previewGhost) return;
     this.ghostGroup.remove(previewGhost);
     this.releaseGhostLine(previewGhost);
+    this.markSceneDirty();
   }
   cancelDeferredStructureBuild() {
     if (this.deferredStructureTimer) {
@@ -2162,7 +4739,10 @@ class SceneManager {
       };
       traverseNode(nodes[0]);
     }
-    this.interactableListValid = false;
+    this.markSceneDirty({
+      invalidateInteractables: true,
+      needsRender: false
+    });
     this.unregisterOriginalStats(originalUuid);
     this.fastPreviewModels.delete(uuid);
     this.fastPreviewModels.delete(originalUuid);
@@ -2216,7 +4796,11 @@ class SceneManager {
     }
     this.updateSceneBounds();
     if (this.onStructureUpdate) this.onStructureUpdate();
-    this.requestRender();
+    this.markSceneDirty({
+      invalidateInteractables: true,
+      needsBoundsUpdate: true,
+      needsCulling: true
+    });
     this.measureRecords.forEach((record, recordId) => {
       let isRelated = record.modelUuid === uuid || record.modelUuid === originalUuid;
       if (!isRelated && record.modelUuid && obj) {
@@ -2318,65 +4902,6 @@ class SceneManager {
     }
     return buffer;
   }
-  reconstructBatchedMesh(data, material) {
-    const { geometries: geoData, instances: instData, originalUuid } = data;
-    const hasAnyIndex = geoData.some((g) => g.index && g.index.length > 0);
-    const geometries = geoData.map((g) => {
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute("position", new THREE.BufferAttribute(g.position, 3));
-      geo.setAttribute("normal", new THREE.BufferAttribute(g.normal, 3));
-      if (g.index && g.index.length > 0) {
-        geo.setIndex(new THREE.BufferAttribute(g.index, 1));
-      } else if (hasAnyIndex) {
-        const count = g.position.length / 3;
-        const index = new Uint32Array(count);
-        for (let i = 0; i < count; i++) index[i] = i;
-        geo.setIndex(new THREE.BufferAttribute(index, 1));
-      }
-      return geo;
-    });
-    let totalVerts = 0;
-    let totalIndices = 0;
-    geometries.forEach((g) => {
-      totalVerts += g.attributes.position.count;
-      if (g.index) totalIndices += g.index.count;
-    });
-    const bm = new THREE.BatchedMesh(instData.length, totalVerts, totalIndices, material);
-    bm.frustumCulled = false;
-    bm.perInstanceFrustumCulling = false;
-    const geoIds = geometries.map((g) => bm.addGeometry(g));
-    const matrix = new THREE.Matrix4();
-    const color = new THREE.Color();
-    const batchIdToUuid = /* @__PURE__ */ new Map();
-    const batchIdToBimId = /* @__PURE__ */ new Map();
-    const batchIdToColor = /* @__PURE__ */ new Map();
-    const batchIdToGeometry = /* @__PURE__ */ new Map();
-    instData.forEach((inst) => {
-      color.setHex(inst.color);
-      matrix.fromArray(inst.matrix);
-      const instId = bm.addInstance(geoIds[inst.geoIdx]);
-      bm.setMatrixAt(instId, matrix);
-      bm.setColorAt(instId, color);
-      const geo = geometries[inst.geoIdx];
-      if (!geo.boundingBox) geo.computeBoundingBox();
-      if (geo.boundingBox && bm.setBoundingBoxAt) bm.setBoundingBoxAt(instId, geo.boundingBox);
-      const bimId = inst.bimId;
-      const key = `${originalUuid}::${bimId}`;
-      const nodeIds = this.bimIdToNodeIds.get(key);
-      const resolvedUuid = nodeIds?.[0] || bimId || originalUuid;
-      batchIdToUuid.set(instId, resolvedUuid);
-      batchIdToBimId.set(instId, bimId);
-      batchIdToColor.set(instId, inst.color);
-      batchIdToGeometry.set(instId, geometries[inst.geoIdx]);
-    });
-    bm.userData.batchIdToUuid = batchIdToUuid;
-    bm.userData.batchIdToBimId = batchIdToBimId;
-    bm.userData.batchIdToColor = batchIdToColor;
-    bm.userData.batchIdToGeometry = batchIdToGeometry;
-    bm.computeBoundingBox();
-    bm.computeBoundingSphere();
-    return bm;
-  }
   async exportNbim(fileName) {
     if (this.chunks.length === 0) throw new Error("无模型数据可导出");
     const bimIdTable = [""];
@@ -2393,145 +4918,20 @@ class SceneManager {
       if (node.children) node.children.forEach(traverseBimIds);
     };
     traverseBimIds(this.structureRoot);
-    const ifcApiByModel = /* @__PURE__ */ new Map();
-    const ifcManagerByModel = /* @__PURE__ */ new Map();
-    this.contentGroup.traverse((obj) => {
-      if (obj.userData?.ifcAPI && obj.userData?.modelID !== void 0 && obj.userData?.originalUuid) {
-        ifcApiByModel.set(String(obj.userData.originalUuid), { ifcApi: obj.userData.ifcAPI, modelID: obj.userData.modelID });
-      }
-      if (obj.userData?.ifcManager && obj.userData?.modelID !== void 0 && obj.userData?.originalUuid) {
-        ifcManagerByModel.set(String(obj.userData.originalUuid), { ifcManager: obj.userData.ifcManager, modelID: obj.userData.modelID });
-      }
+    const { ifcApiByModel, ifcManagerByModel } = collectIfcModelReferences(this.contentGroup);
+    const bimProperties = await collectNbimBimProperties({
+      structureRoot: this.structureRoot,
+      ifcApiByModel,
+      ifcManagerByModel
     });
-    const bimProperties = {};
-    const stack = [this.structureRoot];
-    while (stack.length > 0) {
-      const node = stack.pop();
-      const originalUuid = node.userData?.originalUuid ? String(node.userData.originalUuid) : "";
-      if (node.bimId) {
-        const key = `${originalUuid}::${node.bimId}`;
-        if (!bimProperties[key]) {
-          bimProperties[key] = { uuid: node.id, name: node.name };
-          const expressID = node.userData?.expressID;
-          if (expressID !== void 0 && ifcApiByModel.has(originalUuid)) {
-            try {
-              const { ifcApi, modelID } = ifcApiByModel.get(originalUuid);
-              const entity = ifcApi.GetLine(modelID, Number(expressID));
-              if (entity) {
-                bimProperties[key].ifcType = entity.is_a || "";
-                bimProperties[key].globalId = entity.GlobalId?.value || "";
-                bimProperties[key].ifcName = entity.Name?.value || "";
-              }
-            } catch {
-            }
-          }
-          if (expressID !== void 0 && ifcManagerByModel.has(originalUuid)) {
-            try {
-              const { ifcManager, modelID } = ifcManagerByModel.get(originalUuid);
-              const fullProps = await ifcManager.getItemProperties(modelID, Number(expressID));
-              const rawGroups = fullProps?.rawGroups || fullProps?.groups || null;
-              const normalizedGroups = fullProps?.normalizedGroups || null;
-              if (rawGroups && Object.keys(rawGroups).length > 0) {
-                bimProperties[key].ifcRawGroups = rawGroups;
-              }
-              if (normalizedGroups && Object.keys(normalizedGroups).length > 0) {
-                bimProperties[key].ifcNormalizedGroups = normalizedGroups;
-              }
-            } catch {
-            }
-          }
-        }
-      }
-      if (node.children && node.children.length > 0) {
-        for (let i = node.children.length - 1; i >= 0; i--) {
-          stack.push(node.children[i]);
-        }
-      }
-    }
-    const chunkBlobs = [];
-    const exportChunks = this.chunks.map((c) => ({
-      id: c.id,
-      bounds: {
-        min: { x: c.bounds.min.x, y: c.bounds.min.y, z: c.bounds.min.z },
-        max: { x: c.bounds.max.x, y: c.bounds.max.y, z: c.bounds.max.z }
-      },
-      originalUuid: c.originalUuid ? String(c.originalUuid) : void 0,
-      byteOffset: 0,
-      byteLength: 0
-    }));
-    let currentOffset = 1024;
-    const decodeV8 = (buffer, table) => {
-      const dv2 = new DataView(buffer);
-      let offset = 0;
-      const geoCount = dv2.getUint32(offset, true);
-      offset += 4;
-      const geometries = [];
-      for (let i = 0; i < geoCount; i++) {
-        const vertCount = dv2.getUint32(offset, true);
-        offset += 4;
-        const indexCount = dv2.getUint32(offset, true);
-        offset += 4;
-        const posArr = new Float32Array(buffer, offset, vertCount * 3);
-        offset += vertCount * 12;
-        const normArr = new Float32Array(buffer, offset, vertCount * 3);
-        offset += vertCount * 12;
-        const geo = new THREE.BufferGeometry();
-        geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(posArr), 3));
-        geo.setAttribute("normal", new THREE.BufferAttribute(new Float32Array(normArr), 3));
-        if (indexCount > 0) {
-          const indexArr = new Uint32Array(buffer, offset, indexCount);
-          offset += indexCount * 4;
-          geo.setIndex(new THREE.BufferAttribute(new Uint32Array(indexArr), 1));
-        }
-        geometries.push(geo);
-      }
-      const instanceCount = dv2.getUint32(offset, true);
-      offset += 4;
-      const matrix = new THREE.Matrix4();
-      const instances = [];
-      for (let i = 0; i < instanceCount; i++) {
-        const bimIdIndex = dv2.getUint32(offset, true);
-        offset += 4;
-        const typeIndex = dv2.getUint32(offset, true);
-        offset += 4;
-        const color = dv2.getUint32(offset, true);
-        offset += 4;
-        for (let k = 0; k < 16; k++) {
-          matrix.elements[k] = dv2.getFloat32(offset, true);
-          offset += 4;
-        }
-        const geoIdx = dv2.getUint32(offset, true);
-        offset += 4;
-        instances.push({ bimId: table[bimIdIndex] ?? String(bimIdIndex), typeIndex, color, matrix: matrix.clone(), geometry: geometries[geoIdx] });
-      }
-      return instances;
-    };
-    for (let i = 0; i < this.chunks.length; i++) {
-      const chunk = this.chunks[i];
-      const exportChunk = exportChunks[i];
-      let buffer;
-      if (chunk.node) {
-        buffer = this.generateChunkBinaryV8(chunk.node.items, bimIdToIndex);
-      } else if (chunk.nbimFileId && this.nbimFiles.has(chunk.nbimFileId) && this.hasValidChunkBinaryRange(chunk)) {
-        const file = this.nbimFiles.get(chunk.nbimFileId);
-        const raw = await file.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength).arrayBuffer();
-        const meta = this.nbimMeta.get(chunk.nbimFileId);
-        const version = meta?.version ?? 8;
-        if (version !== 8) {
-          throw new Error(`Unsupported NBIM version: ${version}. Only V8 is supported.`);
-        }
-        const instances = decodeV8(raw, meta?.bimIdTable || []);
-        const items = instances.map((inst) => ({ uuid: "", bimId: inst.bimId, typeIndex: inst.typeIndex, color: inst.color, matrix: inst.matrix, geometry: inst.geometry }));
-        buffer = this.generateChunkBinaryV8(items, bimIdToIndex);
-      } else {
-        continue;
-      }
-      const uint8 = new Uint8Array(buffer);
-      chunkBlobs.push(uint8);
-      exportChunk.byteOffset = currentOffset;
-      exportChunk.byteLength = uint8.byteLength;
-      currentOffset += uint8.byteLength;
-    }
+    const { chunkBlobs, exportChunks, currentOffset } = await prepareNbimExportChunks({
+      chunks: this.chunks,
+      nbimFiles: this.nbimFiles,
+      nbimMeta: this.nbimMeta,
+      bimIdToIndex,
+      hasValidChunkBinaryRange: (chunk) => this.hasValidChunkBinaryRange(chunk),
+      generateChunkBinaryV8: (items, indexMap) => this.generateChunkBinaryV8(items, indexMap)
+    });
     const manifest = {
       globalBounds: {
         min: { x: this.sceneBounds.min.x, y: this.sceneBounds.min.y, z: this.sceneBounds.min.z },
@@ -2539,81 +4939,11 @@ class SceneManager {
       },
       chunks: exportChunks,
       stats: this.originalStats,
-      structureTree: (() => {
-        const sanitizeUserData = (ud) => {
-          if (!ud || typeof ud !== "object") return void 0;
-          const out = {};
-          if (ud.originalUuid !== void 0) out.originalUuid = String(ud.originalUuid);
-          if (ud.expressID !== void 0) out.expressID = ud.expressID;
-          if (ud.modelID !== void 0) out.modelID = ud.modelID;
-          return Object.keys(out).length > 0 ? out : void 0;
-        };
-        const usedIds = /* @__PURE__ */ new Set();
-        const assignId = (rawName, fallback) => {
-          const base = rawName && rawName.trim() ? rawName.trim() : fallback;
-          if (!usedIds.has(base)) {
-            usedIds.add(base);
-            return base;
-          }
-          let n = 2;
-          while (usedIds.has(`${base}_${n}`)) n++;
-          const id = `${base}_${n}`;
-          usedIds.add(id);
-          return id;
-        };
-        const srcRoot = this.structureRoot;
-        const rootId = assignId(srcRoot?.name, srcRoot?.id ?? "Root");
-        const rootCopy = {
-          id: rootId,
-          name: srcRoot?.name,
-          type: srcRoot?.type,
-          visible: srcRoot?.visible !== false,
-          children: []
-        };
-        if (srcRoot?.bimId !== void 0) rootCopy.bimId = srcRoot.bimId;
-        if (srcRoot?.chunkId !== void 0) rootCopy.chunkId = srcRoot.chunkId;
-        const rootUd = sanitizeUserData(srcRoot?.userData);
-        if (rootUd) rootCopy.userData = rootUd;
-        const stack2 = [{ src: srcRoot, dst: rootCopy }];
-        while (stack2.length > 0) {
-          const { src, dst } = stack2.pop();
-          const children = Array.isArray(src?.children) ? src.children : [];
-          for (const child of children) {
-            const childId = assignId(child?.name, child?.id ?? "Node");
-            const childCopy = {
-              id: childId,
-              name: child?.name,
-              type: child?.type,
-              visible: child?.visible !== false,
-              children: []
-            };
-            if (child?.bimId !== void 0) childCopy.bimId = child.bimId;
-            if (child?.chunkId !== void 0) childCopy.chunkId = child.chunkId;
-            const ud = sanitizeUserData(child?.userData);
-            if (ud) childCopy.userData = ud;
-            dst.children.push(childCopy);
-            stack2.push({ src: child, dst: childCopy });
-          }
-        }
-        return rootCopy;
-      })(),
+      structureTree: buildExportStructureTree(this.structureRoot),
       bimIdTable,
       bimProperties
     };
-    let manifestStr;
-    try {
-      manifestStr = JSON.stringify(manifest);
-    } catch (e) {
-      const minimalManifest = {
-        globalBounds: manifest.globalBounds,
-        chunks: manifest.chunks,
-        structureTree: { id: this.structureRoot.id, name: this.structureRoot.name, type: this.structureRoot.type, children: this.structureRoot.children ? [] : [] },
-        bimIdTable: manifest.bimIdTable,
-        bimProperties: {}
-      };
-      manifestStr = JSON.stringify(minimalManifest);
-    }
-    const manifestBytes = new TextEncoder().encode(manifestStr);
+    const manifestBytes = encodeNbimManifest(manifest, this.structureRoot);
     const header = new ArrayBuffer(1024);
     const dv = new DataView(header);
     dv.setUint32(0, 1296646734, true);
@@ -2625,23 +4955,7 @@ class SceneManager {
     const url = URL.createObjectURL(finalBlob);
     const a = document.createElement("a");
     a.href = url;
-    const deriveDefaultStem = () => {
-      const names = [];
-      this.contentGroup.children.forEach((child) => {
-        if (child.userData?.isOptimizedGroup) return;
-        if (child.name.startsWith("optimized_")) return;
-        const rawName = (typeof child.userData?.modelName === "string" ? child.userData.modelName : "") || (child.children?.[0]?.name || "") || child.name;
-        const baseName = sanitizeFileStem(stripFileExtension(rawName));
-        names.push(baseName);
-      });
-      const uniqueNames = Array.from(new Set(names));
-      if (uniqueNames.length === 1) return uniqueNames[0];
-      const now = /* @__PURE__ */ new Date();
-      const pad = (v) => String(v).padStart(2, "0");
-      const suffix = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-      return `批量导出_${suffix}`;
-    };
-    const defaultStem = deriveDefaultStem();
+    const defaultStem = deriveDefaultNbimStem(this.contentGroup);
     const resolvedName = sanitizeFileStem(stripFileExtension((fileName || "").trim()) || defaultStem);
     a.download = `${resolvedName}.nbim`;
     a.click();
@@ -2661,144 +4975,79 @@ class SceneManager {
     if (onProgress) onProgress(20, "正在读取元数据...");
     const manifest = await readNbimManifest(file, header);
     this.nbimMeta.set(fileId, { version, bimIdTable: manifest.bimIdTable });
-    if (manifest.globalBounds) {
-      const newBounds = new THREE.Box3(
-        new THREE.Vector3(manifest.globalBounds.min.x, manifest.globalBounds.min.y, manifest.globalBounds.min.z),
-        new THREE.Vector3(manifest.globalBounds.max.x, manifest.globalBounds.max.y, manifest.globalBounds.max.z)
-      );
-      if (this.globalOffset.length() === 0) {
-        newBounds.getCenter(this.globalOffset);
-        debugLog("SceneManager/NBIM", "初始化全局偏移", this.globalOffset);
-      }
-      if (this.precomputedBounds.isEmpty()) {
-        this.precomputedBounds.copy(newBounds);
-      } else {
-        this.precomputedBounds.union(newBounds);
-      }
-      this.sceneBounds.copy(this.precomputedBounds);
+    const boundsState = applyNbimGlobalBounds({
+      globalBounds: manifest.globalBounds,
+      precomputedBounds: this.precomputedBounds,
+      sceneBounds: this.sceneBounds,
+      globalOffset: this.globalOffset
+    });
+    this.precomputedBounds.copy(boundsState.precomputedBounds);
+    this.sceneBounds.copy(boundsState.sceneBounds);
+    this.globalOffset.copy(boundsState.globalOffset);
+    if (boundsState.initializedOffset) {
+      debugLog("SceneManager/NBIM", "初始化全局偏移", this.globalOffset);
     }
     const modelRoot = manifest.structureTree;
-    if (!this.structureRoot.children) this.structureRoot.children = [];
-    if (modelRoot) {
-      if (modelRoot.children && modelRoot.name === "Root") {
-        this.structureRoot.children.push(...modelRoot.children);
-      } else {
-        this.structureRoot.children.push(modelRoot);
-      }
-    }
+    appendNbimStructure({
+      structureRoot: this.structureRoot,
+      modelRoot
+    });
     const rootId = modelRoot?.id || fileId;
     const manifestBimProperties = manifest?.bimProperties && typeof manifest.bimProperties === "object" ? manifest.bimProperties : {};
-    const propKeys = Object.keys(manifestBimProperties);
-    const ownerSet = /* @__PURE__ */ new Set();
-    propKeys.forEach((k) => {
-      const i = k.indexOf("::");
-      if (i > 0) ownerSet.add(k.slice(0, i));
+    const { defaultOwner, grouped } = groupNbimPropertiesByOwner(manifestBimProperties, rootId);
+    grouped.forEach((props, owner) => this.nbimPropsByOriginalUuid.set(owner, props));
+    const quickStats = buildNbimQuickStats({
+      manifestStats: manifest.stats,
+      modelRoot,
+      chunks: manifest.chunks
     });
-    const defaultOwner = ownerSet.size === 1 ? [...ownerSet][0] : rootId;
-    if (ownerSet.size >= 1) {
-      if (ownerSet.size === 1) {
-        this.nbimPropsByOriginalUuid.set(defaultOwner, manifestBimProperties);
-      } else {
-        const grouped = /* @__PURE__ */ new Map();
-        propKeys.forEach((k) => {
-          const i = k.indexOf("::");
-          const owner = i > 0 ? k.slice(0, i) : rootId;
-          if (!grouped.has(owner)) grouped.set(owner, {});
-          grouped.get(owner)[k] = manifestBimProperties[k];
-        });
-        grouped.forEach((props, owner) => this.nbimPropsByOriginalUuid.set(owner, props));
-      }
-    } else {
-      this.nbimPropsByOriginalUuid.set(rootId, manifestBimProperties);
-    }
-    const quickStats = manifest.stats || {
-      meshes: this.countStructureRenderableNodes(modelRoot),
-      faces: 0,
-      memory: parseFloat(((manifest.chunks || []).reduce((sum, chunk) => sum + (chunk.byteLength || 0), 0) / (1024 * 1024)).toFixed(2))
-    };
     this.registerOriginalStats(rootId, quickStats);
-    const fileGroup = new THREE.Group();
-    fileGroup.name = `file_${rootId}`;
-    fileGroup.userData.originalUuid = rootId;
-    const fileBaseName = sanitizeFileStem(stripFileExtension(file.name));
-    const modelRootName = typeof modelRoot?.name === "string" && modelRoot.name !== "Root" ? modelRoot.name : "";
-    fileGroup.userData.modelName = sanitizeFileStem(sanitizeDisplayLabel(modelRootName, fileBaseName, rootId) || fileBaseName);
+    const fileGroup = createNbimContainerGroup({
+      fileName: file.name,
+      modelRootName: typeof modelRoot?.name === "string" ? modelRoot.name : "",
+      rootId
+    });
     this.contentGroup.add(fileGroup);
     this.interactableListValid = false;
-    if (modelRoot) {
-      const traverse = (node) => {
-        if (!node.userData) node.userData = {};
-        const nodeOriginalUuid = node.userData?.originalUuid ? String(node.userData.originalUuid) : defaultOwner;
-        node.userData.originalUuid = nodeOriginalUuid;
-        if (!this.nodeMap.has(node.id)) this.nodeMap.set(node.id, []);
-        this.nodeMap.get(node.id).push(node);
-        if (node.bimId) {
-          const key = `${nodeOriginalUuid}::${node.bimId}`;
-          if (!this.bimIdToNodeIds.has(key)) this.bimIdToNodeIds.set(key, []);
-          this.bimIdToNodeIds.get(key).push(node.id);
-        }
-        if (node.children) node.children.forEach(traverse);
-      };
-      traverse(modelRoot);
-    }
+    populateNbimNodeMappings({
+      modelRoot,
+      defaultOwner,
+      nodeMap: this.nodeMap,
+      bimIdToNodeIds: this.bimIdToNodeIds
+    });
     if (onProgress) onProgress(30, "正在初始化分块...");
-    const chunkOffset = this.globalOffset.lengthSq() > 0 ? this.globalOffset.clone().negate() : null;
     const chunkEntries = Array.isArray(manifest.chunks) ? manifest.chunks : [];
     this.applyNbimScaleTuning(chunkEntries.length);
-    const deferredGhostSpecs = [];
     const immediateGhostLimit = this.resolvedChunkOptions.ghostMode === "all" ? Number.MAX_SAFE_INTEGER : GHOST_VISIBLE_FIRST_BATCH;
-    for (let i = 0; i < chunkEntries.length; i++) {
-      const c = chunkEntries[i];
-      const bounds = new THREE.Box3(
-        new THREE.Vector3(c.bounds.min.x, c.bounds.min.y, c.bounds.min.z),
-        new THREE.Vector3(c.bounds.max.x, c.bounds.max.y, c.bounds.max.z)
-      );
-      if (chunkOffset) {
-        bounds.translate(chunkOffset);
-      }
-      const chunkId = c.id;
-      const center = bounds.getCenter(new THREE.Vector3());
-      const paddedBounds = bounds.clone();
-      const padSize = bounds.getSize(new THREE.Vector3()).multiplyScalar(this.chunkPadding);
-      paddedBounds.expandByVector(padSize);
-      this.registerChunk({
-        id: chunkId,
-        bounds,
-        paddedBounds,
-        _padding: this.chunkPadding,
-        center,
-        loaded: false,
-        byteOffset: c.byteOffset,
-        byteLength: c.byteLength,
-        nbimFileId: fileId,
-        groupName: `optimized_${rootId}`,
-        originalUuid: c.originalUuid ? String(c.originalUuid) : rootId
-      });
-      if (i < immediateGhostLimit) {
-        const edges = this.createGhostLine(`ghost_${chunkId}`, bounds);
-        this.ghostGroup.add(edges);
-      } else {
-        deferredGhostSpecs.push({ chunkId, bounds });
-      }
-      if ((i + 1) % NBIM_CHUNK_REGISTRATION_BATCH === 0) {
-        if (onProgress) {
-          const ratio = Math.max(0, Math.min(1, (i + 1) / chunkEntries.length));
-          const progress = 30 + Math.round(ratio * 40);
-          onProgress(progress, "正在初始化分块...");
-        }
-        await this.yieldToMainThread();
-      }
-    }
+    const { deferredGhostSpecs } = await registerNbimChunks({
+      chunkEntries,
+      globalOffset: this.globalOffset,
+      chunkPadding: this.chunkPadding,
+      rootId,
+      fileId,
+      immediateGhostLimit,
+      registrationBatchSize: NBIM_CHUNK_REGISTRATION_BATCH,
+      onProgress,
+      registerChunk: (chunk) => this.registerChunk(chunk),
+      createGhostLine: (name, bounds) => this.createGhostLine(name, bounds),
+      addGhostLine: (line) => this.ghostGroup.add(line),
+      yieldToMainThread: () => this.yieldToMainThread()
+    });
     if (deferredGhostSpecs.length > 0) {
       void this.createChunkGhostsProgressively(deferredGhostSpecs);
     }
     this.reportChunkProgress();
     this.fitView(true);
-    this.chunkWarmupActive = true;
-    this.initialChunkLoadTarget = this.chunks.length > 200 ? 44 : this.chunks.length > 80 ? 30 : 16;
+    const loadFinalize = finalizeNbimLoad({
+      chunkCount: this.chunks.length,
+      hasManifestStats: Boolean(manifest.stats),
+      hasManifestChunks: Boolean(manifest.chunks?.length)
+    });
+    this.chunkWarmupActive = loadFinalize.chunkWarmupActive;
+    this.initialChunkLoadTarget = loadFinalize.initialChunkLoadTarget;
     if (onProgress) onProgress(100, "NBIM 已就绪，正在按需加载...");
     this.checkCullingAndLoad();
-    if (!manifest.stats && manifest.chunks?.length) {
+    if (loadFinalize.shouldEstimateStats) {
       void this.estimateNbimStats(file, manifest.chunks, version).then((stats) => {
         this.unregisterOriginalStats(rootId);
         this.registerOriginalStats(rootId, stats);
@@ -2812,6 +5061,7 @@ class SceneManager {
     debugLog("SceneManager", "开始清空场景...");
     this.cancelDeferredStructureBuild();
     this.resetExplode();
+    this.clearLocateFocus();
     try {
       const disposeObject = (obj) => {
         if (obj.isMesh) {
@@ -2877,7 +5127,7 @@ class SceneManager {
       this.chunkWarmupActive = false;
       this.globalOffset.set(0, 0, 0);
       debugLog("SceneManager", "场景已清空");
-      this.requestRender();
+      this.markSceneDirty();
     } catch (error) {
       console.error("清空场景失败:", error);
       throw error;
@@ -2887,221 +5137,208 @@ class SceneManager {
     return this.nodeMap.get(id);
   }
   getBimIdByUuid(uuid) {
-    const nodes = this.nodeMap.get(uuid);
-    if (nodes && nodes.length > 0 && nodes[0].bimId) {
-      return nodes[0].bimId;
-    }
-    for (const [key, nodeIds] of this.bimIdToNodeIds.entries()) {
-      if (nodeIds.includes(uuid)) {
-        const parts = key.split("::");
-        return parts.length > 1 ? parts[1] : null;
-      }
-    }
-    return null;
+    return resolveBimIdByUuid({
+      uuid,
+      nodeMap: this.nodeMap,
+      bimIdToNodeIds: this.bimIdToNodeIds
+    });
   }
   resolveNodeUuidByBimId(bimId) {
-    for (const [key, nodeIds] of this.bimIdToNodeIds.entries()) {
-      if (key.endsWith(`::${bimId}`) && nodeIds.length > 0) {
-        return nodeIds[0];
-      }
-    }
-    return null;
+    return resolveNodeUuidByBimId(bimId, this.bimIdToNodeIds);
   }
   resolveSelectionUuid(rawUuid) {
-    if (this.nodeMap.has(rawUuid)) return rawUuid;
-    const mapped = this.resolveNodeUuidByBimId(rawUuid);
-    return mapped || rawUuid;
+    return resolveSelectionUuid(rawUuid, this.nodeMap, this.bimIdToNodeIds);
   }
   resolveNbimNode(id) {
-    const direct = this.nodeMap.get(id);
-    if (direct && direct.length > 0) return direct[0];
-    return null;
+    return resolveNbimNode(id, this.nodeMap);
   }
   getNbimProperties(id) {
-    const node = this.resolveNbimNode(id);
-    if (!node || !node.bimId) return null;
-    const originalUuid = node.userData?.originalUuid ? String(node.userData.originalUuid) : "";
-    if (!originalUuid) return null;
-    const map = this.nbimPropsByOriginalUuid.get(originalUuid);
-    if (!map) return null;
-    const key = `${originalUuid}::${node.bimId}`;
-    const entry = map[key];
-    if (!entry || typeof entry !== "object") return entry || null;
-    const { ifcRawGroups, ifcNormalizedGroups, ...flatProps } = entry;
-    return flatProps;
+    return resolveNbimFlatProperties({
+      id,
+      nodeMap: this.nodeMap,
+      nbimPropsByOriginalUuid: this.nbimPropsByOriginalUuid
+    });
   }
   getNbimIfcPropertyGroups(id, mode = "raw") {
-    const node = this.resolveNbimNode(id);
-    if (!node || !node.bimId) return null;
-    const originalUuid = node.userData?.originalUuid ? String(node.userData.originalUuid) : "";
-    if (!originalUuid) return null;
-    const map = this.nbimPropsByOriginalUuid.get(originalUuid);
-    if (!map) return null;
-    const key = `${originalUuid}::${node.bimId}`;
-    const entry = map[key];
-    if (!entry || typeof entry !== "object") return null;
-    const rawGroups = entry.ifcRawGroups;
-    const normalizedGroups = entry.ifcNormalizedGroups;
-    if (mode === "normalized") {
-      return normalizedGroups || rawGroups || null;
-    }
-    return rawGroups || normalizedGroups || null;
+    return resolveNbimIfcPropertyGroups({
+      id,
+      nodeMap: this.nodeMap,
+      nbimPropsByOriginalUuid: this.nbimPropsByOriginalUuid
+    }, mode);
+  }
+  getVisibilityContext() {
+    return {
+      scene: this.scene,
+      contentGroup: this.contentGroup,
+      structureRoot: this.structureRoot,
+      nodeMap: this.nodeMap,
+      optimizedMapping: this.optimizedMapping,
+      highlightedUuids: this.highlightedUuids
+    };
+  }
+  getHighlightContext() {
+    return {
+      contentGroup: this.contentGroup,
+      selectionBox: this.selectionBox,
+      highlightMesh: this.highlightMesh,
+      optimizedMapping: this.optimizedMapping,
+      settings: this.settings,
+      state: {
+        highlightedUuids: this.highlightedUuids,
+        locateResultSet: this.locateResultSet,
+        locateFocusUuid: this.locateFocusUuid,
+        lastSelectedUuid: this.lastSelectedUuid
+      },
+      locateMaterialCache: this.locateMaterialCache,
+      locateObjectMaterialCache: this.locateObjectMaterialCache,
+      locateDimmedInstances: this.locateDimmedInstances,
+      clearClashPairHighlight: () => this.clearClashPairHighlight(),
+      nodeMap: this.nodeMap
+    };
+  }
+  getPickingContext() {
+    return {
+      canvas: this.canvas,
+      camera: this.camera,
+      raycaster: this.raycaster,
+      mouse: this.mouse,
+      contentGroup: this.contentGroup,
+      chunks: this.chunks,
+      nodeMap: this.nodeMap,
+      interactableList: this.interactableList,
+      interactableListValid: this.interactableListValid
+    };
+  }
+  syncHighlightState(state) {
+    this.highlightedUuids = state.highlightedUuids;
+    this.locateResultSet = state.locateResultSet;
+    this.locateFocusUuid = state.locateFocusUuid;
+    this.lastSelectedUuid = state.lastSelectedUuid;
+  }
+  syncPickingState(state) {
+    this.interactableList = state.interactableList;
+    this.interactableListValid = state.interactableListValid;
+  }
+  getMeasurementContext() {
+    return {
+      canvas: this.canvas,
+      camera: this.camera,
+      raycaster: this.raycaster,
+      mouse: this.mouse,
+      measureGroup: this.measureGroup,
+      tempMarker: this.tempMarker,
+      dotTexture: this.dotTexture,
+      measureRecords: this.measureRecords,
+      state: {
+        measureType: this.measureType,
+        currentMeasurePoints: this.currentMeasurePoints,
+        currentMeasureModelUuid: this.currentMeasureModelUuid,
+        previewLine: this.previewLine,
+        previewPolygon: this.previewPolygon
+      },
+      getRayIntersects: (clientX, clientY) => this.getRayIntersects(clientX, clientY),
+      onMeasureUpdate: this.onMeasureUpdate
+    };
+  }
+  syncMeasurementState(state) {
+    this.measureType = state.measureType;
+    this.currentMeasurePoints = state.currentMeasurePoints;
+    this.currentMeasureModelUuid = state.currentMeasureModelUuid;
+    this.previewLine = state.previewLine;
+    this.previewPolygon = state.previewPolygon;
+  }
+  syncBoxSelectState(state) {
+    this.boxSelectState = state;
+  }
+  getClippingContext() {
+    return {
+      renderer: this.renderer,
+      clipHelpersGroup: this.clipHelpersGroup,
+      state: {
+        clippingPlanes: this.clippingPlanes,
+        clipPlaneHelpers: this.clipPlaneHelpers,
+        clipHelperVisible: this.clipHelperVisible,
+        clipHelperOpacity: this.clipHelperOpacity
+      }
+    };
+  }
+  syncClippingState(state) {
+    this.clippingPlanes = state.clippingPlanes;
+    this.clipPlaneHelpers = state.clipPlaneHelpers;
+    this.clipHelperVisible = state.clipHelperVisible;
+    this.clipHelperOpacity = state.clipHelperOpacity;
   }
   setAllVisibility(visible) {
-    const setNodeVisible = (n) => {
-      n.visible = visible;
-      if (n.children) n.children.forEach(setNodeVisible);
-    };
-    if (this.structureRoot.children) this.structureRoot.children.forEach(setNodeVisible);
-    this.optimizedMapping.forEach((mappings) => {
-      mappings.forEach((m) => {
-        m.mesh.setVisibleAt(m.instanceId, visible);
-      });
-    });
-    this.contentGroup.traverse((o) => {
-      if (o.name === "Helpers" || o.name === "Measure") return;
-      if (o.isMesh && o.userData.isOptimized) {
-        o.visible = false;
-        return;
-      }
-      o.visible = visible;
-    });
+    applySetAllVisibility(this.getVisibilityContext(), visible);
     this.updateSceneBounds();
     this.refreshExplodeState();
-    this.requestRender();
+    this.markSceneDirty();
   }
   hideObjects(uuids) {
-    uuids.forEach((id) => this.setObjectVisibility(id, false));
+    this.setObjectsVisibility(uuids, false);
   }
-  isolateObjects(uuids) {
-    this.setAllVisibility(false);
-    const affectedBatchedMeshes = /* @__PURE__ */ new Set();
-    uuids.forEach((uuid) => {
-      this.setObjectVisibility(uuid, true);
-      const nodes = this.nodeMap.get(uuid);
-      if (nodes) {
-        nodes.forEach((node) => {
-          const showChildrenRecursive = (n) => {
-            if (n.id !== uuid) {
-              this.setObjectVisibility(n.id, true);
-            }
-            if (n.children) {
-              n.children.forEach(showChildrenRecursive);
-            }
-          };
-          showChildrenRecursive(node);
-        });
-      }
-      const mappings = this.optimizedMapping.get(uuid);
-      if (mappings) {
-        mappings.forEach((m) => {
-          affectedBatchedMeshes.add(m.mesh);
-        });
-      }
-    });
-    affectedBatchedMeshes.forEach((bm) => {
-      bm.visible = true;
-      let parent = bm.parent;
-      while (parent && parent !== this.scene) {
-        parent.visible = true;
-        parent = parent.parent;
-      }
-    });
-    uuids.forEach((uuid) => {
-      const obj = this.contentGroup.getObjectByProperty("uuid", uuid);
-      if (obj) {
-        let parent = obj.parent;
-        while (parent && parent !== this.scene) {
-          parent.visible = true;
-          parent = parent.parent;
-        }
-      }
-    });
-    this.interactableListValid = false;
-    this.updateSceneBounds();
-    this.refreshExplodeState();
-    this.requestRender();
-  }
-  setObjectVisibility(uuid, visible, showParents = true) {
-    const nodes = this.nodeMap.get(uuid);
-    if (nodes) {
-      nodes.forEach((node) => {
-        const setVisibleRecursive = (n) => {
-          n.visible = visible;
-          if (n.children) n.children.forEach(setVisibleRecursive);
-          const otherNodes = this.nodeMap.get(n.id);
-          if (otherNodes) {
-            otherNodes.forEach((on) => on.visible = visible);
-          }
-        };
-        setVisibleRecursive(node);
+  applyVisibilityBatch(changes, options = {}) {
+    const result = applyVisibilityBatch(this.getVisibilityContext(), changes, options);
+    if (result.nextHighlightedUuids) {
+      this.highlightObjects(result.nextHighlightedUuids);
+    }
+    if (options.invalidateInteractables ?? true) {
+      this.markSceneDirty({
+        invalidateInteractables: true,
+        needsRender: false
       });
     }
-    const obj = this.contentGroup.getObjectByProperty("uuid", uuid);
-    if (visible && obj && showParents) {
-      let parent = obj.parent;
-      while (parent && parent !== this.scene) {
-        parent.visible = true;
-        parent = parent.parent;
-      }
-    }
-    if (!visible) {
-      const idsToUnhighlight = [];
-      if (this.highlightedUuids.has(uuid)) {
-        idsToUnhighlight.push(uuid);
-      }
-      if (obj) {
-        obj.traverse((child) => {
-          if (this.highlightedUuids.has(child.uuid)) {
-            idsToUnhighlight.push(child.uuid);
-          }
-        });
-      } else if (nodes && nodes.length > 0) {
-        const findHighlightedRecursive = (n) => {
-          if (this.highlightedUuids.has(n.id)) idsToUnhighlight.push(n.id);
-          if (n.children) n.children.forEach(findHighlightedRecursive);
-        };
-        findHighlightedRecursive(nodes[0]);
-      }
-      if (idsToUnhighlight.length > 0) {
-        const nextHighlighted = new Set(this.highlightedUuids);
-        idsToUnhighlight.forEach((id) => nextHighlighted.delete(id));
-        this.highlightObjects(Array.from(nextHighlighted));
-      }
-    }
-    if (!obj) {
-      if (nodes && nodes.length > 0) {
-        const updateMappingsRecursive = (n) => {
-          const mappings = this.optimizedMapping.get(n.id);
-          if (mappings) {
-            mappings.forEach((m) => {
-              m.mesh.setVisibleAt(m.instanceId, visible);
-            });
-          }
-          if (n.children) n.children.forEach(updateMappingsRecursive);
-        };
-        updateMappingsRecursive(nodes[0]);
-      }
-      return;
-    }
-    obj.traverse((o) => {
-      if (o.name !== "Helpers" && o.name !== "Measure") {
-        if (o.isMesh && o.userData.isOptimized) {
-          o.visible = false;
-        } else {
-          o.visible = visible;
-        }
-        const mappings = this.optimizedMapping.get(o.uuid);
-        if (mappings) {
-          mappings.forEach((m) => {
-            m.mesh.setVisibleAt(m.instanceId, visible);
-          });
-        }
-      }
+    if (result.needsBoundsUpdate) this.updateSceneBounds();
+    if (result.needsExplodeRefresh) this.refreshExplodeState();
+    if (result.needsRender) this.markSceneDirty();
+  }
+  setObjectsVisibility(uuids, visible, options = {}) {
+    if (uuids.length === 0) return;
+    const changes = uuids.map((uuid) => ({
+      uuid,
+      visible,
+      showParents: options.showParents
+    }));
+    const recomputeBounds = !options.deferRefresh;
+    this.applyVisibilityBatch(changes, {
+      recomputeBounds,
+      refreshExplode: options.refreshExplode ?? false,
+      invalidateInteractables: !options.deferRefresh
     });
-    this.interactableListValid = false;
+  }
+  isolateObjects(uuids) {
+    applyIsolateObjects(
+      this.getVisibilityContext(),
+      uuids,
+      (uuid, visible, showParents) => {
+        const inner = applySetObjectVisibility(this.getVisibilityContext(), uuid, visible, showParents);
+        if (inner.nextHighlightedUuids) {
+          const highlightContext = this.getHighlightContext();
+          const highlightResult = applyHighlightObjects(highlightContext, inner.nextHighlightedUuids);
+          this.syncHighlightState(highlightContext.state);
+          if (highlightResult.needsRender) this.markSceneDirty();
+        }
+      }
+    );
+    this.markSceneDirty({
+      invalidateInteractables: true,
+      needsRender: false
+    });
     this.updateSceneBounds();
-    this.requestRender();
+    this.refreshExplodeState();
+    this.markSceneDirty();
+  }
+  setObjectVisibility(uuid, visible, showParents = true) {
+    const result = applySetObjectVisibility(this.getVisibilityContext(), uuid, visible, showParents);
+    if (result.nextHighlightedUuids) {
+      this.highlightObjects(result.nextHighlightedUuids);
+    }
+    this.markSceneDirty({
+      invalidateInteractables: true,
+      needsRender: false
+    });
+    if (result.needsBoundsUpdate) this.updateSceneBounds();
+    if (result.needsRender) this.markSceneDirty();
   }
   highlightObject(uuid) {
     this.highlightObjects(uuid ? [uuid] : []);
@@ -3230,7 +5467,7 @@ class SceneManager {
     });
     this.interactableListValid = false;
     this.updateSceneBounds();
-    this.requestRender();
+    this.markSceneDirty();
   }
   restoreExplodeSnapshot() {
     this.explodeObjectStates.forEach((state) => {
@@ -3243,7 +5480,7 @@ class SceneManager {
     });
     this.interactableListValid = false;
     this.updateSceneBounds();
-    this.requestRender();
+    this.markSceneDirty();
   }
   refreshExplodeState() {
     if (!this.explodeEnabled) return;
@@ -3287,29 +5524,111 @@ class SceneManager {
     this.explodeObjectStates.clear();
     this.explodeInstanceStates.clear();
   }
-  clearLocateFocus() {
-    this.locateObjectMaterialCache.forEach((material, uuid) => {
+  clearClashPairHighlight() {
+    this.clashPairObjectMaterialCache.forEach((material, uuid) => {
       const obj = this.contentGroup.getObjectByProperty("uuid", uuid);
       if (!obj || !obj.isMesh && !obj.isBatchedMesh) return;
       obj.material = material;
     });
-    this.locateObjectMaterialCache.clear();
-    this.locateMaterialCache.clear();
-    this.locateDimmedInstances.forEach(({ mesh, instanceId, originalColor }) => {
+    this.clashPairObjectMaterialCache.clear();
+    this.clashPairInstanceColorCache.forEach(({ mesh, instanceId, originalColor }) => {
       mesh.setColorAt(instanceId, new THREE.Color(originalColor));
       if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     });
-    this.locateDimmedInstances.clear();
-    this.locateResultSet.clear();
-    this.locateFocusUuid = null;
-    this.highlightObjects([]);
+    this.clashPairInstanceColorCache.clear();
+    this.clashPairUuids.clear();
   }
-  hasSameLocateResultSet(uuids) {
-    if (this.locateResultSet.size !== uuids.length) return false;
-    for (const uuid of uuids) {
-      if (!this.locateResultSet.has(uuid)) return false;
+  setClashPairHighlight(aUuid, bUuid, colorAHex = "#ff4d4f", colorBHex = "#1890ff") {
+    const normalizedA = String(aUuid || "").trim();
+    const normalizedB = String(bUuid || "").trim();
+    if (!normalizedA || !normalizedB) {
+      this.clearClashPairHighlight();
+      this.markSceneDirty();
+      return;
     }
-    return true;
+    this.clearLocateFocus();
+    this.clearClashPairHighlight();
+    const aTargets = this.expandLocateTargets([normalizedA]);
+    const bTargets = this.expandLocateTargets([normalizedB]);
+    const colorA = new THREE.Color(colorAHex);
+    const colorB = new THREE.Color(colorBHex);
+    this.contentGroup.traverse((child) => {
+      const mesh = child;
+      if (!mesh.isMesh || !mesh.material) return;
+      const side = aTargets.has(child.uuid) ? "A" : bTargets.has(child.uuid) ? "B" : null;
+      if (!side) return;
+      if (!this.clashPairObjectMaterialCache.has(child.uuid)) {
+        this.clashPairObjectMaterialCache.set(child.uuid, mesh.material);
+      }
+      const sourceMaterials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      const tintColor = side === "A" ? colorA : colorB;
+      const nextMaterials = sourceMaterials.map((material) => {
+        if (!material) return material;
+        const cloned = material.clone();
+        if ("transparent" in cloned) cloned.transparent = false;
+        if ("opacity" in cloned) cloned.opacity = 1;
+        if ("depthWrite" in cloned) cloned.depthWrite = true;
+        if ("color" in cloned && cloned.color) {
+          cloned.color.copy(cloned.color.clone().lerp(tintColor, 0.86));
+        }
+        if ("emissive" in cloned && cloned.emissive) {
+          cloned.emissive.copy(tintColor.clone().multiplyScalar(0.36));
+        }
+        cloned.needsUpdate = true;
+        return cloned;
+      });
+      mesh.material = Array.isArray(mesh.material) ? nextMaterials : nextMaterials[0];
+    });
+    const originalColorByInstance = /* @__PURE__ */ new Map();
+    this.optimizedMapping.forEach((mappings) => {
+      mappings.forEach((mapping) => {
+        originalColorByInstance.set(`${mapping.mesh.uuid}:${mapping.instanceId}`, mapping.originalColor);
+      });
+    });
+    this.contentGroup.traverse((child) => {
+      const batched = child;
+      if (!child.isBatchedMesh) return;
+      const batchIdToUuid = batched.userData?.batchIdToUuid;
+      if (!batchIdToUuid || batchIdToUuid.size === 0) return;
+      let touched = false;
+      batchIdToUuid.forEach((instanceUuid, instanceId) => {
+        const side = aTargets.has(instanceUuid) ? "A" : bTargets.has(instanceUuid) ? "B" : null;
+        if (!side) return;
+        const key = `${batched.uuid}:${instanceId}`;
+        if (!this.clashPairInstanceColorCache.has(key)) {
+          const mappedOriginalColor = originalColorByInstance.get(key);
+          if (typeof mappedOriginalColor === "number") {
+            this.clashPairInstanceColorCache.set(key, {
+              mesh: batched,
+              instanceId,
+              originalColor: mappedOriginalColor
+            });
+          } else {
+            const currentColor = new THREE.Color();
+            batched.getColorAt(instanceId, currentColor);
+            this.clashPairInstanceColorCache.set(key, {
+              mesh: batched,
+              instanceId,
+              originalColor: currentColor.getHex()
+            });
+          }
+        }
+        const origin = this.clashPairInstanceColorCache.get(key)?.originalColor;
+        if (typeof origin !== "number") return;
+        const tintColor = side === "A" ? colorA : colorB;
+        batched.setColorAt(instanceId, new THREE.Color(origin).lerp(tintColor, 0.88));
+        touched = true;
+      });
+      if (touched && batched.instanceColor) batched.instanceColor.needsUpdate = true;
+    });
+    this.clashPairUuids = /* @__PURE__ */ new Set([normalizedA, normalizedB]);
+    this.markSceneDirty();
+  }
+  clearLocateFocus() {
+    const context = this.getHighlightContext();
+    const result = applyClearLocateFocus(context);
+    this.syncHighlightState(context.state);
+    if (result.needsRender) this.markSceneDirty();
   }
   expandLocateTargets(ids) {
     const expanded = /* @__PURE__ */ new Set();
@@ -3331,144 +5650,17 @@ class SceneManager {
     }
     return expanded;
   }
-  updateLocateFocusHighlight(uuid) {
-    this.locateFocusUuid = uuid;
-    this.highlightObject(uuid);
-  }
   setLocateResultSet(uuids, focusUuid = null) {
-    const normalized = Array.from(new Set(uuids.filter(Boolean)));
-    if (normalized.length === 0) {
-      this.clearLocateFocus();
-      return;
-    }
-    const selectedSet = new Set(normalized);
-    const expandedTargets = this.expandLocateTargets(normalized);
-    const expandedList = Array.from(expandedTargets);
-    if (this.hasSameLocateResultSet(expandedList)) {
-      const nextFocus = focusUuid && this.locateResultSet.has(focusUuid) ? focusUuid : expandedList[0];
-      this.updateLocateFocusHighlight(nextFocus);
-      return;
-    }
-    this.clearLocateFocus();
-    const resultSet = expandedTargets;
-    this.locateResultSet = resultSet;
-    this.locateFocusUuid = focusUuid && resultSet.has(focusUuid) ? focusUuid : expandedList[0];
-    const focusKey = this.locateFocusUuid;
-    const dimmedColor = new THREE.Color("#b7bec9");
-    const accentColor = new THREE.Color(this.settings.highlightColor || "#ff9f1c");
-    this.contentGroup.traverse((child) => {
-      const mesh = child;
-      if (!mesh.isMesh || !mesh.material) return;
-      if (!this.locateObjectMaterialCache.has(child.uuid)) {
-        this.locateObjectMaterialCache.set(child.uuid, mesh.material);
-      }
-      const sourceMaterials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-      const isMatched = resultSet.has(child.uuid);
-      const isFocus = isMatched && focusKey !== null && child.uuid === focusKey;
-      const nextMaterials = sourceMaterials.map((material) => {
-        if (!material) return material;
-        const cloned = material.clone();
-        if ("transparent" in cloned) cloned.transparent = false;
-        if ("opacity" in cloned) cloned.opacity = 1;
-        if ("depthWrite" in cloned) cloned.depthWrite = true;
-        if ("color" in cloned && cloned.color) {
-          const baseColor = cloned.color.clone();
-          if (isMatched) {
-            const tint = isFocus ? 0.93 : 0.76;
-            cloned.color.copy(baseColor.lerp(accentColor, tint));
-          } else {
-            cloned.transparent = true;
-            cloned.opacity = 0.18;
-            cloned.depthWrite = false;
-            cloned.color.copy(baseColor.lerp(dimmedColor, 0.84));
-          }
-        }
-        if ("emissive" in cloned && cloned.emissive) {
-          if (isMatched) {
-            cloned.emissive.copy(accentColor.clone().multiplyScalar(isFocus ? 0.4 : 0.12));
-          } else {
-            cloned.emissive.set(0);
-          }
-        }
-        if ("roughness" in cloned && !isMatched) cloned.roughness = Math.max(0.9, cloned.roughness ?? 0.9);
-        if ("metalness" in cloned && !isMatched) cloned.metalness = Math.min(0.02, cloned.metalness ?? 0.02);
-        cloned.needsUpdate = true;
-        return cloned;
-      });
-      mesh.material = Array.isArray(mesh.material) ? nextMaterials : nextMaterials[0];
-    });
-    this.contentGroup.traverse((child) => {
-      const batched = child;
-      if (!batched.isBatchedMesh || !batched.material) return;
-      if (!this.locateObjectMaterialCache.has(child.uuid)) {
-        this.locateObjectMaterialCache.set(child.uuid, batched.material);
-      }
-      const owner = batched.userData?.originalUuid ? String(batched.userData.originalUuid) : "";
-      const batchIdToUuid = batched.userData?.batchIdToUuid;
-      let hasMatchedInstance = false;
-      let hasFocusInstance = false;
-      if (batchIdToUuid && batchIdToUuid.size > 0) {
-        for (const instanceUuid of batchIdToUuid.values()) {
-          if (!hasMatchedInstance && resultSet.has(instanceUuid)) hasMatchedInstance = true;
-          if (!hasFocusInstance && focusKey !== null && instanceUuid === focusKey) hasFocusInstance = true;
-          if (hasMatchedInstance && hasFocusInstance) break;
-        }
-      }
-      const ownerExplicitSelected = owner ? selectedSet.has(owner) : false;
-      const isMatched = resultSet.has(child.uuid) || hasMatchedInstance || ownerExplicitSelected;
-      const isFocus = this.locateFocusUuid !== null && this.locateFocusUuid === child.uuid || hasFocusInstance || ownerExplicitSelected && this.locateFocusUuid !== null && this.locateFocusUuid === owner;
-      const sourceMaterials = Array.isArray(batched.material) ? batched.material : [batched.material];
-      const nextMaterials = sourceMaterials.map((material) => {
-        if (!material) return material;
-        const cloned = material.clone();
-        if ("transparent" in cloned) cloned.transparent = false;
-        if ("opacity" in cloned) cloned.opacity = 1;
-        if ("depthWrite" in cloned) cloned.depthWrite = true;
-        if ("color" in cloned && cloned.color) {
-          const baseColor = cloned.color.clone();
-          if (isMatched) {
-            const tint = isFocus ? 0.92 : 0.7;
-            cloned.color.copy(baseColor.lerp(accentColor, tint));
-          } else {
-            cloned.transparent = true;
-            cloned.opacity = 0.16;
-            cloned.depthWrite = false;
-            cloned.color.copy(baseColor.lerp(dimmedColor, 0.86));
-          }
-        }
-        if ("emissive" in cloned && cloned.emissive) {
-          if (isMatched) {
-            cloned.emissive.copy(accentColor.clone().multiplyScalar(isFocus ? 0.36 : 0.12));
-          } else {
-            cloned.emissive.set(0);
-          }
-        }
-        if ("roughness" in cloned && !isMatched) cloned.roughness = Math.max(0.9, cloned.roughness ?? 0.9);
-        if ("metalness" in cloned && !isMatched) cloned.metalness = Math.min(0.02, cloned.metalness ?? 0.02);
-        cloned.needsUpdate = true;
-        return cloned;
-      });
-      batched.material = Array.isArray(batched.material) ? nextMaterials : nextMaterials[0];
-    });
-    this.optimizedMapping.forEach((mappings, originalUuid) => {
-      const isMatched = resultSet.has(originalUuid);
-      const isFocus = isMatched && focusKey !== null && originalUuid === focusKey;
-      mappings.forEach((mapping) => {
-        const key = `${mapping.mesh.uuid}:${mapping.instanceId}`;
-        this.locateDimmedInstances.set(key, {
-          mesh: mapping.mesh,
-          instanceId: mapping.instanceId,
-          originalColor: mapping.originalColor
-        });
-        const sourceColor = new THREE.Color(mapping.originalColor);
-        const tint = isFocus ? 0.93 : isMatched ? 0.76 : 0.82;
-        const target = isMatched ? accentColor : dimmedColor;
-        mapping.mesh.setColorAt(mapping.instanceId, sourceColor.lerp(target, tint));
-        if (mapping.mesh.instanceColor) mapping.mesh.instanceColor.needsUpdate = true;
-      });
-    });
-    this.updateLocateFocusHighlight(this.locateFocusUuid);
-    this.requestRender();
+    const context = this.getHighlightContext();
+    const result = applySetLocateResultSet(context, uuids, focusUuid);
+    this.syncHighlightState(context.state);
+    if (result.needsRender) this.markSceneDirty();
+  }
+  setLocateFocusContext(uuids, focusUuid = null, highlightColors) {
+    const context = this.getHighlightContext();
+    const result = applySetLocateResultSet(context, uuids, focusUuid, { highlightColors });
+    this.syncHighlightState(context.state);
+    if (result.needsRender) this.markSceneDirty();
   }
   setLocateFocus(uuid) {
     if (!uuid) {
@@ -3478,114 +5670,10 @@ class SceneManager {
     this.setLocateResultSet([uuid], uuid);
   }
   highlightObjects(uuids) {
-    const target = new Set(uuids.filter(Boolean));
-    const restoreOne = (id) => {
-      const mappings = this.optimizedMapping.get(id);
-      if (mappings) {
-        mappings.forEach((m) => {
-          m.mesh.setColorAt(m.instanceId, new THREE.Color(m.originalColor));
-          if (m.mesh.instanceColor) {
-            m.mesh.instanceColor.needsUpdate = true;
-          }
-        });
-      }
-    };
-    const applyOne = (id) => {
-      const mappings = this.optimizedMapping.get(id);
-      if (mappings) {
-        mappings.forEach((m) => {
-          const highlightColor = new THREE.Color(this.settings.highlightColor || "#ff9f1c");
-          m.mesh.setColorAt(m.instanceId, highlightColor);
-          if (m.mesh.instanceColor) {
-            m.mesh.instanceColor.needsUpdate = true;
-          }
-        });
-      }
-    };
-    const preserveLocateTint = this.locateResultSet.size > 0;
-    if (!preserveLocateTint) {
-      for (const prev of this.highlightedUuids) {
-        if (!target.has(prev)) restoreOne(prev);
-      }
-      for (const next of target) {
-        if (!this.highlightedUuids.has(next)) applyOne(next);
-      }
-    }
-    this.highlightedUuids = target;
-    this.selectionBox.visible = false;
-    this.highlightMesh.visible = false;
-    this.lastSelectedUuid = uuids.length > 0 ? uuids[uuids.length - 1] : null;
-    if (target.size === 0) {
-      this.requestRender();
-      return;
-    }
-    const union = new THREE.Box3();
-    const tmpBox = new THREE.Box3();
-    const tmpMat = new THREE.Matrix4();
-    const addObjectBounds = (id) => {
-      const mappings = this.optimizedMapping.get(id);
-      if (mappings && mappings.length > 0) {
-        const m = mappings[0];
-        if (m.geometry) {
-          if (!m.geometry.boundingBox) m.geometry.computeBoundingBox();
-          tmpBox.copy(m.geometry.boundingBox);
-          m.mesh.getMatrixAt(m.instanceId, tmpMat);
-          tmpMat.premultiply(m.mesh.matrixWorld);
-          tmpBox.applyMatrix4(tmpMat);
-          union.union(tmpBox);
-        }
-        return;
-      }
-      const obj = this.contentGroup.getObjectByProperty("uuid", id);
-      if (!obj) return;
-      obj.updateMatrixWorld(true);
-      if (obj.userData.boundingBox) {
-        tmpBox.copy(obj.userData.boundingBox).applyMatrix4(obj.matrixWorld);
-      } else {
-        tmpBox.setFromObject(obj);
-      }
-      union.union(tmpBox);
-    };
-    for (const id of target) addObjectBounds(id);
-    if (!union.isEmpty()) {
-      this.selectionBox.box.copy(union);
-      const locatingFocus = !!(this.locateFocusUuid && target.has(this.locateFocusUuid));
-      if (locatingFocus) {
-        const pad = Math.max(union.getSize(new THREE.Vector3()).length() * 0.048, 0.22);
-        this.selectionBox.box.expandByScalar(pad);
-      }
-      this.selectionBox.visible = locatingFocus || !!this.settings.highlightShowBox;
-    }
-    const focusId = this.lastSelectedUuid;
-    if (!focusId) {
-      this.requestRender();
-      return;
-    }
-    const focusMappings = this.optimizedMapping.get(focusId);
-    if (focusMappings && focusMappings.length > 0) {
-      this.highlightMesh.visible = false;
-      this.requestRender();
-      return;
-    }
-    const focusObj = this.contentGroup.getObjectByProperty("uuid", focusId);
-    if (!focusObj) {
-      this.requestRender();
-      return;
-    }
-    if (focusObj.isMesh) {
-      focusObj.updateMatrixWorld(true);
-      this.highlightMesh.geometry = focusObj.geometry;
-      const worldPos = new THREE.Vector3();
-      const worldQuat = new THREE.Quaternion();
-      const worldScale = new THREE.Vector3();
-      focusObj.matrixWorld.decompose(worldPos, worldQuat, worldScale);
-      worldScale.multiplyScalar(1.035);
-      this.highlightMesh.position.copy(worldPos);
-      this.highlightMesh.quaternion.copy(worldQuat);
-      this.highlightMesh.scale.copy(worldScale);
-      this.highlightMesh.visible = true;
-    }
-    this.requestRender();
+    const context = this.getHighlightContext();
+    const result = applyHighlightObjects(context, uuids);
+    this.syncHighlightState(context.state);
+    if (result.needsRender) this.markSceneDirty();
   }
   pick(clientX, clientY) {
     const intersect = this.getRayIntersects(clientX, clientY);
@@ -3593,78 +5681,9 @@ class SceneManager {
     return { object: intersect.object, intersect };
   }
   getRayIntersects(clientX, clientY) {
-    const rect = this.canvas.getBoundingClientRect();
-    this.mouse.x = (clientX - rect.left) / rect.width * 2 - 1;
-    this.mouse.y = -((clientY - rect.top) / rect.height) * 2 + 1;
-    this.raycaster.setFromCamera(this.mouse, this.camera);
-    if (!this.interactableListValid) {
-      this.interactableList = [];
-      if (this.chunks.length > 0) {
-        this.chunks.forEach((c) => {
-          if (c.loaded && c.mesh && c.mesh.visible) {
-            this.interactableList.push(c.mesh);
-          }
-        });
-      }
-      const traverseLimit = (o, depth) => {
-        if (depth > 10) return;
-        if (!o.visible) return;
-        if (o.userData.chunkId) return;
-        if (o.isMesh || o.isBatchedMesh) {
-          if (!o.userData.isOptimized) {
-            this.interactableList.push(o);
-          }
-        } else if (o.children.length > 0) {
-          for (const child of o.children) {
-            traverseLimit(child, depth + 1);
-          }
-        }
-      };
-      for (const child of this.contentGroup.children) {
-        if (child.userData.isOptimizedGroup) continue;
-        traverseLimit(child, 0);
-      }
-      this.interactableListValid = true;
-    }
-    const intersects = this.raycaster.intersectObjects(this.interactableList, false);
-    if (intersects.length > 0) {
-      const hit = intersects[0];
-      if (hit.object.isBatchedMesh) {
-        const bm = hit.object;
-        const batchId = hit.batchId !== void 0 ? hit.batchId : hit.instanceId;
-        if (batchId !== void 0) {
-          const originalUuid = bm.userData.batchIdToUuid?.get(batchId);
-          if (originalUuid) {
-            const originalObj = this.contentGroup.getObjectByProperty("uuid", originalUuid);
-            if (originalObj) {
-              hit.object = originalObj;
-            } else {
-              const nodes = this.nodeMap.get(originalUuid);
-              const node = nodes?.[0];
-              const proxy = new THREE.Object3D();
-              proxy.uuid = originalUuid;
-              if (node) {
-                proxy.name = node.name;
-                proxy.type = node.type;
-                proxy.isMesh = node.type === "Mesh";
-              }
-              proxy.getWorldPosition = (v) => {
-                const mat2 = new THREE.Matrix4();
-                bm.getMatrixAt(batchId, mat2);
-                mat2.premultiply(bm.matrixWorld);
-                return v.setFromMatrixPosition(mat2);
-              };
-              const mat = new THREE.Matrix4();
-              bm.getMatrixAt(batchId, mat);
-              proxy.position.setFromMatrixPosition(mat);
-              hit.object = proxy;
-            }
-          }
-        }
-      }
-      return hit;
-    }
-    return null;
+    const result = applyGetRayIntersects(this.getPickingContext(), clientX, clientY);
+    this.syncPickingState(result.state);
+    return result.intersect;
   }
   computeTotalBounds(onlyVisible = false, forceRecompute = false) {
     if (!onlyVisible && !forceRecompute && !this.precomputedBounds.isEmpty()) {
@@ -3789,6 +5808,22 @@ class SceneManager {
   fitViewToObject(uuid) {
     const box = new THREE.Box3();
     this.unionNodeBounds(uuid, box);
+    if (!box.isEmpty()) this.fitBox(box, false, 1.14);
+  }
+  getBoundsForObject(uuid) {
+    if (!uuid) return null;
+    const box = new THREE.Box3();
+    this.unionNodeBounds(uuid, box);
+    return box.isEmpty() ? null : box;
+  }
+  collectBoundsForUuids(uuids) {
+    const box = new THREE.Box3();
+    const unique = Array.from(new Set((uuids || []).filter(Boolean)));
+    unique.forEach((uuid) => this.unionNodeBounds(uuid, box));
+    return box;
+  }
+  fitViewToObjects(uuids) {
+    const box = this.collectBoundsForUuids(uuids);
     if (!box.isEmpty()) this.fitBox(box, false, 1.14);
   }
   fitBox(box, updateCameraPosition = true, paddingOverride) {
@@ -4035,7 +6070,7 @@ class SceneManager {
     if (state.bottom !== void 0) this.camera.bottom = state.bottom;
     this.camera.updateProjectionMatrix();
     this.controls.update();
-    this.requestRender();
+    this.markSceneDirty();
   }
   // --- 测量定位逻辑 ---
   locateMeasurement(id) {
@@ -4062,7 +6097,7 @@ class SceneManager {
     this.camera.zoom = Math.min(targetZoom, 100);
     this.camera.updateProjectionMatrix();
     this.controls.update();
-    this.requestRender();
+    this.markSceneDirty();
   }
   // --- 测量逻辑 ---
   startMeasurement(type) {
@@ -4072,501 +6107,98 @@ class SceneManager {
     this.clearMeasurementPreview();
   }
   addMeasurePoint(point, modelUuid) {
-    if (this.measureType === "none") return null;
-    if (modelUuid) {
-      this.currentMeasureModelUuid = modelUuid;
-    }
-    this.currentMeasurePoints.push(point);
-    this.addMarker(point, this.measureGroup);
-    if (this.measureType === "dist" && this.currentMeasurePoints.length === 2) {
-      return this.finalizeMeasurement();
-    } else if (this.measureType === "angle" && this.currentMeasurePoints.length === 3) {
-      return this.finalizeMeasurement();
-    } else if (this.measureType === "coord") {
-      return this.finalizeMeasurement();
-    }
-    this.updateMeasurePreview();
-    this.requestRender();
-    return null;
+    const context = this.getMeasurementContext();
+    const result = applyAddMeasurePoint(context, point, modelUuid);
+    this.syncMeasurementState(result.state);
+    if (result.needsRender) this.markSceneDirty();
+    return result.completed ?? null;
   }
   updateMeasurePreview(hoverPoint) {
-    if (this.previewLine) {
-      this.measureGroup.remove(this.previewLine);
-      this.previewLine = null;
-    }
-    if (this.previewPolygon) {
-      this.measureGroup.remove(this.previewPolygon);
-      this.previewPolygon = null;
-    }
-    const points = [...this.currentMeasurePoints];
-    if (hoverPoint) points.push(hoverPoint);
-    if (points.length < 2) return;
-    const geometry = new THREE.BufferGeometry().setFromPoints(points);
-    const material = new THREE.LineDashedMaterial({
-      color: 16711680,
-      dashSize: 5,
-      gapSize: 2,
-      depthTest: false
-    });
-    this.previewLine = new THREE.Line(geometry, material);
-    this.previewLine.computeLineDistances();
-    this.previewLine.renderOrder = 998;
-    this.measureGroup.add(this.previewLine);
+    const context = this.getMeasurementContext();
+    const result = applyUpdateMeasurePreview(context, hoverPoint);
+    this.syncMeasurementState(result.state);
   }
   updateMeasureHover(clientX, clientY) {
-    if (this.measureType === "none") {
-      this.tempMarker.visible = false;
-      return;
-    }
-    const intersect = this.getRayIntersects(clientX, clientY);
-    if (intersect) {
-      const p = intersect.point;
-      const attr = this.tempMarker.geometry.attributes.position;
-      attr.setXYZ(0, p.x, p.y, p.z);
-      attr.needsUpdate = true;
-      this.tempMarker.visible = true;
-      if (this.currentMeasurePoints.length > 0) {
-        this.updateMeasurePreview(p);
-      }
-    } else {
-      this.tempMarker.visible = false;
-      if (this.previewLine) this.previewLine.visible = false;
-    }
-    this.requestRender();
+    const context = this.getMeasurementContext();
+    const result = applyUpdateMeasureHover(context, clientX, clientY);
+    this.syncMeasurementState(result.state);
+    if (result.needsRender) this.markSceneDirty();
   }
   finalizeMeasurement() {
-    const id = `measure_${Date.now()}`;
-    const group = new THREE.Group();
-    group.name = id;
-    this.currentMeasurePoints.forEach((p) => this.addMarker(p, group));
-    let valStr = "";
-    let displayVal = "";
-    let typeStr = this.measureType;
-    let labelPos = new THREE.Vector3();
-    if (this.measureType === "dist") {
-      const p1 = this.currentMeasurePoints[0];
-      const p2 = this.currentMeasurePoints[1];
-      const dist = p1.distanceTo(p2);
-      const dx = Math.abs(p2.x - p1.x);
-      const dy = Math.abs(p2.y - p1.y);
-      const dz = Math.abs(p2.z - p1.z);
-      displayVal = dist.toFixed(3);
-      valStr = `${displayVal} (Δx:${dx.toFixed(2)}, Δy:${dy.toFixed(2)}, Δz:${dz.toFixed(2)})`;
-      this.addLine(this.currentMeasurePoints, group);
-      labelPos.copy(p1).add(p2).multiplyScalar(0.5);
-    } else if (this.measureType === "angle") {
-      const p1 = this.currentMeasurePoints[0];
-      const center = this.currentMeasurePoints[1];
-      const p2 = this.currentMeasurePoints[2];
-      const v1 = p1.clone().sub(center).normalize();
-      const v2 = p2.clone().sub(center).normalize();
-      const angle = v1.angleTo(v2) * (180 / Math.PI);
-      displayVal = angle.toFixed(2) + "°";
-      valStr = displayVal;
-      this.addLine(this.currentMeasurePoints, group);
-      labelPos.copy(center);
-    } else {
-      const p = this.currentMeasurePoints[0];
-      displayVal = `(${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)})`;
-      valStr = displayVal;
-      labelPos.copy(p);
-    }
-    const label = this.createLabel(displayVal, labelPos);
-    group.add(label);
-    this.measureGroup.add(group);
-    this.measureRecords.set(id, {
-      id,
-      type: typeStr,
-      val: valStr,
-      group,
-      modelUuid: this.currentMeasureModelUuid || void 0
-    });
-    this.currentMeasurePoints = [];
-    this.currentMeasureModelUuid = null;
-    this.clearMeasurementPreview();
-    if (this.onMeasureUpdate) {
-      this.onMeasureUpdate(Array.from(this.measureRecords.values()));
-    }
-    this.requestRender();
-    return { id, type: typeStr, val: valStr };
-  }
-  createLabel(text, position) {
-    const canvas = document.createElement("canvas");
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return new THREE.Sprite();
-    const fontSize = 48;
-    const padding = 24;
-    ctx.font = `Bold ${fontSize}px "Segoe UI", Arial, sans-serif`;
-    const textWidth = ctx.measureText(text).width;
-    canvas.width = textWidth + padding * 2;
-    canvas.height = fontSize + padding;
-    ctx.shadowColor = "rgba(0, 0, 0, 0.5)";
-    ctx.shadowBlur = 10;
-    ctx.fillStyle = "rgba(30, 30, 30, 0.9)";
-    const radius = 8;
-    if (ctx.roundRect) {
-      ctx.roundRect(5, 5, canvas.width - 10, canvas.height - 10, radius);
-    } else {
-      ctx.rect(5, 5, canvas.width - 10, canvas.height - 10);
-    }
-    ctx.fill();
-    ctx.shadowBlur = 0;
-    ctx.strokeStyle = "#ff0000";
-    ctx.lineWidth = 2;
-    ctx.stroke();
-    ctx.font = `Bold ${fontSize}px "Segoe UI", Arial, sans-serif`;
-    ctx.fillStyle = "#ffffff";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText(text, canvas.width / 2, canvas.height / 2);
-    const texture = new THREE.CanvasTexture(canvas);
-    texture.minFilter = THREE.LinearFilter;
-    texture.magFilter = THREE.LinearFilter;
-    const spriteMaterial = new THREE.SpriteMaterial({
-      map: texture,
-      depthTest: false,
-      sizeAttenuation: false
-      // 关键：使文字不受相机缩放影响
-    });
-    const sprite = new THREE.Sprite(spriteMaterial);
-    sprite.position.copy(position);
-    const baseScale = 0.5;
-    sprite.scale.set(baseScale * (canvas.width / canvas.height), baseScale, 1);
-    sprite.renderOrder = 1001;
-    sprite.userData = { type: "label" };
-    return sprite;
+    const context = this.getMeasurementContext();
+    const result = applyFinalizeMeasurement(context);
+    this.syncMeasurementState(result.state);
+    if (result.needsRender) this.markSceneDirty();
+    return result.completed ?? null;
   }
   highlightMeasurement(id) {
-    this.measureRecords.forEach((record, rid) => {
-      const isHighlighted = rid === id;
-      const color = isHighlighted ? 65280 : 16711680;
-      record.group.traverse((child) => {
-        if (child instanceof THREE.Line || child instanceof THREE.LineLoop) {
-          child.material.color.set(color);
-        } else if (child instanceof THREE.Points) {
-          child.material.color.set(color);
-        } else if (child instanceof THREE.Sprite) {
-          child.material.color.set(isHighlighted ? 65280 : 16777215);
-        } else if (child instanceof THREE.Mesh && child.material instanceof THREE.MeshBasicMaterial) {
-          child.material.color.set(color);
-        } else if (child instanceof THREE.Box3Helper) {
-          child.material.color.set(color);
-        }
-      });
-    });
+    const result = applyHighlightMeasurement(this.getMeasurementContext(), id);
+    this.syncMeasurementState(result.state);
+    this.markSceneDirty();
   }
   pickMeasurement(clientX, clientY) {
-    const rect = this.canvas.getBoundingClientRect();
-    this.mouse.x = (clientX - rect.left) / rect.width * 2 - 1;
-    this.mouse.y = -((clientY - rect.top) / rect.height) * 2 + 1;
-    this.raycaster.setFromCamera(this.mouse, this.camera);
-    const oldThreshold = this.raycaster.params.Line?.threshold || 0;
-    if (this.raycaster.params.Line) this.raycaster.params.Line.threshold = 5;
-    const intersects = this.raycaster.intersectObjects(this.measureGroup.children, true);
-    if (this.raycaster.params.Line) this.raycaster.params.Line.threshold = oldThreshold;
-    if (intersects.length > 0) {
-      let obj = intersects[0].object;
-      while (obj.parent && !obj.name.startsWith("measure_")) {
-        obj = obj.parent;
-      }
-      if (obj.name.startsWith("measure_")) {
-        return obj.name;
-      }
-    }
-    return null;
-  }
-  addMarker(point, parent) {
-    const markerGeo = new THREE.BufferGeometry().setAttribute("position", new THREE.Float32BufferAttribute([point.x, point.y, point.z], 3));
-    const markerMat = new THREE.PointsMaterial({ color: 16711680, size: 8, map: this.dotTexture, transparent: true, alphaTest: 0.5, depthTest: false });
-    const marker = new THREE.Points(markerGeo, markerMat);
-    marker.renderOrder = 999;
-    parent.add(marker);
-  }
-  addLine(points, parent) {
-    const geometry = new THREE.BufferGeometry().setFromPoints(points);
-    const material = new THREE.LineBasicMaterial({ color: 16711680, depthTest: false, linewidth: 2 });
-    const line = new THREE.Line(geometry, material);
-    line.renderOrder = 998;
-    parent.add(line);
-  }
-  addLineLoop(points, parent) {
-    const geometry = new THREE.BufferGeometry().setFromPoints(points);
-    const material = new THREE.LineBasicMaterial({ color: 16711680, depthTest: false, linewidth: 2 });
-    const line = new THREE.LineLoop(geometry, material);
-    line.renderOrder = 998;
-    parent.add(line);
-  }
-  addPolygonFill(points, parent) {
-    if (points.length < 3) return;
-    const shape = new THREE.Shape();
-    const v1 = new THREE.Vector3().subVectors(points[1], points[0]);
-    const v2 = new THREE.Vector3().subVectors(points[2], points[0]);
-    const normal = new THREE.Vector3().crossVectors(v1, v2).normalize();
-    const tangent = v1.normalize();
-    const bitangent = new THREE.Vector3().crossVectors(normal, tangent).normalize();
-    const origin = points[0];
-    const toLocal = (p) => {
-      const d = new THREE.Vector3().subVectors(p, origin);
-      return [d.dot(tangent), d.dot(bitangent)];
-    };
-    shape.moveTo(...toLocal(points[0]));
-    for (let i = 1; i < points.length; i++) {
-      shape.lineTo(...toLocal(points[i]));
-    }
-    shape.closePath();
-    const geometry = new THREE.ShapeGeometry(shape);
-    const material = new THREE.MeshBasicMaterial({
-      color: 16711680,
-      transparent: true,
-      opacity: 0.15,
-      depthTest: false,
-      side: THREE.DoubleSide
-    });
-    const mesh = new THREE.Mesh(geometry, material);
-    mesh.renderOrder = 997;
-    const matrix = new THREE.Matrix4();
-    matrix.makeBasis(tangent, bitangent, normal);
-    matrix.setPosition(origin);
-    mesh.matrixAutoUpdate = false;
-    mesh.matrix.copy(matrix);
-    mesh.applyMatrix4(matrix);
-    parent.add(mesh);
-  }
-  computeGeometryVolume(geometry, mesh, instanceId) {
-    const pos = geometry.attributes.position;
-    const index = geometry.index;
-    let volume = 0;
-    const vA = new THREE.Vector3();
-    const vB = new THREE.Vector3();
-    const vC = new THREE.Vector3();
-    const tmpMat = new THREE.Matrix4();
-    if (instanceId !== void 0 && mesh.isInstancedMesh) {
-      mesh.getMatrixAt(instanceId, tmpMat);
-    } else {
-      tmpMat.copy(mesh.matrixWorld);
-    }
-    const applyMatrix = (v) => {
-      v.applyMatrix4(tmpMat);
-    };
-    if (index) {
-      for (let i = 0; i < index.count; i += 3) {
-        vA.fromBufferAttribute(pos, index.getX(i));
-        vB.fromBufferAttribute(pos, index.getX(i + 1));
-        vC.fromBufferAttribute(pos, index.getX(i + 2));
-        applyMatrix(vA);
-        applyMatrix(vB);
-        applyMatrix(vC);
-        volume += vA.dot(new THREE.Vector3().crossVectors(vB, vC)) / 6;
-      }
-    } else {
-      for (let i = 0; i < pos.count; i += 3) {
-        vA.fromBufferAttribute(pos, i);
-        vB.fromBufferAttribute(pos, i + 1);
-        vC.fromBufferAttribute(pos, i + 2);
-        applyMatrix(vA);
-        applyMatrix(vB);
-        applyMatrix(vC);
-        volume += vA.dot(new THREE.Vector3().crossVectors(vB, vC)) / 6;
-      }
-    }
-    return Math.abs(volume);
-  }
-  computeGeometryArea(geometry, mesh, instanceId) {
-    const pos = geometry.attributes.position;
-    const index = geometry.index;
-    let area = 0;
-    const vA = new THREE.Vector3();
-    const vB = new THREE.Vector3();
-    const vC = new THREE.Vector3();
-    const tmpMat = new THREE.Matrix4();
-    if (instanceId !== void 0 && mesh.isInstancedMesh) {
-      mesh.getMatrixAt(instanceId, tmpMat);
-    } else {
-      tmpMat.copy(mesh.matrixWorld);
-    }
-    const applyMatrix = (v) => {
-      v.applyMatrix4(tmpMat);
-    };
-    if (index) {
-      for (let i = 0; i < index.count; i += 3) {
-        vA.fromBufferAttribute(pos, index.getX(i));
-        vB.fromBufferAttribute(pos, index.getX(i + 1));
-        vC.fromBufferAttribute(pos, index.getX(i + 2));
-        applyMatrix(vA);
-        applyMatrix(vB);
-        applyMatrix(vC);
-        const ab = new THREE.Vector3().subVectors(vB, vA);
-        const ac = new THREE.Vector3().subVectors(vC, vA);
-        area += ab.cross(ac).length() / 2;
-      }
-    } else {
-      for (let i = 0; i < pos.count; i += 3) {
-        vA.fromBufferAttribute(pos, i);
-        vB.fromBufferAttribute(pos, i + 1);
-        vC.fromBufferAttribute(pos, i + 2);
-        applyMatrix(vA);
-        applyMatrix(vB);
-        applyMatrix(vC);
-        const ab = new THREE.Vector3().subVectors(vB, vA);
-        const ac = new THREE.Vector3().subVectors(vC, vA);
-        area += ab.cross(ac).length() / 2;
-      }
-    }
-    return area;
+    return applyPickMeasurement(this.getMeasurementContext(), clientX, clientY);
   }
   /**
    * 获取对象的面积和体积
    */
   getObjectGeometryData(uuid) {
-    let area = 0;
-    let volume = 0;
-    const mappings = this.optimizedMapping.get(uuid);
-    if (mappings && mappings.length > 0) {
-      mappings.forEach((m) => {
-        if (m.geometry) {
-          area += this.computeGeometryArea(m.geometry, m.mesh, m.instanceId);
-          volume += this.computeGeometryVolume(m.geometry, m.mesh, m.instanceId);
-        }
-      });
-    } else {
-      const obj = this.contentGroup.getObjectByProperty("uuid", uuid);
-      if (obj && obj.isMesh) {
-        const mesh = obj;
-        if (mesh.geometry) {
-          area = this.computeGeometryArea(mesh.geometry, mesh, void 0);
-          volume = this.computeGeometryVolume(mesh.geometry, mesh, void 0);
-        }
-      }
-    }
-    return { area, volume };
+    return getObjectGeometryDataFromScene({
+      uuid,
+      optimizedMapping: this.optimizedMapping,
+      contentGroup: this.contentGroup
+    });
   }
   // ========== 框选方法 ==========
   /**
    * 开始框选
    */
   startBoxSelect(clientX, clientY) {
-    this.boxSelectState.active = true;
-    this.boxSelectState.startX = clientX;
-    this.boxSelectState.startY = clientY;
-    this.boxSelectState.endX = clientX;
-    this.boxSelectState.endY = clientY;
-    this.updateBoxSelectRect();
+    const result = applyStartBoxSelect(this.boxSelectState, clientX, clientY);
+    this.syncBoxSelectState(result.state);
   }
   /**
    * 更新框选范围
    */
   updateBoxSelect(clientX, clientY) {
-    if (!this.boxSelectState.active) return;
-    this.boxSelectState.endX = clientX;
-    this.boxSelectState.endY = clientY;
-    this.updateBoxSelectRect();
+    const result = applyUpdateBoxSelect(this.boxSelectState, clientX, clientY);
+    this.syncBoxSelectState(result.state);
   }
   /**
    * 完成框选，返回选中的对象 UUID 列表
    */
   endBoxSelect() {
-    if (!this.boxSelectState.active) return [];
-    this.boxSelectState.active = false;
-    this.removeBoxSelectRect();
-    const { startX, startY, endX, endY } = this.boxSelectState;
-    const dx = Math.abs(endX - startX);
-    const dy = Math.abs(endY - startY);
-    if (dx < 5 || dy < 5) return [];
-    const rect = this.canvas.getBoundingClientRect();
-    const x1 = (Math.min(startX, endX) - rect.left) / rect.width * 2 - 1;
-    const y1 = -(Math.max(startY, endY) - rect.top) / rect.height * 2 + 1;
-    const x2 = (Math.max(startX, endX) - rect.left) / rect.width * 2 - 1;
-    const y2 = -(Math.min(startY, endY) - rect.top) / rect.height * 2 + 1;
-    return this.selectByScreenRect(x1, y1, x2, y2);
+    const result = applyEndBoxSelect(
+      this.boxSelectState,
+      this.canvas,
+      (x1, y1, x2, y2) => this.selectByScreenRect(x1, y1, x2, y2)
+    );
+    this.syncBoxSelectState(result.state);
+    return result.selected;
   }
   /**
    * 取消框选
    */
   cancelBoxSelect() {
-    this.boxSelectState.active = false;
-    this.removeBoxSelectRect();
-  }
-  updateBoxSelectRect() {
-    const state = this.boxSelectState;
-    if (!state.rectElement) {
-      state.rectElement = document.createElement("div");
-      state.rectElement.style.cssText = `
-                position: fixed; border: 1px dashed #00aaff;
-                background: rgba(0, 170, 255, 0.08); pointer-events: none; z-index: 1000;
-            `;
-      document.body.appendChild(state.rectElement);
-    }
-    const { startX, startY, endX, endY } = state;
-    state.rectElement.style.left = Math.min(startX, endX) + "px";
-    state.rectElement.style.top = Math.min(startY, endY) + "px";
-    state.rectElement.style.width = Math.abs(endX - startX) + "px";
-    state.rectElement.style.height = Math.abs(endY - startY) + "px";
-  }
-  removeBoxSelectRect() {
-    if (this.boxSelectState.rectElement) {
-      this.boxSelectState.rectElement.remove();
-      this.boxSelectState.rectElement = null;
-    }
+    const result = applyCancelBoxSelect(this.boxSelectState);
+    this.syncBoxSelectState(result.state);
   }
   /**
    * 通过屏幕矩形选择对象
    */
   selectByScreenRect(x1, y1, x2, y2) {
-    if (!this.interactableListValid) {
-      this.getRayIntersects(0, 0);
-    }
-    const minX = Math.min(x1, x2);
-    const maxX = Math.max(x1, x2);
-    const minY = Math.min(y1, y2);
-    const maxY = Math.max(y1, y2);
-    const originalMatrix = this.camera.projectionMatrix.clone();
-    const newMatrix = new THREE.Matrix4();
-    const selectWidth = maxX - minX;
-    const selectHeight = maxY - minY;
-    const scaleX = selectWidth / 2;
-    const scaleY = selectHeight / 2;
-    const centerX = (maxX + minX) / 2;
-    const centerY = (maxY + minY) / 2;
-    const translateMatrix = new THREE.Matrix4().makeTranslation(-centerX, -centerY, 0);
-    const scaleMatrix = new THREE.Matrix4().makeScale(1 / scaleX, 1 / scaleY, 1);
-    newMatrix.multiplyMatrices(scaleMatrix, translateMatrix);
-    const modifiedProjectionMatrix = newMatrix.multiply(originalMatrix);
-    const frustum = new THREE.Frustum();
-    const viewMatrix = this.camera.matrixWorldInverse;
-    const projViewMatrix = modifiedProjectionMatrix.clone().multiply(viewMatrix);
-    frustum.setFromProjectionMatrix(projViewMatrix);
-    const selected = [];
-    const box = new THREE.Box3();
-    const tmpMat = new THREE.Matrix4();
-    for (const obj of this.interactableList) {
-      if (obj.isBatchedMesh) {
-        const bm = obj;
-        const batchIdToUuid = bm.userData.batchIdToUuid;
-        const batchIdToGeometry = bm.userData.batchIdToGeometry;
-        if (!batchIdToUuid || !batchIdToGeometry) continue;
-        for (const [batchId, uuid] of batchIdToUuid) {
-          try {
-            const geometry = batchIdToGeometry.get(batchId);
-            if (!geometry) continue;
-            bm.getMatrixAt(batchId, tmpMat);
-            tmpMat.premultiply(bm.matrixWorld);
-            const geoBox = new THREE.Box3();
-            if (!geometry.boundingBox) geometry.computeBoundingBox();
-            geoBox.copy(geometry.boundingBox).applyMatrix4(tmpMat);
-            if (frustum.intersectsBox(geoBox)) {
-              selected.push(uuid);
-            }
-          } catch (e) {
-          }
-        }
-        continue;
-      }
-      box.setFromObject(obj);
-      if (frustum.intersectsBox(box)) {
-        selected.push(obj.uuid);
-      }
-    }
-    return selected;
+    const pickingState = ensureInteractableList(this.getPickingContext());
+    this.syncPickingState(pickingState);
+    return selectInteractablesByScreenRect(
+      {
+        camera: this.camera,
+        interactableList: this.interactableList
+      },
+      x1,
+      y1,
+      x2,
+      y2
+    );
   }
   removeMeasurement(id) {
     if (this.measureRecords.has(id)) {
@@ -4577,6 +6209,7 @@ class SceneManager {
         if (this.onMeasureUpdate) {
           this.onMeasureUpdate(Array.from(this.measureRecords.values()));
         }
+        this.markSceneDirty();
       }
     }
   }
@@ -4589,280 +6222,104 @@ class SceneManager {
     if (this.onMeasureUpdate) {
       this.onMeasureUpdate([]);
     }
-    this.requestRender();
+    this.markSceneDirty();
   }
   clearMeasurementPreview() {
-    this.currentMeasurePoints = [];
-    if (this.previewLine) {
-      this.measureGroup.remove(this.previewLine);
-      this.previewLine = null;
-    }
-    if (this.previewPolygon) {
-      this.measureGroup.remove(this.previewPolygon);
-      this.previewPolygon = null;
-    }
-    this.tempMarker.visible = false;
-    for (let i = this.measureGroup.children.length - 1; i >= 0; i--) {
-      const child = this.measureGroup.children[i];
-      if (!child.name.startsWith("measure_") && child !== this.previewLine && child !== this.previewPolygon) {
-        this.measureGroup.remove(child);
-      }
-    }
+    const context = this.getMeasurementContext();
+    const result = applyClearMeasurementPreview(context);
+    this.syncMeasurementState(result.state);
+    this.markSceneDirty();
   }
   // --- 剖切逻辑 ---
   setupClipping() {
-    this.clippingPlanes = [
-      new THREE.Plane(new THREE.Vector3(1, 0, 0), 0),
-      new THREE.Plane(new THREE.Vector3(-1, 0, 0), 0),
-      new THREE.Plane(new THREE.Vector3(0, 1, 0), 0),
-      new THREE.Plane(new THREE.Vector3(0, -1, 0), 0),
-      new THREE.Plane(new THREE.Vector3(0, 0, 1), 0),
-      new THREE.Plane(new THREE.Vector3(0, 0, -1), 0)
-    ];
-    this.renderer.clippingPlanes = [];
-    const colors = [16711680, 16711680, 65280, 65280, 255, 255];
-    this.clipPlaneHelpers = [];
-    this.clipHelpersGroup.clear();
-    for (let i = 0; i < 6; i++) {
-      const geom = new THREE.PlaneGeometry(1, 1);
-      const mat = new THREE.MeshBasicMaterial({
-        color: colors[i],
-        transparent: true,
-        opacity: this.clipHelperOpacity,
-        side: THREE.DoubleSide,
-        depthWrite: false,
-        polygonOffset: true,
-        polygonOffsetFactor: -4,
-        polygonOffsetUnits: -4,
-        clippingPlanes: []
-      });
-      const mesh = new THREE.Mesh(geom, mat);
-      mesh.visible = false;
-      mesh.renderOrder = 9999;
-      const edges = new THREE.EdgesGeometry(geom);
-      const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({
-        color: colors[i],
-        transparent: true,
-        opacity: Math.min(1, this.clipHelperOpacity + 0.08),
-        depthWrite: false
-      }));
-      line.visible = false;
-      line.renderOrder = 1e4;
-      mesh.add(line);
-      this.clipPlaneHelpers.push(mesh);
-      this.clipHelpersGroup.add(mesh);
-    }
+    const result = applySetupClipping(this.getClippingContext());
+    this.syncClippingState(result.state);
   }
   setClipHelperOptions(options) {
-    if (typeof options.visible === "boolean") {
-      this.clipHelperVisible = options.visible;
-    }
-    if (typeof options.opacity === "number" && !Number.isNaN(options.opacity)) {
-      this.clipHelperOpacity = THREE.MathUtils.clamp(options.opacity, 0.05, 0.35);
-    }
-    this.clipPlaneHelpers.forEach((helper) => {
-      const surfaceMat = helper.material;
-      surfaceMat.opacity = this.clipHelperOpacity;
-      surfaceMat.needsUpdate = true;
-      helper.children.forEach((child) => {
-        const lineMat = child.material;
-        if (lineMat) {
-          lineMat.opacity = Math.min(1, this.clipHelperOpacity + 0.08);
-          lineMat.needsUpdate = true;
-        }
-      });
-    });
-    if (!this.clipHelperVisible || this.renderer.clippingPlanes.length === 0) {
-      this.clipPlaneHelpers.forEach((helper) => {
-        helper.visible = false;
-      });
-    }
+    const result = applySetClipHelperOptions(this.getClippingContext(), options);
+    this.syncClippingState(result.state);
+    this.markSceneDirty();
   }
   setClippingEnabled(enabled) {
     this.renderer.clippingPlanes = enabled ? this.clippingPlanes : [];
     if (!enabled) {
       this.clipPlaneHelpers.forEach((h) => h.visible = false);
     }
-    this.requestRender();
+    this.markSceneDirty();
   }
   updateClippingPlanes(bounds, values, active) {
-    if (bounds.isEmpty()) return;
-    const { min, max } = bounds;
-    const size = max.clone().sub(min);
-    const center = bounds.getCenter(new THREE.Vector3());
-    const diagonal = size.length();
-    const helperSize = diagonal > 0 ? diagonal * 1.2 : 1e3;
-    const xMin = min.x + values.x[0] / 100 * size.x;
-    const xMax = min.x + values.x[1] / 100 * size.x;
-    const yMin = min.y + values.y[0] / 100 * size.y;
-    const yMax = min.y + values.y[1] / 100 * size.y;
-    const zMin = min.z + values.z[0] / 100 * size.z;
-    const zMax = min.z + values.z[1] / 100 * size.z;
-    const isEnabled = this.renderer.clippingPlanes.length > 0;
-    if (active.x) {
-      this.clippingPlanes[0].constant = -xMin;
-      this.clippingPlanes[1].constant = xMax;
-      this.updatePlaneHelper(0, new THREE.Vector3(1, 0, 0), xMin, center, helperSize, isEnabled);
-      this.updatePlaneHelper(1, new THREE.Vector3(-1, 0, 0), xMax, center, helperSize, isEnabled);
-    } else {
-      this.clippingPlanes[0].constant = Infinity;
-      this.clippingPlanes[1].constant = Infinity;
-      this.clipPlaneHelpers[0].visible = false;
-      this.clipPlaneHelpers[1].visible = false;
-    }
-    if (active.y) {
-      this.clippingPlanes[2].constant = -yMin;
-      this.clippingPlanes[3].constant = yMax;
-      this.updatePlaneHelper(2, new THREE.Vector3(0, 1, 0), yMin, center, helperSize, isEnabled);
-      this.updatePlaneHelper(3, new THREE.Vector3(0, -1, 0), yMax, center, helperSize, isEnabled);
-    } else {
-      this.clippingPlanes[2].constant = Infinity;
-      this.clippingPlanes[3].constant = Infinity;
-      this.clipPlaneHelpers[2].visible = false;
-      this.clipPlaneHelpers[3].visible = false;
-    }
-    if (active.z) {
-      this.clippingPlanes[4].constant = -zMin;
-      this.clippingPlanes[5].constant = zMax;
-      this.updatePlaneHelper(4, new THREE.Vector3(0, 0, 1), zMin, center, helperSize, isEnabled);
-      this.updatePlaneHelper(5, new THREE.Vector3(0, 0, -1), zMax, center, helperSize, isEnabled);
-    } else {
-      this.clippingPlanes[4].constant = Infinity;
-      this.clippingPlanes[5].constant = Infinity;
-      this.clipPlaneHelpers[4].visible = false;
-      this.clipPlaneHelpers[5].visible = false;
-    }
-    this.requestRender();
-  }
-  updatePlaneHelper(idx, normal, dist, center, size, isEnabled) {
-    const helper = this.clipPlaneHelpers[idx];
-    if (!helper) return;
-    helper.visible = isEnabled && this.clipHelperVisible;
-    helper.scale.set(size, size, 1);
-    const pos = new THREE.Vector3(center.x, center.y, center.z);
-    const epsilon = 1e-3;
-    if (normal.x !== 0) pos.x = dist + normal.x * epsilon;
-    else if (normal.y !== 0) pos.y = dist + normal.y * epsilon;
-    else if (normal.z !== 0) pos.z = dist + normal.z * epsilon;
-    helper.position.copy(pos);
-    helper.lookAt(pos.clone().add(normal));
+    const result = applyUpdateClippingPlanes(this.getClippingContext(), bounds, values, active);
+    this.syncClippingState(result.state);
+    if (result.needsRender) this.markSceneDirty();
   }
   /**
    * 检查包围盒是否完全被当前剖切面裁剪掉
    * 如果包围盒完全在任意一个激活的剖切面的“背面”，则认为被裁剪
    */
   isBoxClipped(box) {
-    for (const plane of this.clippingPlanes) {
-      if (plane.constant === Infinity) continue;
-      const planeNormal = plane.normal;
-      const maxPoint = new THREE.Vector3(
-        planeNormal.x > 0 ? box.max.x : box.min.x,
-        planeNormal.y > 0 ? box.max.y : box.min.y,
-        planeNormal.z > 0 ? box.max.z : box.min.z
-      );
-      if (plane.distanceToPoint(maxPoint) < 0) {
-        return true;
-      }
-    }
-    return false;
+    return isBoxClippedByPlanes(this.clippingPlanes, box);
   }
   getStats() {
-    const drawCalls = this.renderer.info.render.calls;
-    const textureMemory = estimateTextureMemoryMb(this.contentGroup);
-    return {
-      meshes: this.originalStats.meshes,
-      faces: this.originalStats.faces,
-      memory: parseFloat(this.originalStats.memory.toFixed(2)),
-      textureMemory,
-      drawCalls,
-      chunksLoaded: this.chunkLoadedCount,
-      chunksTotal: this.chunks.length,
-      chunksQueued: this.processingChunks.size,
-      pixelRatio: Number(this.activePixelRatio.toFixed(2))
-    };
+    return collectSceneManagerStats({
+      renderer: this.renderer,
+      contentGroup: this.contentGroup,
+      originalStats: this.originalStats,
+      chunkLoadedCount: this.chunkLoadedCount,
+      chunksLength: this.chunks.length,
+      processingChunkCount: this.processingChunks.size,
+      activePixelRatio: this.activePixelRatio
+    });
   }
   dispose() {
     this.disposed = true;
-    this.cancelDeferredStructureBuild();
     this.animateFramePending = false;
-    if (this.animationFrameId !== null) {
-      cancelAnimationFrame(this.animationFrameId);
-      this.animationFrameId = null;
-    }
-    if (this.logicTimer) clearInterval(this.logicTimer);
-    for (const worker of this.workers) {
-      try {
-        worker.terminate();
-      } catch (error) {
-        console.warn("Worker terminate failed:", error);
+    this.cancelBoxSelect();
+    disposeSceneManagerResources({
+      cancelDeferredStructureBuild: () => this.cancelDeferredStructureBuild(),
+      clearLocateFocus: () => this.clearLocateFocus(),
+      releaseGhostLine: (line) => this.releaseGhostLine(line),
+      clearChunkCache: () => this.clearChunkCache(),
+      controls: this.controls,
+      selectionBox: this.selectionBox,
+      highlightMesh: this.highlightMesh,
+      tempMarker: this.tempMarker,
+      dotTexture: this.dotTexture,
+      sharedMaterial: this.sharedMaterial,
+      ghostEdgesGeometry: this.ghostEdgesGeometry,
+      ghostMaterial: this.ghostMaterial,
+      renderer: this.renderer,
+      ghostGroup: this.ghostGroup,
+      workers: this.workers,
+      workerQueue: this.workerQueue,
+      logicTimer: this.logicTimer,
+      animationFrameId: this.animationFrameId,
+      onAnimationFrameDisposed: () => {
+        this.animationFrameId = null;
+      },
+      onWorkersDisposed: () => {
+        this.workers = [];
+        this.activeWorkerCount = 0;
+      },
+      onQueuesReset: () => {
+        this.processingChunks.clear();
+        this.cancelledChunkIds.clear();
+        this.prefetchQueue = [];
+        this.prefetchQueueSet.clear();
+        this.prefetchInFlight.clear();
+        this.chunkReadCache.clear();
+        this.chunkReadCacheOrder = [];
+      },
+      onStateCachesReset: () => {
+        this.highlightedUuids.clear();
+        this.locateResultSet.clear();
+        this.fastPreviewModels.clear();
+        this.ghostMeshPool.length = 0;
       }
-    }
-    this.workers = [];
-    if (this.workerQueue.length > 0) {
-      const pending = this.workerQueue.splice(0, this.workerQueue.length);
-      pending.forEach((task) => task.reject(new Error("SceneManager disposed")));
-    }
-    this.activeWorkerCount = 0;
-    this.processingChunks.clear();
-    this.cancelledChunkIds.clear();
-    this.prefetchQueue = [];
-    this.prefetchQueueSet.clear();
-    this.prefetchInFlight.clear();
-    this.chunkReadCache.clear();
-    this.chunkReadCacheOrder = [];
-    this.highlightedUuids.clear();
-    this.locateResultSet.clear();
-    this.fastPreviewModels.clear();
-    this.clearChunkCache();
-    while (this.ghostGroup.children.length > 0) {
-      const ghost = this.ghostGroup.children[0];
-      this.ghostGroup.remove(ghost);
-      this.releaseGhostLine(ghost);
-    }
-    this.ghostMeshPool.length = 0;
-    this.controls.dispose();
-    if (this.selectionBox.geometry) this.selectionBox.geometry.dispose();
-    const selectionMat = this.selectionBox.material;
-    (Array.isArray(selectionMat) ? selectionMat : [selectionMat]).forEach((m) => m?.dispose?.());
-    if (this.highlightMesh.geometry) this.highlightMesh.geometry.dispose();
-    const highlightMat = this.highlightMesh.material;
-    (Array.isArray(highlightMat) ? highlightMat : [highlightMat]).forEach((m) => m?.dispose?.());
-    if (this.tempMarker.geometry) this.tempMarker.geometry.dispose();
-    const tempMarkerMat = this.tempMarker.material;
-    (Array.isArray(tempMarkerMat) ? tempMarkerMat : [tempMarkerMat]).forEach((m) => m?.dispose?.());
-    this.dotTexture.dispose();
-    this.sharedMaterial.dispose();
-    this.ghostEdgesGeometry.dispose();
-    this.ghostMaterial.dispose();
-    this.renderer.dispose();
+    });
   }
-}
-function stripFileExtension(name) {
-  return name.replace(/\.[^./\\]+$/, "");
-}
-function sanitizeFileStem(name) {
-  const sanitized = name.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, " ").trim();
-  return sanitized || "model";
 }
 
 const themes = {
-  dark: {
-    bg: "#1A1C1E",
-    panelBg: "#222427",
-    headerBg: "#282A2D",
-    border: "#444b55",
-    text: "#E6E1E5",
-    textLight: "#FFFFFF",
-    textMuted: "#938F99",
-    accent: "#A1C9FF",
-    highlight: "#49454F",
-    itemHover: "rgba(161, 201, 255, 0.08)",
-    success: "#B4E197",
-    warning: "#F2C94C",
-    danger: "#F2B8B5",
-    canvasBg: "#121416",
-    shadow: "rgba(0, 0, 0, 0.5)"
-  },
   light: {
     bg: "#F8FAFF",
     panelBg: "#FFFFFF",
@@ -4977,12 +6434,15 @@ const resources = {
     delete_item: "Delete Item",
     btn_confirm: "Confirm",
     btn_cancel: "Cancel",
+    panel_close: "Close",
     // 属性
     pg_basic: "Basic Information",
     pg_geo: "Geometry",
+    pg_clash: "Clash Status",
     prop_name: "Name",
     prop_id: "ID",
     prop_type: "Type",
+    prop_status: "Status",
     prop_pos: "Position",
     prop_dim: "Dimensions",
     prop_inst: "Instances",
@@ -5003,6 +6463,7 @@ const resources = {
     measure_clear: "Clear All",
     measure_start: "Start",
     measure_stop: "Stop",
+    measure_panel_hint: "Choose a mode, then click points in the viewport to measure.",
     tb_boxSelect: "Box Select",
     tb_boxSelect_hint: "Drag to select objects",
     tb_wireframe: "Wireframe",
@@ -5038,6 +6499,7 @@ const resources = {
     st_lighting: "Lighting",
     st_ambient: "Ambient Int.",
     st_dir: "Direct Int.",
+    st_back: "Back Light Int.",
     st_render_mode: "Render Mode",
     st_render_standard: "Standard",
     st_render_mayo: "Mayo",
@@ -5069,8 +6531,73 @@ const resources = {
     tb_screenshot: "Shot",
     tb_settings: "Setting",
     tb_about: "About",
+    tb_search: "Search",
+    tb_clash: "Clash",
     tb_sun: "Sun",
     tb_explode: "Explode",
+    search_conditions: "Search Conditions",
+    search_field_name: "Property Name",
+    search_field_value: "Property Value",
+    search_add_condition: "Add Condition",
+    search_run: "Search",
+    search_clear: "Clear Results",
+    search_no_results: "No Results",
+    search_page_size: "Per Page",
+    search_page_prev: "Prev",
+    search_page_next: "Next",
+    searching: "Searching...",
+    search_invalid_condition: "Please fill at least one complete condition",
+    search_cancel: "Cancel Search",
+    search_cancelled: "Search Cancelled",
+    remove_condition: "Remove Condition",
+    search_connector_and: "AND",
+    search_connector_or: "OR",
+    search_op_equals: "Equals",
+    search_op_contains: "Contains",
+    search_op_not_contains: "Not Contains",
+    search_op_starts_with: "Starts With",
+    search_op_ends_with: "Ends With",
+    clash_placeholder: "Clash detection will be implemented in phase 2. This phase keeps the toolbar entry and panel scaffold.",
+    clash_run: "Run Check",
+    clash_clear: "Clear Results",
+    clash_ready: "Ready",
+    clash_collecting: "Collecting Candidates...",
+    clash_running: "Running clash detection...",
+    clash_results: "Clash Results",
+    clash_no_results: "No clash results",
+    clash_scope_visible: "Scope: Visible objects",
+    clash_candidates: "Candidates",
+    clash_overlap_volume: "Overlap Volume",
+    clash_insufficient_candidates: "Not enough candidates (at least 2 required)",
+    clash_set_a: "Model Set A",
+    clash_set_b: "Model Set B",
+    clash_no_models: "No models",
+    clash_tolerance: "Tolerance",
+    clash_min_overlap: "Min Overlap Volume",
+    clash_clearance_distance: "Min Clearance Distance",
+    clash_clearance_value: "Clearance Distance",
+    clash_detection_type: "Detection Type",
+    clash_type_all: "All Types",
+    clash_type_hard: "Hard Clash",
+    clash_type_clearance: "Clearance Clash",
+    clash_narrow_phase: "Enable Narrow Phase (OBB)",
+    clash_triangle_phase: "Enable Triangle Validation",
+    clash_include_same_model: "Include Intra-model Checks",
+    clash_pairs_scanned: "Pairs Scanned",
+    clash_export_csv: "Export CSV",
+    clash_group_all: "All",
+    clash_group_new: "New",
+    clash_group_confirmed: "Confirmed",
+    clash_group_resolved: "Resolved",
+    clash_mark_confirmed: "Mark Group Confirmed",
+    clash_mark_resolved: "Mark Group Resolved",
+    clash_mark_new: "Mark Group New",
+    clash_isolate_new: "Isolate New",
+    clash_isolate_confirmed: "Isolate Confirmed",
+    clash_severity_high: "High",
+    clash_severity_medium: "Medium",
+    clash_severity_low: "Low",
+    tree_clash_only: "Clash Nodes Only",
     st_monitor: "Performance Panel",
     st_adaptive_quality: "Adaptive Quality",
     st_performance_profile: "Performance Profile",
@@ -5107,6 +6634,8 @@ const resources = {
     menu_about: "About",
     about_title: "About 3D Browser",
     about_author: "Author",
+    about_tagline: "Professional 3D Model Viewer",
+    about_copyright: "Copyright © 2026. All rights reserved.",
     project_url: "Project URL",
     about_license: "License",
     about_license_nc: "Non-commercial Use Only",
@@ -5123,17 +6652,32 @@ const resources = {
     viewpoint_save: "Save Current Viewpoint",
     viewpoint_empty: "No saved viewpoints",
     viewpoint_loading: "Restoring viewpoint",
+    viewpoint_default_name: "Viewpoint",
     viewpoint_load: "Restore",
     viewpoint_load_hint: "Double click to restore",
     viewpoint_overwrite: "Overwrite",
     viewpoint_no_preview: "No preview",
+    viewpoint_save_visibility: "Save visibility",
+    viewpoint_save_selection: "Save selection",
+    viewpoint_save_clip: "Save clipping",
+    viewpoint_save_explode: "Save explode",
+    viewpoint_flag_visibility: "Visibility",
+    viewpoint_flag_selection: "Selection",
+    viewpoint_flag_clip: "Clip",
+    viewpoint_flag_explode: "Explode",
     chunk_loading: "Chunks",
     select_all: "Select All",
     invert_selection: "Invert Selection",
     set_opacity: "Opacity",
     copied: "Copied",
+    click_to_copy: "Click to copy",
     search_results: "Results",
+    search_selected_results: "Checked",
+    search_batch_highlight: "Batch Highlight",
+    search_add_to_selection: "Add To Selection",
+    search_export_results: "Export Results",
     locate_in_view: "Locate in View",
+    settings_more: "More Settings",
     locate_first_match: "Locate First Match",
     ifc_locator_all: "All",
     ifc_locator_name: "Name",
@@ -5156,7 +6700,31 @@ const resources = {
     op_screenshot_transparent: "Transparent Screenshot",
     screenshot_mode: "Capture Mode",
     screenshot_scene_desc: "Export PNG with the current scene background",
-    screenshot_transparent_desc: "Export transparent PNG for documents and overlays"
+    screenshot_transparent_desc: "Export transparent PNG for documents and overlays",
+    summary_parent: "Parent",
+    summary_children: "Children",
+    summary_visible: "Visible",
+    summary_yes: "Yes",
+    summary_no: "No",
+    summary_models: "Models",
+    summary_types: "Type Mix",
+    summary_bounds: "Selection Bounds",
+    summary_total_area: "Total Area",
+    summary_total_volume: "Total Volume",
+    mode_measure: "Measuring",
+    mode_clip: "Clipping",
+    mode_search: "Search Highlight",
+    mode_hidden: "Hidden Objects",
+    mode_isolated: "Isolated Objects",
+    mode_box_select: "Box Selection",
+    mode_clash: "Clash Active",
+    mode_clear: "Clear",
+    stats_original_meshes: "Original Meshes",
+    stats_triangles: "Triangles",
+    stats_chunks: "Chunks",
+    stats_pixel_ratio: "Pixel Ratio",
+    confirm: "Confirm",
+    view_home: "Home View"
   },
   zh: {
     home: "首页",
@@ -5251,12 +6819,15 @@ const resources = {
     delete_item: "删除模型",
     btn_confirm: "确定",
     btn_cancel: "取消",
+    panel_close: "关闭",
     // 属性
     pg_basic: "基本信息",
     pg_geo: "几何信息",
+    pg_clash: "碰撞状态",
     prop_name: "名称",
     prop_id: "ID",
     prop_type: "类型",
+    prop_status: "状态",
     prop_pos: "位置",
     prop_dim: "尺寸",
     prop_inst: "实例数",
@@ -5277,6 +6848,7 @@ const resources = {
     measure_clear: "清空测量",
     measure_start: "开始测量",
     measure_stop: "停止测量",
+    measure_panel_hint: "选择测量方式后，在视口中点击点位开始测量。",
     tb_boxSelect: "框选",
     tb_boxSelect_hint: "拖拽选择对象",
     tb_wireframe: "线框",
@@ -5312,6 +6884,7 @@ const resources = {
     st_lighting: "场景光照",
     st_ambient: "环境光强度",
     st_dir: "直射光强度",
+    st_back: "背光强度",
     st_render_mode: "渲染模式",
     st_render_standard: "标准",
     st_render_mayo: "Mayo",
@@ -5343,8 +6916,73 @@ const resources = {
     tb_screenshot: "截图",
     tb_settings: "设置",
     tb_about: "关于",
+    tb_search: "搜索",
+    tb_clash: "碰撞",
     tb_sun: "光照",
     tb_explode: "爆炸",
+    search_conditions: "搜索条件",
+    search_field_name: "属性名",
+    search_field_value: "属性值",
+    search_add_condition: "添加条件",
+    search_run: "搜索",
+    search_clear: "清除结果",
+    search_no_results: "暂无结果",
+    search_page_size: "每页",
+    search_page_prev: "上一页",
+    search_page_next: "下一页",
+    searching: "搜索中...",
+    search_invalid_condition: "请至少输入一组完整的搜索条件",
+    search_cancel: "取消搜索",
+    search_cancelled: "搜索已取消",
+    remove_condition: "移除条件",
+    search_connector_and: "且",
+    search_connector_or: "或",
+    search_op_equals: "等于",
+    search_op_contains: "包含",
+    search_op_not_contains: "不包含",
+    search_op_starts_with: "开头",
+    search_op_ends_with: "结尾",
+    clash_placeholder: "碰撞检查将在下一期实现。本期已预留工具入口与结果面板结构。",
+    clash_run: "开始检查",
+    clash_clear: "清空结果",
+    clash_ready: "准备就绪",
+    clash_collecting: "正在收集候选构件...",
+    clash_running: "正在执行碰撞检查...",
+    clash_results: "碰撞结果",
+    clash_no_results: "暂无碰撞结果",
+    clash_scope_visible: "范围：当前可见构件",
+    clash_candidates: "候选",
+    clash_overlap_volume: "重叠体积",
+    clash_insufficient_candidates: "可检测构件不足（至少需要2个）",
+    clash_set_a: "模型集 A",
+    clash_set_b: "模型集 B",
+    clash_no_models: "暂无模型",
+    clash_tolerance: "容差",
+    clash_min_overlap: "最小重叠体积",
+    clash_clearance_distance: "最小净空距离",
+    clash_clearance_value: "净空距离",
+    clash_detection_type: "检测类型",
+    clash_type_all: "全部类型",
+    clash_type_hard: "硬碰撞",
+    clash_type_clearance: "净空碰撞",
+    clash_narrow_phase: "启用精筛（OBB）",
+    clash_triangle_phase: "启用三角面复核",
+    clash_include_same_model: "包含同模型内检测",
+    clash_pairs_scanned: "已扫描对数",
+    clash_export_csv: "导出 CSV",
+    clash_group_all: "全部",
+    clash_group_new: "新建",
+    clash_group_confirmed: "已确认",
+    clash_group_resolved: "已解决",
+    clash_mark_confirmed: "当前组标记已确认",
+    clash_mark_resolved: "当前组标记已解决",
+    clash_mark_new: "当前组标记新建",
+    clash_isolate_new: "仅看新建",
+    clash_isolate_confirmed: "仅看已确认",
+    clash_severity_high: "高",
+    clash_severity_medium: "中",
+    clash_severity_low: "低",
+    tree_clash_only: "仅显示冲突节点",
     st_monitor: "性能面板",
     st_adaptive_quality: "自适应画质",
     st_performance_profile: "性能策略",
@@ -5381,6 +7019,8 @@ const resources = {
     menu_about: "关于",
     about_title: "关于 3D Browser",
     about_author: "作者",
+    about_tagline: "专业三维模型查看器",
+    about_copyright: "Copyright © 2026. All rights reserved.",
     project_url: "项目地址",
     about_license: "授权协议",
     about_license_nc: "仅限非商业用途",
@@ -5397,17 +7037,32 @@ const resources = {
     viewpoint_save: "保存当前视点",
     viewpoint_empty: "暂无保存的视点",
     viewpoint_loading: "恢复视点",
+    viewpoint_default_name: "视点",
     viewpoint_load: "恢复",
     viewpoint_load_hint: "双击恢复视点",
     viewpoint_overwrite: "覆盖",
     viewpoint_no_preview: "无预览",
+    viewpoint_save_visibility: "保存可见性",
+    viewpoint_save_selection: "保存选择",
+    viewpoint_save_clip: "保存剖切",
+    viewpoint_save_explode: "保存爆炸图",
+    viewpoint_flag_visibility: "可见性",
+    viewpoint_flag_selection: "选择",
+    viewpoint_flag_clip: "剖切",
+    viewpoint_flag_explode: "爆炸图",
     chunk_loading: "分片加载",
     select_all: "全选",
     invert_selection: "反选",
     set_opacity: "透明度",
     copied: "已复制",
+    click_to_copy: "点击复制",
     search_results: "结果数",
+    search_selected_results: "已勾选",
+    search_batch_highlight: "批量高亮",
+    search_add_to_selection: "加入当前选择",
+    search_export_results: "导出结果",
     locate_in_view: "定位到视图",
+    settings_more: "更多设置",
     locate_first_match: "定位首个匹配",
     ifc_locator_all: "综合",
     ifc_locator_name: "名称",
@@ -5430,7 +7085,31 @@ const resources = {
     op_screenshot_transparent: "透明背景截图",
     screenshot_mode: "截图方式",
     screenshot_scene_desc: "导出带当前场景背景的 PNG 截图",
-    screenshot_transparent_desc: "导出透明背景 PNG，便于报告排版"
+    screenshot_transparent_desc: "导出透明背景 PNG，便于报告排版",
+    summary_parent: "父级",
+    summary_children: "子节点",
+    summary_visible: "可见",
+    summary_yes: "是",
+    summary_no: "否",
+    summary_models: "模型数",
+    summary_types: "类型分布",
+    summary_bounds: "总体包围盒",
+    summary_total_area: "总面积",
+    summary_total_volume: "总体积",
+    mode_measure: "测量中",
+    mode_clip: "剖切中",
+    mode_search: "搜索结果高亮",
+    mode_hidden: "已隐藏对象",
+    mode_isolated: "已隔离对象",
+    mode_box_select: "框选中",
+    mode_clash: "碰撞结果已激活",
+    mode_clear: "清除",
+    stats_original_meshes: "原始网格",
+    stats_triangles: "三角面",
+    stats_chunks: "分片",
+    stats_pixel_ratio: "像素比",
+    confirm: "确定",
+    writing: "正在写入文件..."
   }
 };
 const getTranslation = (lang, key) => {
@@ -5586,22 +7265,11 @@ const IconEye = (props) => createIcon(
   ] }),
   props
 );
-const IconSun = (props) => createIcon(
+const IconSearch = (props) => createIcon(
   /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("circle", { cx: "12", cy: "12", r: "5" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "1", x2: "12", y2: "3" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "21", x2: "12", y2: "23" }),
-    /* @__PURE__ */ jsx("line", { x1: "4.22", y1: "4.22", x2: "5.64", y2: "5.64" }),
-    /* @__PURE__ */ jsx("line", { x1: "18.36", y1: "18.36", x2: "19.78", y2: "19.78" }),
-    /* @__PURE__ */ jsx("line", { x1: "1", y1: "12", x2: "3", y2: "12" }),
-    /* @__PURE__ */ jsx("line", { x1: "21", y1: "12", x2: "23", y2: "12" }),
-    /* @__PURE__ */ jsx("line", { x1: "4.22", y1: "19.78", x2: "5.64", y2: "18.36" }),
-    /* @__PURE__ */ jsx("line", { x1: "18.36", y1: "5.64", x2: "19.78", y2: "4.22" })
+    /* @__PURE__ */ jsx("circle", { cx: "11", cy: "11", r: "7" }),
+    /* @__PURE__ */ jsx("line", { x1: "16.65", y1: "16.65", x2: "21", y2: "21" })
   ] }),
-  props
-);
-const IconMoon = (props) => createIcon(
-  /* @__PURE__ */ jsx(Fragment, { children: /* @__PURE__ */ jsx("path", { d: "M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" }) }),
   props
 );
 const IconGrid = (props) => createIcon(
@@ -5826,31 +7494,19 @@ const ImageButton = ({
   theme,
   style,
   className = "",
+  disabled,
   ...props
 }) => {
   return /* @__PURE__ */ jsxs(
     "button",
     {
-      style,
+      style: { opacity: disabled ? 0.4 : 1, cursor: disabled ? "not-allowed" : "pointer", ...style },
       className: `ui-toolbar-btn ${active ? "active" : ""} ${className}`,
+      disabled,
       ...props,
       children: [
-        /* @__PURE__ */ jsx("div", { style: { display: "flex", alignItems: "center", justifyContent: "center", width: 18, height: 18, overflow: "visible" }, children: icon }),
-        label && /* @__PURE__ */ jsx(
-          "div",
-          {
-            style: {
-              fontSize: 11,
-              lineHeight: 1,
-              fontWeight: 500,
-              whiteSpace: "nowrap",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              maxWidth: "100%"
-            },
-            children: label
-          }
-        )
+        /* @__PURE__ */ jsx("div", { className: "ui-toolbar-btn-icon", children: icon }),
+        label && /* @__PURE__ */ jsx("div", { className: "ui-toolbar-btn-label", children: label })
       ]
     }
   );
@@ -5881,40 +7537,20 @@ const Toolbar = (props) => {
   };
   const renderDropdown = (menuId, items) => {
     if (openMenu !== menuId) return null;
-    return /* @__PURE__ */ jsx(
-      "div",
-      {
-        ref: menuRef,
-        style: {
-          position: "absolute",
-          top: "100%",
-          left: 0,
-          marginTop: "4px",
-          backgroundColor: theme.panelBg,
-          border: `1px solid ${theme.border}`,
-          boxShadow: "0 4px 12px rgba(0,0,0,0.15)",
-          zIndex: 2e3,
-          minWidth: "140px",
-          padding: "4px 0"
-        },
-        children: items
-      }
-    );
+    return /* @__PURE__ */ jsx("div", { ref: menuRef, className: "ui-toolbar-menu", children: items });
   };
   const menuItem = (icon, label, onClick) => /* @__PURE__ */ jsxs(
     "div",
     {
-      style: { display: "flex", alignItems: "center", gap: "8px", padding: "5px 14px", fontSize: "12px", color: theme.text, cursor: "pointer", backgroundColor: "transparent" },
+      className: "ui-toolbar-menu-item",
       onClick,
-      onMouseEnter: (e) => e.currentTarget.style.backgroundColor = theme.itemHover,
-      onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
       children: [
-        /* @__PURE__ */ jsx("span", { style: { width: 18, height: 18, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, opacity: 0.8 }, children: icon }),
+        /* @__PURE__ */ jsx("span", { className: "ui-toolbar-menu-icon", children: icon }),
         label
       ]
     }
   );
-  const menuDivider = () => /* @__PURE__ */ jsx("div", { style: { height: "1px", backgroundColor: theme.border, margin: "4px 0" } });
+  const menuDivider = () => /* @__PURE__ */ jsx("div", { className: "ui-toolbar-menu-divider" });
   return /* @__PURE__ */ jsxs("div", { className: "ui-toolbar", children: [
     /* @__PURE__ */ jsx(
       "input",
@@ -5938,7 +7574,7 @@ const Toolbar = (props) => {
         onChange: props.handleBatchConvert
       }
     ),
-    !isHidden("file") && /* @__PURE__ */ jsx("div", { className: "ui-toolbar-group", children: /* @__PURE__ */ jsxs("div", { style: { position: "relative" }, children: [
+    !isHidden("file") && /* @__PURE__ */ jsx("div", { className: "ui-toolbar-group", children: /* @__PURE__ */ jsxs("div", { className: "ui-toolbar-menu-anchor", children: [
       /* @__PURE__ */ jsx(
         ImageButton,
         {
@@ -5977,7 +7613,7 @@ const Toolbar = (props) => {
           theme
         }
       ),
-      /* @__PURE__ */ jsxs("div", { style: { position: "relative" }, children: [
+      /* @__PURE__ */ jsxs("div", { className: "ui-toolbar-menu-anchor", children: [
         /* @__PURE__ */ jsx(
           ImageButton,
           {
@@ -6034,7 +7670,7 @@ const Toolbar = (props) => {
       ] })
     ] }),
     !isHidden("interface") && /* @__PURE__ */ jsxs("div", { className: "ui-toolbar-group", children: [
-      !isHidden("wireframe") && /* @__PURE__ */ jsxs("div", { style: { position: "relative" }, children: [
+      !isHidden("wireframe") && /* @__PURE__ */ jsxs("div", { className: "ui-toolbar-menu-anchor", children: [
         /* @__PURE__ */ jsx(
           ImageButton,
           {
@@ -6138,13 +7774,23 @@ const Toolbar = (props) => {
           theme
         }
       ),
-      !isHidden("sun") && /* @__PURE__ */ jsx(
+      !isHidden("search") && /* @__PURE__ */ jsx(
         ImageButton,
         {
-          icon: /* @__PURE__ */ jsx(IconSun, {}),
-          label: t("tb_sun"),
-          active: props.activeTool === "sun",
-          onClick: () => props.setActiveTool?.(props.activeTool === "sun" ? "none" : "sun"),
+          icon: /* @__PURE__ */ jsx(IconSearch, {}),
+          label: t("tb_search") || "搜索",
+          active: props.activeTool === "search",
+          onClick: () => props.setActiveTool?.(props.activeTool === "search" ? "none" : "search"),
+          theme
+        }
+      ),
+      !isHidden("clash") && /* @__PURE__ */ jsx(
+        ImageButton,
+        {
+          icon: /* @__PURE__ */ jsx(IconTarget, {}),
+          label: t("tb_clash") || "碰撞",
+          active: props.activeTool === "clash",
+          onClick: () => props.setActiveTool?.(props.activeTool === "clash" ? "none" : "clash"),
           theme
         }
       ),
@@ -6186,6 +7832,7 @@ const Toolbar = (props) => {
 const Button = ({
   children,
   variant = "default",
+  size = "md",
   active,
   theme,
   style,
@@ -6197,6 +7844,9 @@ const Button = ({
   else if (variant === "danger") btnClass += " ui-btn-danger";
   else if (variant === "ghost") btnClass += " ui-btn-ghost";
   else btnClass += " ui-btn-default";
+  if (size === "sm") btnClass += " ui-btn-sm";
+  else if (size === "lg") btnClass += " ui-btn-lg";
+  else btnClass += " ui-btn-md";
   if (active) btnClass += " active";
   return /* @__PURE__ */ jsx("button", { className: `${btnClass} ${className}`, style, ...props, children });
 };
@@ -6240,16 +7890,10 @@ const Slider = ({
     "div",
     {
       ref: sliderRef,
-      className: "ui-slider",
+      className: `ui-slider ui-slider-control ${disabled ? "ui-slider-control-disabled" : "ui-slider-control-interactive"}`,
       style: {
-        opacity: disabled ? 0.5 : 1,
         width: "100%",
         minWidth: 0,
-        height: "24px",
-        position: "relative",
-        cursor: disabled ? "not-allowed" : "pointer",
-        display: "flex",
-        alignItems: "center",
         ...style
       },
       onMouseDown: handleMouseDown,
@@ -6257,14 +7901,7 @@ const Slider = ({
         /* @__PURE__ */ jsx(
           "div",
           {
-            className: "ui-slider-track",
-            style: {
-              position: "absolute",
-              width: "100%",
-              height: "6px",
-              backgroundColor: "var(--border-color)",
-              borderRadius: "3px"
-            }
+            className: "ui-slider-track"
           }
         ),
         /* @__PURE__ */ jsx(
@@ -6272,11 +7909,7 @@ const Slider = ({
           {
             className: "ui-slider-progress",
             style: {
-              position: "absolute",
-              width: `${percentage}%`,
-              height: "6px",
-              backgroundColor: "var(--accent)",
-              borderRadius: "3px"
+              width: `${percentage}%`
             }
           }
         ),
@@ -6286,15 +7919,7 @@ const Slider = ({
             className: "ui-slider-thumb",
             style: {
               left: `${percentage}%`,
-              width: "16px",
-              height: "16px",
-              backgroundColor: "var(--bg-primary)",
-              border: `2px solid var(--accent)`,
-              borderRadius: "50%",
-              cursor: disabled ? "not-allowed" : "default",
-              position: "absolute",
-              transform: "translateX(-50%)",
-              boxShadow: "0 1px 3px rgba(0,0,0,0.3)"
+              cursor: disabled ? "not-allowed" : "default"
             }
           }
         )
@@ -6469,7 +8094,7 @@ const Switch = ({ checked, onChange, disabled = false, className = "" }) => {
   );
 };
 
-const SegmentedControl$1 = ({
+const SegmentedControl = ({
   options,
   value,
   onChange,
@@ -6487,53 +8112,70 @@ const SegmentedControl$1 = ({
   option.value
 )) });
 
-const ColorPicker = ({ value, onChange, style }) => /* @__PURE__ */ jsxs("div", { className: "flex items-center gap-2", style, children: [
+const ColorPicker = ({ value, onChange, style }) => /* @__PURE__ */ jsxs("div", { className: "ui-color-picker", style, children: [
   /* @__PURE__ */ jsx(
     "input",
     {
       type: "color",
       value,
       onChange: (e) => onChange(e.target.value),
-      style: {
-        width: "28px",
-        height: "28px",
-        padding: 0,
-        border: "1px solid var(--border-color)",
-        borderRadius: "4px",
-        cursor: "pointer",
-        backgroundColor: "transparent"
-      }
+      className: "ui-color-picker-input"
     }
   ),
-  /* @__PURE__ */ jsx(
-    "span",
-    {
-      style: {
-        fontSize: "11px",
-        color: "var(--text-secondary)"
-      },
-      children: value
-    }
-  )
+  /* @__PURE__ */ jsx("span", { className: "ui-color-picker-value", children: value })
 ] });
 
-const Select = ({ value, options, onChange, className = "", style }) => /* @__PURE__ */ jsx(
-  "select",
-  {
-    value,
-    onChange: (e) => onChange(e.target.value),
-    className: `ui-input ${className}`,
-    style: {
-      padding: "4px 28px 4px 8px",
-      appearance: "none",
-      backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23A0A0A0' d='M2 4l4 4 4-4'/%3E%3C/svg%3E")`,
-      backgroundRepeat: "no-repeat",
-      backgroundPosition: "right 8px center",
-      ...style
-    },
-    children: options.map((option) => /* @__PURE__ */ jsx("option", { value: option.value, children: option.label }, option.value))
-  }
-);
+const Select = ({ value, options, onChange, className = "", style, disabled }) => {
+  const [isOpen, setIsOpen] = useState(false);
+  const containerRef = useRef(null);
+  const selectedOption = options.find((opt) => opt.value === value) || options[0];
+  useEffect(() => {
+    const handleClickOutside = (e) => {
+      if (containerRef.current && !containerRef.current.contains(e.target)) {
+        setIsOpen(false);
+      }
+    };
+    if (isOpen) {
+      document.addEventListener("mousedown", handleClickOutside);
+    }
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, [isOpen]);
+  return /* @__PURE__ */ jsxs(
+    "div",
+    {
+      ref: containerRef,
+      className: `ui-select-custom ${isOpen ? "open" : ""} ${disabled ? "disabled" : ""}`,
+      style,
+      children: [
+        /* @__PURE__ */ jsxs(
+          "div",
+          {
+            className: `ui-select-selector ui-input ${className}`,
+            onClick: () => !disabled && setIsOpen(!isOpen),
+            children: [
+              /* @__PURE__ */ jsx("span", { className: "ui-select-selection-item", children: selectedOption?.label }),
+              /* @__PURE__ */ jsx("span", { className: "ui-select-arrow", children: /* @__PURE__ */ jsx("svg", { viewBox: "64 64 896 896", width: "12", height: "12", fill: "currentColor", children: /* @__PURE__ */ jsx("path", { d: "M884 256h-75c-5.1 0-9.9 2.5-12.9 6.6L512 654.2 227.9 262.6c-3-4.1-7.8-6.6-12.9-6.6h-75c-6.5 0-10.3 7.4-6.5 12.7l352.6 486.1c12.8 17.6 39 17.6 51.7 0l352.6-486.1c3.9-5.3.1-12.7-6.4-12.7z" }) }) })
+            ]
+          }
+        ),
+        isOpen && !disabled && /* @__PURE__ */ jsx("div", { className: "ui-select-dropdown", children: options.map((option) => /* @__PURE__ */ jsx(
+          "div",
+          {
+            className: `ui-select-item ${option.value === value ? "selected" : ""}`,
+            onClick: () => {
+              onChange(option.value);
+              setIsOpen(false);
+            },
+            children: option.label
+          },
+          option.value
+        )) })
+      ]
+    }
+  );
+};
 
 const Checkbox = ({
   label,
@@ -6546,15 +8188,8 @@ const Checkbox = ({
   return /* @__PURE__ */ jsxs(
     "label",
     {
-      style: {
-        display: "inline-flex",
-        alignItems: "center",
-        gap: "8px",
-        cursor: disabled ? "not-allowed" : "pointer",
-        userSelect: "none",
-        opacity: disabled ? 0.5 : 1,
-        ...style
-      },
+      className: `ui-checkbox ${disabled ? "ui-checkbox-disabled" : ""}`,
+      style,
       onClick: (e) => {
         if (disabled) return;
         e.preventDefault();
@@ -6564,36 +8199,23 @@ const Checkbox = ({
         /* @__PURE__ */ jsx(
           "div",
           {
-            style: {
-              width: "14px",
-              height: "14px",
-              minWidth: "14px",
-              minHeight: "14px",
-              border: "1px solid var(--border-color)",
-              borderRadius: "2px",
-              backgroundColor: checked ? "var(--accent)" : "var(--bg-primary)",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              transition: "none",
-              flexShrink: 0
-            },
+            className: `ui-checkbox-box ${checked ? "ui-checkbox-box-checked" : ""}`,
             children: checked && /* @__PURE__ */ jsx(
               "svg",
               {
                 viewBox: "0 0 24 24",
                 fill: "none",
                 stroke: "white",
-                strokeWidth: "2",
+                strokeWidth: "3",
                 strokeLinecap: "round",
                 strokeLinejoin: "round",
-                style: { width: "10px", height: "10px" },
+                className: "ui-checkbox-icon",
                 children: /* @__PURE__ */ jsx("polyline", { points: "20 6 9 17 4 12" })
               }
             )
           }
         ),
-        label && /* @__PURE__ */ jsx("span", { style: { fontSize: "12px", color: "var(--text-primary)", ...labelStyle }, children: label })
+        label && /* @__PURE__ */ jsx("span", { className: "ui-checkbox-label", style: labelStyle, children: label })
       ]
     }
   );
@@ -6610,83 +8232,79 @@ const InputNumber = ({
   style,
   ...props
 }) => {
-  const handleChange = (e) => {
-    let val = parseFloat(e.target.value);
-    if (isNaN(val)) return;
+  const [text, setText] = useState(() => String(value));
+  useEffect(() => {
+    setText(String(value));
+  }, [value]);
+  const clampValue = (nextValue) => {
+    let val = nextValue;
     if (min !== void 0) val = Math.max(min, val);
     if (max !== void 0) val = Math.min(max, val);
-    onChange(val);
+    return val;
+  };
+  const handleChange = (e) => {
+    const nextText = e.target.value;
+    setText(nextText);
+    if (nextText.trim() === "") return;
+    const parsed = parseFloat(nextText);
+    if (isNaN(parsed)) return;
+    onChange(clampValue(parsed));
+  };
+  const handleBlur = () => {
+    if (text.trim() === "") {
+      setText(String(value));
+      return;
+    }
+    const parsed = parseFloat(text);
+    if (isNaN(parsed)) {
+      setText(String(value));
+      return;
+    }
+    const clamped = clampValue(parsed);
+    setText(String(clamped));
+    if (clamped !== value) {
+      onChange(clamped);
+    }
   };
   const stepUp = () => {
-    let val = value + step;
-    if (max !== void 0) val = Math.min(max, val);
-    onChange(val);
+    const nextValue = clampValue(value + step);
+    setText(String(nextValue));
+    onChange(nextValue);
   };
   const stepDown = () => {
-    let val = value - step;
-    if (min !== void 0) val = Math.max(min, val);
-    onChange(val);
+    const nextValue = clampValue(value - step);
+    setText(String(nextValue));
+    onChange(nextValue);
   };
   return /* @__PURE__ */ jsxs(
     "div",
     {
-      className: `ui-input-number ${className}`,
-      style: {
-        display: "inline-flex",
-        alignItems: "center",
-        position: "relative",
-        ...style
-      },
+      className: `ui-input-number ui-input-number-root ${className}`,
+      style,
       children: [
         /* @__PURE__ */ jsx(
           "input",
           {
             type: "number",
-            value,
+            value: text,
             onChange: handleChange,
+            onBlur: handleBlur,
             min,
             max,
             step,
-            className: "ui-input",
-            style: {
-              paddingRight: unit ? "24px" : "48px",
-              textAlign: "right"
-            },
+            className: `ui-input ui-input-number-input ${unit ? "ui-input-number-input-with-unit" : "ui-input-number-input-with-controls"}`,
             ...props
           }
         ),
-        unit && /* @__PURE__ */ jsx("span", { style: {
-          position: "absolute",
-          right: "32px",
-          fontSize: "11px",
-          color: "var(--text-muted)"
-        }, children: unit }),
-        /* @__PURE__ */ jsxs("div", { className: "ui-input-number-controls", style: {
-          position: "absolute",
-          right: "4px",
-          display: "flex",
-          flexDirection: "column",
-          height: "calc(100% - 8px)",
-          gap: "2px"
-        }, children: [
+        unit && /* @__PURE__ */ jsx("span", { className: "ui-input-number-unit", children: unit }),
+        /* @__PURE__ */ jsxs("div", { className: "ui-input-number-controls", children: [
           /* @__PURE__ */ jsx(
             "button",
             {
               onClick: stepUp,
               className: "ui-input-number-btn",
               title: "Increase",
-              style: {
-                flex: 1,
-                background: "transparent",
-                border: "none",
-                color: "var(--text-muted)",
-                cursor: "pointer",
-                padding: "0 4px",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                fontSize: "8px"
-              },
+              style: { flex: 1 },
               children: "▲"
             }
           ),
@@ -6696,18 +8314,7 @@ const InputNumber = ({
               onClick: stepDown,
               className: "ui-input-number-btn",
               title: "Decrease",
-              style: {
-                flex: 1,
-                background: "transparent",
-                border: "none",
-                color: "var(--text-muted)",
-                cursor: "pointer",
-                padding: "0 4px",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                fontSize: "8px"
-              },
+              style: { flex: 1 },
               children: "▼"
             }
           )
@@ -6715,6 +8322,49 @@ const InputNumber = ({
       ]
     }
   );
+};
+
+const PaginationControls = ({
+  prevTitle,
+  nextTitle,
+  currentPage,
+  totalPages,
+  onPrev,
+  onNext,
+  rightContent
+}) => {
+  return /* @__PURE__ */ jsxs("div", { className: "ui-page-nav-wrap", children: [
+    /* @__PURE__ */ jsxs("div", { className: "ui-page-nav-group", children: [
+      /* @__PURE__ */ jsx(
+        Button,
+        {
+          variant: "ghost",
+          className: "ui-properties-action ui-icon-btn ui-page-nav-btn",
+          onClick: onPrev,
+          disabled: currentPage <= 1,
+          title: prevTitle,
+          children: /* @__PURE__ */ jsx(IconChevronLeft, { size: 20 })
+        }
+      ),
+      /* @__PURE__ */ jsxs("span", { className: "ui-page-nav-indicator", children: [
+        currentPage,
+        "/",
+        totalPages
+      ] }),
+      /* @__PURE__ */ jsx(
+        Button,
+        {
+          variant: "ghost",
+          className: "ui-properties-action ui-icon-btn ui-page-nav-btn",
+          onClick: onNext,
+          disabled: currentPage >= totalPages,
+          title: nextTitle,
+          children: /* @__PURE__ */ jsx(IconChevronRight, { size: 20 })
+        }
+      )
+    ] }),
+    rightContent
+  ] });
 };
 
 const ContextMenu = ({ x, y, items, onClose, theme }) => {
@@ -6755,7 +8405,7 @@ const ContextMenu = ({ x, y, items, onClose, theme }) => {
         }
         if (item.slider) {
           return /* @__PURE__ */ jsxs("div", { className: "ui-context-menu-item", style: { display: "flex", flexDirection: "column", gap: "4px", cursor: "default" }, children: [
-            /* @__PURE__ */ jsxs("div", { style: { display: "flex", justifyContent: "space-between", fontSize: "12px" }, children: [
+            /* @__PURE__ */ jsxs("div", { style: { display: "flex", justifyContent: "space-between", fontSize: "var(--font-size-secondary)" }, children: [
               /* @__PURE__ */ jsx("span", { children: item.label }),
               /* @__PURE__ */ jsxs("span", { children: [
                 Math.round((item.value || 0) * 100),
@@ -6863,6 +8513,12 @@ const ensureNodeChildrenLoaded = (node) => {
     children: getRawChildren(node).map((child) => createTreeNodeFromRaw(child, node.depth + 1))
   };
 };
+const rawTreeContainsUuid = (rawNode, targetUuid) => {
+  if (!rawNode) return false;
+  if (rawNode.id === targetUuid || rawNode.uuid === targetUuid) return true;
+  const children = Array.isArray(rawNode.children) ? rawNode.children : [];
+  return children.some((child) => rawTreeContainsUuid(child, targetUuid));
+};
 const getNodeSearchText = (node) => {
   const source = node?.object ?? node;
   const meta = source?.userData?.ifcMetadata || {};
@@ -6872,6 +8528,8 @@ const getNodeSearchText = (node) => {
     source?.bimId,
     source?.userData?.bimId,
     source?.userData?.expressID,
+    source?.userData?.ifcType,
+    source?.userData?.globalId,
     meta.storey,
     meta.category,
     meta.typeName,
@@ -6881,61 +8539,25 @@ const getNodeSearchText = (node) => {
     ...meta.classifications || []
   ].filter(Boolean).join(" ").toLowerCase();
 };
-const rawTreeContainsUuid = (rawNode, targetUuid) => {
-  if (!rawNode) return false;
-  if (rawNode.id === targetUuid || rawNode.uuid === targetUuid) return true;
-  const children = Array.isArray(rawNode.children) ? rawNode.children : [];
-  return children.some((child) => rawTreeContainsUuid(child, targetUuid));
-};
-const getNodeLocatorText = (node, mode) => {
-  const source = node?.object ?? node;
-  const meta = source?.userData?.ifcMetadata || {};
-  const valuesByMode = {
-    all: [
-      source?.name,
-      meta.globalId,
-      meta.typeName,
-      meta.category,
-      ...meta.classifications || []
-    ],
-    name: [source?.name],
-    globalId: [meta.globalId],
-    classification: meta.classifications || [],
-    typeName: [meta.typeName, meta.category]
-  };
-  return valuesByMode[mode].filter((value) => value !== void 0 && value !== null && value !== "").join(" ").toLowerCase();
-};
 const SceneTree = ({
   t,
   treeRoot,
   setTreeRoot,
   selectedUuid,
   locatedUuid,
-  selectedStorey,
   onSelect,
   onToggleVisibility,
   onDelete,
   onIsolate,
   onHide,
   onShowAll,
-  onApplyIfcFiltersToViewport,
-  onApplyStoreyWorkset,
   onLocate,
   onClearLocate,
   onLocateResultsChange,
-  locateResultUuids = []
+  locateResultUuids = [],
+  clashSummaryByUuid = {}
 }) => {
   const [searchQuery, setSearchQuery] = useState("");
-  const [locatorMode, setLocatorMode] = useState("all");
-  const [locatorQuery, setLocatorQuery] = useState("");
-  const [locatorIndex, setLocatorIndex] = useState(0);
-  const [filters, setFilters] = useState({
-    storey: "",
-    elevation: "",
-    system: "",
-    category: "",
-    material: ""
-  });
   const [contextMenu, setContextMenu] = useState(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [containerHeight, setContainerHeight] = useState(400);
@@ -6943,57 +8565,7 @@ const SceneTree = ({
   const selectionSourceRef = useRef(null);
   const searchExpandedStateRef = useRef(null);
   const previousSearchQueryRef = useRef("");
-  const lastLocateResultsRef = useRef([]);
-  const collectIfcOptions = (nodes) => {
-    const storeys = /* @__PURE__ */ new Set();
-    const systems = /* @__PURE__ */ new Set();
-    const categories = /* @__PURE__ */ new Set();
-    const materials = /* @__PURE__ */ new Set();
-    const elevations = /* @__PURE__ */ new Set();
-    let hasIfcModel = false;
-    const walk = (list) => {
-      list.forEach((entry) => {
-        const source = entry?.object ?? entry;
-        const meta = source?.userData?.ifcMetadata;
-        if (source?.userData?.isIFC || meta) hasIfcModel = true;
-        if (meta?.storey) storeys.add(meta.storey);
-        if (typeof meta?.elevation === "number" && Number.isFinite(meta.elevation)) elevations.add(meta.elevation);
-        if (meta?.category) categories.add(meta.category);
-        meta?.systems?.forEach((item) => systems.add(item));
-        meta?.materials?.forEach((item) => materials.add(item));
-        const rawChildren = getRawChildren(entry);
-        if (rawChildren.length > 0) walk(rawChildren);
-      });
-    };
-    walk(nodes);
-    const sort = (set) => Array.from(set).sort((a, b) => a.localeCompare(b, "zh-Hans-CN"));
-    return {
-      storeys: sort(storeys),
-      elevations: Array.from(elevations).sort((a, b) => a - b),
-      systems: sort(systems),
-      categories: sort(categories),
-      materials: sort(materials),
-      hasIfcModel
-    };
-  };
-  const ifcOptions = useMemo(() => collectIfcOptions(treeRoot), [treeRoot]);
-  const hasIfcFilters = ifcOptions.storeys.length > 0 || ifcOptions.elevations.length > 0 || ifcOptions.systems.length > 0 || ifcOptions.categories.length > 0 || ifcOptions.materials.length > 0;
-  const hasIfcLocator = ifcOptions.hasIfcModel;
-  const hasActiveFilters = Object.values(filters).some(Boolean);
-  const selectedStoreyIndex = selectedStorey ? ifcOptions.storeys.indexOf(selectedStorey) : -1;
-  const adjacentStoreys = selectedStoreyIndex >= 0 ? ifcOptions.storeys.filter((_item, index) => Math.abs(index - selectedStoreyIndex) <= 1) : [];
-  const canApplyCurrentStorey = Boolean(selectedStorey);
-  const canApplyAdjacentStoreys = adjacentStoreys.length > 1;
-  const matchesIfcFilters = (meta) => {
-    if (!hasActiveFilters) return true;
-    if (!meta) return false;
-    if (filters.storey && meta.storey !== filters.storey) return false;
-    if (filters.elevation && String(meta.elevation) !== filters.elevation) return false;
-    if (filters.category && meta.category !== filters.category) return false;
-    if (filters.system && !(meta.systems || []).includes(filters.system)) return false;
-    if (filters.material && !(meta.materials || []).includes(filters.material)) return false;
-    return true;
-  };
+  const [activeTreeUuid, setActiveTreeUuid] = useState(null);
   useEffect(() => {
     if (!containerRef.current) return;
     const resizeObserver = new ResizeObserver((entries) => {
@@ -7015,20 +8587,20 @@ const SceneTree = ({
     previousSearchQueryRef.current = searchQuery;
   }, [searchQuery, setTreeRoot, treeRoot]);
   useEffect(() => {
-    if (!selectedUuid) return;
+    if (!activeTreeUuid) return;
     if (selectionSourceRef.current !== "tree") return;
     setTreeRoot((prev) => {
       const expandSelectedPath = (nodes) => {
         let found2 = false;
         const nextNodes = nodes.map((node) => {
           let workingNode = node;
-          if (node.uuid === selectedUuid) {
+          if (node.uuid === activeTreeUuid) {
             found2 = true;
             return node;
           }
           if (!node.childrenLoaded && node.hasChildren) {
             const rawChildren = getRawChildren(node);
-            const containsTarget = rawChildren.some((child) => rawTreeContainsUuid(child, selectedUuid));
+            const containsTarget = rawChildren.some((child) => rawTreeContainsUuid(child, activeTreeUuid));
             if (containsTarget) {
               workingNode = ensureNodeChildrenLoaded(node);
             }
@@ -7046,28 +8618,27 @@ const SceneTree = ({
       const [nextTree, found] = expandSelectedPath(prev);
       return found ? nextTree : prev;
     });
-  }, [selectedUuid, setTreeRoot]);
+  }, [activeTreeUuid, setTreeRoot]);
   const filterTree = (nodes, query) => {
     const lowercaseQuery = query.toLowerCase();
     return nodes.reduce((acc, node) => {
-      const meta = node.object?.userData?.ifcMetadata;
       const matchesQuery = !query || getNodeSearchText(node).includes(lowercaseQuery);
-      const matchesFilter = matchesIfcFilters(meta);
-      const sourceChildren = query || hasActiveFilters ? getRawChildren(node).map((child) => createTreeNodeFromRaw(child, node.depth + 1)) : node.children;
+      const sourceChildren = query ? getRawChildren(node).map((child) => createTreeNodeFromRaw(child, node.depth + 1)) : node.children;
       const filteredChildren = filterTree(sourceChildren, query);
-      if (matchesQuery && matchesFilter || filteredChildren.length > 0) {
+      const includeByQuery = !query || matchesQuery || filteredChildren.length > 0;
+      if (includeByQuery) {
         acc.push({
           ...node,
-          childrenLoaded: query || hasActiveFilters ? true : node.childrenLoaded,
+          childrenLoaded: query ? true : node.childrenLoaded,
           hasChildren: node.hasChildren ?? getRawChildren(node).length > 0,
-          expanded: query || hasActiveFilters ? true : node.expanded,
+          expanded: query ? true : node.expanded,
           children: filteredChildren
         });
       }
       return acc;
     }, []);
   };
-  const filteredTree = useMemo(() => filterTree(treeRoot, searchQuery), [treeRoot, searchQuery, filters, hasActiveFilters]);
+  const filteredTree = useMemo(() => filterTree(treeRoot, searchQuery), [treeRoot, searchQuery]);
   const flatData = useMemo(() => flattenTree(filteredTree), [filteredTree]);
   const firstSearchMatch = useMemo(() => {
     if (!searchQuery) return null;
@@ -7080,21 +8651,20 @@ const SceneTree = ({
     }
     return null;
   }, [searchQuery, treeRoot]);
-  const locatorMatches = useMemo(() => {
-    if (!locatorQuery.trim()) return [];
-    const query = locatorQuery.trim().toLowerCase();
+  const searchMatches = useMemo(() => {
+    if (!searchQuery.trim()) return [];
+    const query = searchQuery.trim().toLowerCase();
     const results = [];
     const stack = [...treeRoot];
     while (stack.length > 0) {
       const node = stack.shift();
-      if (getNodeLocatorText(node, locatorMode).includes(query)) {
+      if (getNodeSearchText(node).includes(query)) {
         results.push(node);
       }
       getRawChildren(node).map((child) => createTreeNodeFromRaw(child, (node.depth ?? 0) + 1)).forEach((child) => stack.push(child));
     }
     return results;
-  }, [locatorMode, locatorQuery, treeRoot]);
-  const clampedLocatorIndex = locatorMatches.length > 0 ? Math.min(locatorIndex, locatorMatches.length - 1) : 0;
+  }, [searchQuery, treeRoot]);
   const rowHeight = 24;
   const totalHeight = flatData.length * rowHeight;
   const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight));
@@ -7106,6 +8676,10 @@ const SceneTree = ({
       selectionSourceRef.current = null;
     }
   }, [selectedUuid]);
+  useEffect(() => {
+    const nextLocateResults = searchQuery.trim() ? searchMatches.map((item) => item.uuid) : [];
+    onLocateResultsChange?.(nextLocateResults);
+  }, [searchMatches, searchQuery, onLocateResultsChange]);
   const toggleNode = (nodeUuid) => {
     const toggle = (nodes) => nodes.map((node) => {
       if (node.uuid === nodeUuid) {
@@ -7138,38 +8712,28 @@ const SceneTree = ({
   };
   const handleLocateFirstMatch = () => {
     if (!firstSearchMatch) return;
-    onSelect(firstSearchMatch.uuid, firstSearchMatch.object);
     onLocate?.(firstSearchMatch.object);
   };
-  const handleLocateIfcMatch = (matchIndex = 0) => {
-    const target = locatorMatches[matchIndex];
-    if (!target) return;
-    onSelect(target.uuid, target.object);
-    onLocate?.(target.object);
+  const getClashBadge = (uuid) => {
+    const summary = clashSummaryByUuid[uuid];
+    if (!summary) return null;
+    if (summary.worstStatus === "new") {
+      return {
+        label: `${t("clash_group_new")} ${summary.newCount}`,
+        color: "var(--error)"
+      };
+    }
+    if (summary.worstStatus === "confirmed") {
+      return {
+        label: `${t("clash_group_confirmed")} ${summary.confirmedCount}`,
+        color: "var(--warning, #f59e0b)"
+      };
+    }
+    return {
+      label: `${t("clash_group_resolved")} ${summary.resolvedCount}`,
+      color: "var(--success)"
+    };
   };
-  useEffect(() => {
-    setLocatorIndex(0);
-  }, [locatorMode, locatorQuery]);
-  useEffect(() => {
-    if (!locatorQuery.trim()) {
-      onClearLocate?.();
-    }
-  }, [locatorQuery, onClearLocate]);
-  useEffect(() => {
-    const nextLocateResults = locatorQuery.trim() ? locatorMatches.map((item) => item.uuid) : [];
-    const prevLocateResults = lastLocateResultsRef.current;
-    const changed = prevLocateResults.length !== nextLocateResults.length || prevLocateResults.some((uuid, index) => uuid !== nextLocateResults[index]);
-    if (!changed) return;
-    lastLocateResultsRef.current = nextLocateResults;
-    onLocateResultsChange?.(nextLocateResults);
-  }, [locatorMatches, locatorQuery, onLocateResultsChange]);
-  useEffect(() => {
-    if (locatorMatches.length === 0 && locatorIndex !== 0) {
-      setLocatorIndex(0);
-    } else if (locatorMatches.length > 0 && locatorIndex > locatorMatches.length - 1) {
-      setLocatorIndex(locatorMatches.length - 1);
-    }
-  }, [locatorIndex, locatorMatches.length]);
   return /* @__PURE__ */ jsxs("div", { className: "ui-tree-panel", children: [
     /* @__PURE__ */ jsxs("div", { className: "ui-search-bar", children: [
       /* @__PURE__ */ jsxs("div", { className: "ui-search-input-wrap", children: [
@@ -7193,9 +8757,9 @@ const SceneTree = ({
       ] }),
       searchQuery && /* @__PURE__ */ jsxs("div", { className: "ui-tree-search-meta", children: [
         /* @__PURE__ */ jsxs("span", { children: [
-          t("search_results") || "结果",
+          t("search_results"),
           ": ",
-          flatData.length
+          searchMatches.length
         ] }),
         /* @__PURE__ */ jsx(
           Button,
@@ -7204,212 +8768,7 @@ const SceneTree = ({
             className: "ui-properties-action",
             onClick: handleLocateFirstMatch,
             disabled: !firstSearchMatch,
-            children: t("locate_first_match") || "定位首个匹配"
-          }
-        )
-      ] }),
-      hasIfcLocator && /* @__PURE__ */ jsxs("div", { className: "ui-tree-locator", children: [
-        /* @__PURE__ */ jsx(
-          Select,
-          {
-            value: locatorMode,
-            onChange: (value) => setLocatorMode(value),
-            options: [
-              { value: "all", label: t("ifc_locator_all") || "综合" },
-              { value: "name", label: t("ifc_locator_name") || "名称" },
-              { value: "globalId", label: t("ifc_locator_globalid") || "GlobalId" },
-              { value: "classification", label: t("ifc_locator_classification") || "分类编码" },
-              { value: "typeName", label: t("ifc_locator_type") || "类型" }
-            ],
-            className: "ui-input-compact"
-          }
-        ),
-        /* @__PURE__ */ jsxs("div", { className: "ui-search-input-wrap", children: [
-          /* @__PURE__ */ jsx(
-            "input",
-            {
-              type: "text",
-              placeholder: t("ifc_locator_placeholder") || "按 IFC 标识定位...",
-              value: locatorQuery,
-              onChange: (e) => {
-                setLocatorQuery(e.target.value);
-                setLocatorIndex(0);
-              },
-              onKeyDown: (e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  handleLocateIfcMatch(clampedLocatorIndex);
-                }
-              },
-              className: "ui-input ui-input-compact"
-            }
-          ),
-          locatorQuery && /* @__PURE__ */ jsx("button", { className: "ui-search-clear", onClick: () => {
-            setLocatorQuery("");
-            setLocatorIndex(0);
-          }, children: /* @__PURE__ */ jsx(IconClose, { width: 14, height: 14 }) })
-        ] })
-      ] }),
-      hasIfcLocator && locatorQuery && /* @__PURE__ */ jsxs("div", { className: "ui-tree-search-meta", children: [
-        /* @__PURE__ */ jsxs("span", { children: [
-          t("ifc_locator_results") || "IFC结果",
-          ": ",
-          locatorMatches.length,
-          locatorMatches.length > 0 ? ` (${clampedLocatorIndex + 1}/${locatorMatches.length})` : ""
-        ] }),
-        /* @__PURE__ */ jsxs("div", { className: "ui-tree-search-actions", children: [
-          /* @__PURE__ */ jsx(
-            Button,
-            {
-              variant: "ghost",
-              className: "ui-properties-action ui-icon-btn ui-tree-locator-btn",
-              onClick: () => {
-                const nextIndex = Math.max(0, clampedLocatorIndex - 1);
-                setLocatorIndex(nextIndex);
-                handleLocateIfcMatch(nextIndex);
-              },
-              disabled: locatorMatches.length === 0 || clampedLocatorIndex === 0,
-              title: t("ifc_locator_prev") || "上一个",
-              children: /* @__PURE__ */ jsx(IconChevronLeft, { size: 18 })
-            }
-          ),
-          /* @__PURE__ */ jsx(
-            Button,
-            {
-              variant: "ghost",
-              className: "ui-properties-action ui-icon-btn ui-tree-locator-btn",
-              onClick: () => {
-                const nextIndex = Math.min(locatorMatches.length - 1, clampedLocatorIndex + 1);
-                setLocatorIndex(nextIndex);
-                handleLocateIfcMatch(nextIndex);
-              },
-              disabled: locatorMatches.length === 0 || clampedLocatorIndex >= locatorMatches.length - 1,
-              title: t("ifc_locator_next") || "下一个",
-              children: /* @__PURE__ */ jsx(IconChevronRight, { size: 18 })
-            }
-          ),
-          /* @__PURE__ */ jsx(
-            Button,
-            {
-              variant: "ghost",
-              className: "ui-properties-action ui-icon-btn ui-tree-locator-btn",
-              onClick: () => handleLocateIfcMatch(clampedLocatorIndex),
-              disabled: locatorMatches.length === 0,
-              title: t("ifc_locator_action") || "定位构件",
-              children: /* @__PURE__ */ jsx(IconTarget, { size: 18 })
-            }
-          )
-        ] })
-      ] })
-    ] }),
-    hasIfcFilters && /* @__PURE__ */ jsxs("div", { className: "ui-tree-filters", children: [
-      /* @__PURE__ */ jsxs("div", { className: "ui-tree-filter-grid", children: [
-        /* @__PURE__ */ jsx(
-          Select,
-          {
-            value: filters.storey,
-            onChange: (value) => setFilters((prev) => ({ ...prev, storey: value })),
-            options: [
-              { value: "", label: t("ifc_filter_storey") || "全部楼层" },
-              ...ifcOptions.storeys.map((item) => ({ value: item, label: item }))
-            ],
-            className: "ui-input-compact"
-          }
-        ),
-        /* @__PURE__ */ jsx(
-          Select,
-          {
-            value: filters.system,
-            onChange: (value) => setFilters((prev) => ({ ...prev, system: value })),
-            options: [
-              { value: "", label: t("ifc_filter_system") || "全部系统" },
-              ...ifcOptions.systems.map((item) => ({ value: item, label: item }))
-            ],
-            className: "ui-input-compact"
-          }
-        ),
-        /* @__PURE__ */ jsx(
-          Select,
-          {
-            value: filters.elevation,
-            onChange: (value) => setFilters((prev) => ({ ...prev, elevation: value })),
-            options: [
-              { value: "", label: t("ifc_filter_elevation") || "全部标高" },
-              ...ifcOptions.elevations.map((item) => ({ value: String(item), label: String(item) }))
-            ],
-            className: "ui-input-compact"
-          }
-        ),
-        /* @__PURE__ */ jsx(
-          Select,
-          {
-            value: filters.category,
-            onChange: (value) => setFilters((prev) => ({ ...prev, category: value })),
-            options: [
-              { value: "", label: t("ifc_filter_category") || "全部类别" },
-              ...ifcOptions.categories.map((item) => ({ value: item, label: item }))
-            ],
-            className: "ui-input-compact"
-          }
-        ),
-        /* @__PURE__ */ jsx(
-          Select,
-          {
-            value: filters.material,
-            onChange: (value) => setFilters((prev) => ({ ...prev, material: value })),
-            options: [
-              { value: "", label: t("ifc_filter_material") || "全部材质" },
-              ...ifcOptions.materials.map((item) => ({ value: item, label: item }))
-            ],
-            className: "ui-input-compact"
-          }
-        )
-      ] }),
-      hasActiveFilters && /* @__PURE__ */ jsxs("div", { className: "ui-tree-filter-actions", children: [
-        /* @__PURE__ */ jsx(
-          Button,
-          {
-            variant: "ghost",
-            className: "ui-properties-action",
-            onClick: () => onApplyIfcFiltersToViewport?.(filters),
-            children: t("ifc_filter_apply_viewport") || "应用到视口"
-          }
-        ),
-        /* @__PURE__ */ jsx(
-          Button,
-          {
-            variant: "ghost",
-            className: "ui-properties-action",
-            onClick: () => setFilters({
-              storey: "",
-              elevation: "",
-              system: "",
-              category: "",
-              material: ""
-            }),
-            children: t("ifc_filter_clear") || "清除筛选"
-          }
-        )
-      ] }),
-      selectedStorey && /* @__PURE__ */ jsxs("div", { className: "ui-tree-filter-actions ui-tree-workset-actions", children: [
-        /* @__PURE__ */ jsx(
-          Button,
-          {
-            variant: "ghost",
-            className: "ui-properties-action",
-            onClick: () => onApplyStoreyWorkset?.([selectedStorey]),
-            disabled: !canApplyCurrentStorey,
-            children: t("ifc_workset_current") || "当前楼层"
-          }
-        ),
-        /* @__PURE__ */ jsx(
-          Button,
-          {
-            variant: "ghost",
-            className: "ui-properties-action",
-            onClick: () => onApplyStoreyWorkset?.(adjacentStoreys),
-            disabled: !canApplyAdjacentStoreys,
-            children: t("ifc_workset_adjacent") || "上下楼层"
+            children: t("locate_first_match")
           }
         )
       ] })
@@ -7423,10 +8782,11 @@ const SceneTree = ({
         children: /* @__PURE__ */ jsx("div", { style: { height: totalHeight, position: "relative" }, children: /* @__PURE__ */ jsx("div", { style: { position: "absolute", top: startIndex * rowHeight, left: 0, right: 0 }, children: visibleItems.map((node) => /* @__PURE__ */ jsxs(
           "div",
           {
-            className: `ui-tree-node ${node.uuid === selectedUuid ? "selected" : ""} ${locateResultUuids.includes(node.uuid) ? "matched" : ""} ${node.uuid === locatedUuid ? "located" : ""}`,
+            className: `ui-tree-node ${node.uuid === activeTreeUuid ? "selected" : ""} ${locateResultUuids.includes(node.uuid) ? "matched" : ""} ${node.uuid === locatedUuid ? "located" : ""}`,
             style: { paddingLeft: 8 + node.depth * 16 },
             onClick: () => {
               selectionSourceRef.current = "tree";
+              setActiveTreeUuid(node.uuid);
               onSelect(node.uuid, node.object);
             },
             onDoubleClick: (e) => {
@@ -7459,9 +8819,33 @@ const SceneTree = ({
                   style: { marginRight: 4, padding: 0, flexShrink: 0 }
                 }
               ),
-              /* @__PURE__ */ jsx("div", { className: "ui-tree-label", children: searchQuery && node.name.toLowerCase().includes(searchQuery.toLowerCase()) ? /* @__PURE__ */ jsx("span", { children: node.name.split(new RegExp(`(${searchQuery})`, "gi")).map(
-                (part, index) => part.toLowerCase() === searchQuery.toLowerCase() ? /* @__PURE__ */ jsx("span", { className: "ui-search-hit", children: part }, index) : part
-              ) }) : node.name })
+              /* @__PURE__ */ jsxs("div", { className: "ui-tree-label", children: [
+                searchQuery && node.name.toLowerCase().includes(searchQuery.toLowerCase()) ? /* @__PURE__ */ jsx("span", { children: node.name.split(new RegExp(`(${searchQuery})`, "gi")).map(
+                  (part, index) => part.toLowerCase() === searchQuery.toLowerCase() ? /* @__PURE__ */ jsx("span", { className: "ui-search-hit", children: part }, index) : part
+                ) }) : node.name,
+                (() => {
+                  const badge = getClashBadge(node.uuid);
+                  if (!badge) return null;
+                  return /* @__PURE__ */ jsx(
+                    "span",
+                    {
+                      style: {
+                        marginLeft: 6,
+                        padding: "0 6px",
+                        borderRadius: "var(--radius-xl)",
+                        border: `1px solid ${badge.color}`,
+                        color: badge.color,
+                        fontSize: "var(--font-size-label)",
+                        lineHeight: "16px",
+                        display: "inline-flex",
+                        alignItems: "center",
+                        verticalAlign: "middle"
+                      },
+                      children: badge.label
+                    }
+                  );
+                })()
+              ] })
             ]
           },
           node.uuid
@@ -7476,10 +8860,12 @@ const SceneTree = ({
         onClose: () => setContextMenu(null),
         items: [
           {
-            label: t("locate_in_view") || "定位到视图",
+            label: t("locate_in_view"),
             onClick: () => onLocate?.(contextMenu.node.object)
           },
-          { divider: true },
+          {
+            divider: true
+          },
           {
             label: t("expand_all"),
             onClick: expandAll
@@ -7513,7 +8899,8 @@ const FloatingPanel = ({
   movable = true,
   storageId,
   modal = false,
-  autoHeight = height === void 0
+  autoHeight = height === void 0,
+  closeLabel = "Close"
 }) => {
   const panelRef = useRef(null);
   const minWidth = storageId === "tool_measure" ? 320 : 220;
@@ -7716,22 +9103,14 @@ const FloatingPanel = ({
     modal && /* @__PURE__ */ jsx(
       "div",
       {
-        style: {
-          position: "fixed",
-          top: 0,
-          left: 0,
-          right: 0,
-          bottom: 0,
-          backgroundColor: "rgba(0, 0, 0, 0.6)",
-          zIndex: 1999
-        }
+        className: "ui-modal-scrim"
       }
     ),
     /* @__PURE__ */ jsxs(
       "div",
       {
         ref: panelRef,
-        className: "ui-panel",
+        className: `ui-panel${modal ? " ui-panel-modal" : ""}`,
         style: {
           position: modal ? "fixed" : "absolute",
           left: 0,
@@ -7756,7 +9135,7 @@ const FloatingPanel = ({
                   {
                     className: "ui-panel-close",
                     onClick: onCloseClick,
-                    title: "Close",
+                    title: closeLabel,
                     children: /* @__PURE__ */ jsx(IconClose, { width: 14, height: 14 })
                   }
                 )
@@ -7780,30 +9159,20 @@ const FloatingPanel = ({
 const Row$1 = ({ label, children, labelWidth = "80px", stretch = false }) => /* @__PURE__ */ jsxs(
   "div",
   {
-    className: "flex items-center justify-between",
-    style: { marginBottom: "6px", minHeight: "26px", gap: "12px" },
+    className: "ui-form-row ui-form-row-tight",
     children: [
       /* @__PURE__ */ jsx(
         "span",
         {
-          className: "text-sm text-secondary flex-shrink-0",
-          style: {
-            minWidth: labelWidth
-          },
+          className: "ui-form-label ui-form-label-dynamic",
+          style: { ["--label-width"]: labelWidth },
           children: label
         }
       ),
       /* @__PURE__ */ jsx(
         "div",
         {
-          className: "flex items-center",
-          style: {
-            flex: stretch ? 1 : "0 1 auto",
-            // stretch时flex:1，否则不伸缩
-            justifyContent: stretch ? "flex-start" : "flex-end",
-            minWidth: stretch ? 0 : void 0
-            // stretch时允许缩小
-          },
+          className: `ui-form-value ${stretch ? "ui-form-value-stretch" : ""} ${stretch ? "" : "ui-form-value-end"}`,
           children
         }
       )
@@ -7823,10 +9192,6 @@ const SettingsPanel = ({
   // 当前语言
   setLang,
   // 设置语言回调
-  themeMode,
-  // 主题模式
-  setThemeMode,
-  // 设置主题回调
   showStats,
   // 是否显示统计
   setShowStats,
@@ -7838,6 +9203,7 @@ const SettingsPanel = ({
   const [activeTab, setActiveTab] = useState("general");
   const tabOptions = [
     { value: "general", label: t("setting_general") || "通用" },
+    { value: "lighting", label: t("st_lighting") || "光照" },
     { value: "viewport", label: t("st_viewport") || "视口" },
     { value: "highlight", label: t("st_highlight") || "高亮" }
   ];
@@ -7845,33 +9211,23 @@ const SettingsPanel = ({
     FloatingPanel,
     {
       title: t("settings"),
+      closeLabel: t("panel_close") || "关闭",
       onClose,
       width: 360,
       height: 400,
       modal: true,
       movable: false,
       theme,
-      children: /* @__PURE__ */ jsxs("div", { style: { padding: "10px", display: "flex", flexDirection: "column", gap: "6px", height: "100%", overflowY: "auto" }, children: [
-        /* @__PURE__ */ jsx("div", { style: { position: "sticky", top: 0, zIndex: 1, background: "var(--bg-panel)", paddingBottom: "6px" }, children: /* @__PURE__ */ jsx(
-          SegmentedControl$1,
+      children: /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-body", style: { flex: 1, minHeight: 0 }, children: [
+        /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-sticky-tabs", children: /* @__PURE__ */ jsx(
+          SegmentedControl,
           {
             options: tabOptions,
             value: activeTab,
             onChange: (value) => setActiveTab(value)
           }
         ) }),
-        activeTab === "general" && /* @__PURE__ */ jsxs("div", { className: "mb-2", style: { padding: "0 6px" }, children: [
-          /* @__PURE__ */ jsx(Row$1, { label: t("st_theme"), labelWidth: "70px", children: /* @__PURE__ */ jsx("div", { style: { flex: 1, display: "flex", justifyContent: "flex-end" }, children: /* @__PURE__ */ jsx(
-            SegmentedControl$1,
-            {
-              options: [
-                { value: "light", label: t("theme_light") || "Light" },
-                { value: "dark", label: t("theme_dark") || "Dark" }
-              ],
-              value: themeMode,
-              onChange: (v) => setThemeMode(v)
-            }
-          ) }) }),
+        activeTab === "general" && /* @__PURE__ */ jsxs("div", { className: "ui-panel-stack", children: [
           /* @__PURE__ */ jsx(Row$1, { label: t("st_lang"), labelWidth: "70px", stretch: true, children: /* @__PURE__ */ jsx(
             Select,
             {
@@ -7891,9 +9247,50 @@ const SettingsPanel = ({
             }
           ) })
         ] }),
-        activeTab === "viewport" && /* @__PURE__ */ jsxs("div", { className: "mb-2", style: { padding: "0 6px" }, children: [
-          /* @__PURE__ */ jsx(Row$1, { label: t("st_viewcube_size"), labelWidth: "90px", stretch: true, children: /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", gap: "8px", width: "100%" }, children: [
-            /* @__PURE__ */ jsx("div", { style: { flex: 1, minWidth: 0 }, children: /* @__PURE__ */ jsx(
+        activeTab === "lighting" && /* @__PURE__ */ jsxs("div", { className: "ui-panel-stack", children: [
+          /* @__PURE__ */ jsx(Row$1, { label: t("st_ambient") || "环境光", labelWidth: "90px", stretch: true, children: /* @__PURE__ */ jsxs("div", { className: "ui-slider-field", children: [
+            /* @__PURE__ */ jsx("div", { className: "ui-inline-actions-stretch", children: /* @__PURE__ */ jsx(
+              Slider,
+              {
+                min: 0,
+                max: 4,
+                step: 0.05,
+                value: settings.ambientInt || 0,
+                onChange: (value) => onUpdate({ ambientInt: value })
+              }
+            ) }),
+            /* @__PURE__ */ jsx("div", { className: "ui-result-item-secondary-value", children: (settings.ambientInt || 0).toFixed(2) })
+          ] }) }),
+          /* @__PURE__ */ jsx(Row$1, { label: t("st_dir") || "主光", labelWidth: "90px", stretch: true, children: /* @__PURE__ */ jsxs("div", { className: "ui-slider-field", children: [
+            /* @__PURE__ */ jsx("div", { className: "ui-inline-actions-stretch", children: /* @__PURE__ */ jsx(
+              Slider,
+              {
+                min: 0,
+                max: 4,
+                step: 0.05,
+                value: settings.dirInt || 0,
+                onChange: (value) => onUpdate({ dirInt: value })
+              }
+            ) }),
+            /* @__PURE__ */ jsx("div", { className: "ui-result-item-secondary-value", children: (settings.dirInt || 0).toFixed(2) })
+          ] }) }),
+          /* @__PURE__ */ jsx(Row$1, { label: t("st_back") || "背光", labelWidth: "90px", stretch: true, children: /* @__PURE__ */ jsxs("div", { className: "ui-slider-field", children: [
+            /* @__PURE__ */ jsx("div", { className: "ui-inline-actions-stretch", children: /* @__PURE__ */ jsx(
+              Slider,
+              {
+                min: 0,
+                max: 2,
+                step: 0.05,
+                value: settings.backLightInt ?? 0.5,
+                onChange: (value) => onUpdate({ backLightInt: value })
+              }
+            ) }),
+            /* @__PURE__ */ jsx("div", { className: "ui-result-item-secondary-value", children: (settings.backLightInt ?? 0.5).toFixed(2) })
+          ] }) })
+        ] }),
+        activeTab === "viewport" && /* @__PURE__ */ jsxs("div", { className: "ui-panel-stack", children: [
+          /* @__PURE__ */ jsx(Row$1, { label: t("st_viewcube_size"), labelWidth: "90px", stretch: true, children: /* @__PURE__ */ jsxs("div", { className: "ui-slider-field", children: [
+            /* @__PURE__ */ jsx("div", { className: "ui-inline-actions-stretch", children: /* @__PURE__ */ jsx(
               Slider,
               {
                 min: 120,
@@ -7903,8 +9300,8 @@ const SettingsPanel = ({
                 onChange: (value) => onUpdate({ viewCubeSize: value })
               }
             ) }),
-            /* @__PURE__ */ jsxs("div", { style: { color: "var(--text-secondary)", fontSize: "12px", minWidth: "44px", textAlign: "right" }, children: [
-              settings.viewCubeSize || 100,
+            /* @__PURE__ */ jsxs("div", { className: "ui-result-item-secondary-value ui-result-item-secondary-value-wide", children: [
+              settings.viewCubeSize || 120,
               "px"
             ] })
           ] }) }),
@@ -7915,8 +9312,8 @@ const SettingsPanel = ({
               onChange: (v) => onUpdate({ adaptiveQuality: v })
             }
           ) }),
-          /* @__PURE__ */ jsx(Row$1, { label: t("st_performance_profile") || "性能策略", labelWidth: "90px", children: /* @__PURE__ */ jsx("div", { style: { flex: 1, display: "flex", justifyContent: "flex-end" }, children: /* @__PURE__ */ jsx(
-            SegmentedControl$1,
+          /* @__PURE__ */ jsx(Row$1, { label: t("st_performance_profile") || "性能策略", labelWidth: "90px", children: /* @__PURE__ */ jsx("div", { className: "ui-inline-actions ui-inline-actions-end", children: /* @__PURE__ */ jsx(
+            SegmentedControl,
             {
               options: [
                 { value: "smooth", label: t("st_perf_smooth") || "流畅优先" },
@@ -7928,7 +9325,7 @@ const SettingsPanel = ({
             }
           ) }) })
         ] }),
-        activeTab === "highlight" && /* @__PURE__ */ jsxs("div", { className: "mb-2", style: { padding: "0 6px" }, children: [
+        activeTab === "highlight" && /* @__PURE__ */ jsxs("div", { className: "ui-panel-stack", children: [
           /* @__PURE__ */ jsx(Row$1, { label: t("st_highlight_color") || "高亮颜色", labelWidth: "90px", stretch: true, children: /* @__PURE__ */ jsx(
             ColorPicker,
             {
@@ -7951,68 +9348,33 @@ const SettingsPanel = ({
 
 const Icons = {
   Trash: () => /* @__PURE__ */ jsx("svg", { width: "14", height: "14", viewBox: "0 0 16 16", fill: "none", stroke: "currentColor", strokeWidth: "1.5", children: /* @__PURE__ */ jsx("path", { d: "M2 4h12M5 4V3a1 1 0 011-1h4a1 1 0 011 1v1M6 7v5M10 7v5M3 4l1 9a1 1 0 001 1h6a1 1 0 001-1l1-9", strokeLinecap: "round", strokeLinejoin: "round" }) }),
-  Distance: () => /* @__PURE__ */ jsx("svg", { width: "14", height: "14", viewBox: "0 0 16 16", fill: "none", stroke: "currentColor", strokeWidth: "1.5", children: /* @__PURE__ */ jsx("path", { d: "M2 8h12M8 4l4 4-4 4", strokeLinecap: "round", strokeLinejoin: "round" }) }),
-  Angle: () => /* @__PURE__ */ jsx("svg", { width: "14", height: "14", viewBox: "0 0 16 16", fill: "none", stroke: "currentColor", strokeWidth: "1.5", children: /* @__PURE__ */ jsx("path", { d: "M2 14L14 14M2 14l3.5-12 6 8", strokeLinecap: "round", strokeLinejoin: "round" }) }),
-  Coordinate: () => /* @__PURE__ */ jsxs("svg", { width: "14", height: "14", viewBox: "0 0 16 16", fill: "none", stroke: "currentColor", strokeWidth: "1.5", children: [
-    /* @__PURE__ */ jsx("circle", { cx: "8", cy: "8", r: "6" }),
-    /* @__PURE__ */ jsx("path", { d: "M8 2v12M2 8h12", strokeLinecap: "round" })
-  ] }),
-  None: () => /* @__PURE__ */ jsxs("svg", { width: "14", height: "14", viewBox: "0 0 16 16", fill: "none", stroke: "currentColor", strokeWidth: "1.5", children: [
-    /* @__PURE__ */ jsx("circle", { cx: "8", cy: "8", r: "6" }),
-    /* @__PURE__ */ jsx("path", { d: "M5 5l6 6M11 5l-6 6", strokeLinecap: "round" })
-  ] }),
   Close: () => /* @__PURE__ */ jsx("svg", { width: "12", height: "12", viewBox: "0 0 14 14", fill: "none", stroke: "currentColor", strokeWidth: "1.5", children: /* @__PURE__ */ jsx("path", { d: "M2 2L12 12M12 2L2 12", strokeLinecap: "round" }) })
-};
-const SegmentedControl = ({ options, value, onChange }) => {
-  return /* @__PURE__ */ jsx("div", { className: "ui-segmented", children: options.map((option) => /* @__PURE__ */ jsx(
-    "button",
-    {
-      className: `ui-segmented-item ${value === option.value ? "active" : ""}`,
-      onClick: () => onChange(option.value),
-      children: /* @__PURE__ */ jsx("span", { children: option.label })
-    },
-    option.value
-  )) });
 };
 const ClearButton = ({ onClick, disabled }) => {
   return /* @__PURE__ */ jsx(
-    "button",
+    Button,
     {
       onClick,
       disabled,
-      className: `ui-btn ui-btn-icon ui-btn-ghost ${disabled ? "disabled" : ""}`,
+      variant: "ghost",
+      size: "sm",
+      className: "ui-btn-icon",
       title: "Clear All",
       children: /* @__PURE__ */ jsx(Icons.Trash, {})
     }
   );
 };
 const DataPanel = ({ children, empty, emptyText }) => {
-  return /* @__PURE__ */ jsx("div", { className: "ui-data-panel flex flex-col", children: empty ? /* @__PURE__ */ jsx("div", { className: "flex flex-col items-center justify-center", style: { flex: 1, minHeight: "100px" }, children: /* @__PURE__ */ jsx("span", { className: "text-secondary text-sm", children: emptyText }) }) : children });
+  return /* @__PURE__ */ jsx("div", { className: "ui-data-panel ui-measure-results", children: empty ? /* @__PURE__ */ jsx("div", { className: "ui-measure-empty", children: emptyText }) : children });
 };
 const MeasureItem = ({ item, isHighlighted, onHighlight, onDelete }) => {
   return /* @__PURE__ */ jsxs(
     "div",
     {
       onClick: onHighlight,
-      className: `ui-list-item ${isHighlighted ? "selected" : ""}`,
-      style: {
-        padding: "6px 10px",
-        minHeight: "30px"
-      },
+      className: `ui-list-item ui-measure-item ${isHighlighted ? "selected" : ""}`,
       children: [
-        /* @__PURE__ */ jsx(
-          "span",
-          {
-            style: {
-              fontSize: "12px",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
-              flex: 1
-            },
-            children: item.val
-          }
-        ),
+        /* @__PURE__ */ jsx("span", { className: "ui-measure-item-value", children: item.val }),
         /* @__PURE__ */ jsx(
           "button",
           {
@@ -8032,17 +9394,7 @@ const MeasureItem = ({ item, isHighlighted, onHighlight, onDelete }) => {
   );
 };
 const TypeHeader = ({ label }) => {
-  return /* @__PURE__ */ jsx(
-    "div",
-    {
-      className: "ui-group-title",
-      style: {
-        padding: "4px 10px",
-        fontSize: "10px"
-      },
-      children: label
-    }
-  );
+  return /* @__PURE__ */ jsx("div", { className: "ui-group-title", children: label });
 };
 const MeasurePanel = ({
   t,
@@ -8071,12 +9423,6 @@ const MeasurePanel = ({
     setMeasureType(type);
     sceneMgr?.startMeasurement(type);
   };
-  const measureOptions = [
-    { value: "none", label: t("measure_none") || "None", icon: /* @__PURE__ */ jsx(Icons.None, {}) },
-    { value: "dist", label: t("measure_dist") || "Distance", icon: /* @__PURE__ */ jsx(Icons.Distance, {}) },
-    { value: "angle", label: t("measure_angle") || "Angle", icon: /* @__PURE__ */ jsx(Icons.Angle, {}) },
-    { value: "coord", label: t("measure_coord") || "Coord", icon: /* @__PURE__ */ jsx(Icons.Coordinate, {}) }
-  ];
   const getInstructionText = () => {
     switch (measureType) {
       case "dist":
@@ -8105,28 +9451,55 @@ const MeasurePanel = ({
     FloatingPanel,
     {
       title: t("measure_title"),
+      closeLabel: t("panel_close") || "关闭",
       onClose,
       width: 300,
       height: 400,
       resizable: true,
       storageId: "tool_measure",
-      children: /* @__PURE__ */ jsxs("div", { className: "flex flex-col p-3", style: { height: "100%", gap: "10px" }, children: [
-        /* @__PURE__ */ jsxs("div", { className: "flex items-center justify-between", children: [
-          /* @__PURE__ */ jsx(
-            SegmentedControl,
-            {
-              options: measureOptions,
-              value: measureType,
-              onChange: handleTypeChange
-            }
-          ),
+      children: /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-body", children: [
+        /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-row-between", children: [
+          /* @__PURE__ */ jsxs("div", { className: "ui-segmented ui-measure-types", children: [
+            /* @__PURE__ */ jsx(
+              "button",
+              {
+                className: `ui-segmented-item ${measureType === "none" ? "active" : ""}`,
+                onClick: () => handleTypeChange("none"),
+                children: /* @__PURE__ */ jsx("span", { children: t("measure_none") || "None" })
+              }
+            ),
+            /* @__PURE__ */ jsx(
+              "button",
+              {
+                className: `ui-segmented-item ${measureType === "dist" ? "active" : ""}`,
+                onClick: () => handleTypeChange("dist"),
+                children: /* @__PURE__ */ jsx("span", { children: t("measure_dist") || "Distance" })
+              }
+            ),
+            /* @__PURE__ */ jsx(
+              "button",
+              {
+                className: `ui-segmented-item ${measureType === "angle" ? "active" : ""}`,
+                onClick: () => handleTypeChange("angle"),
+                children: /* @__PURE__ */ jsx("span", { children: t("measure_angle") || "Angle" })
+              }
+            ),
+            /* @__PURE__ */ jsx(
+              "button",
+              {
+                className: `ui-segmented-item ${measureType === "coord" ? "active" : ""}`,
+                onClick: () => handleTypeChange("coord"),
+                children: /* @__PURE__ */ jsx("span", { children: t("measure_coord") || "Coord" })
+              }
+            )
+          ] }),
           /* @__PURE__ */ jsx(ClearButton, { onClick: onClear, disabled: measureHistory.length === 0 })
         ] }),
-        /* @__PURE__ */ jsxs("div", { className: "flex items-center gap-2 text-sm text-secondary", children: [
+        /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-row-between ui-toolpanel-caption", children: [
           /* @__PURE__ */ jsx("span", { children: getInstructionText() }),
-          measureType !== "none" && /* @__PURE__ */ jsx("span", { className: "ml-auto font-medium text-secondary", children: "[ESC] Exit" })
+          measureType !== "none" && /* @__PURE__ */ jsx("span", { className: "ui-toolpanel-caption-muted", children: "[ESC] Exit" })
         ] }),
-        /* @__PURE__ */ jsx(DataPanel, { empty: measureHistory.length === 0, emptyText: t("no_measurements") || "No measurements", children: measureHistory.length > 0 && /* @__PURE__ */ jsx("div", { className: "flex flex-col", style: { overflow: "auto" }, children: Object.entries(groupedHistory).map(([type, items]) => {
+        /* @__PURE__ */ jsx(DataPanel, { empty: measureHistory.length === 0, emptyText: t("no_measurements") || "No measurements", children: measureHistory.length > 0 && /* @__PURE__ */ jsx("div", { className: "ui-measure-results-scroll", children: Object.entries(groupedHistory).map(([type, items]) => {
           if (items.length === 0) return null;
           return /* @__PURE__ */ jsxs("div", { children: [
             /* @__PURE__ */ jsx(TypeHeader, { label: getTypeLabel(type) }),
@@ -8151,14 +9524,7 @@ const AxisSliderRow = ({ axis, label, active, value, onToggle, onChange, disable
   return /* @__PURE__ */ jsxs(
     "div",
     {
-      className: "flex items-center",
-      style: {
-        gap: "8px",
-        padding: "6px 0",
-        borderBottom: "1px solid var(--border-color)",
-        opacity: disabled ? 0.5 : 1,
-        pointerEvents: disabled ? "none" : "auto"
-      },
+      className: `ui-clip-axis-row${disabled ? " ui-is-disabled" : ""}`,
       children: [
         /* @__PURE__ */ jsx(
           Checkbox,
@@ -8176,17 +9542,11 @@ const AxisSliderRow = ({ axis, label, active, value, onToggle, onChange, disable
         /* @__PURE__ */ jsx(
           "span",
           {
-            style: {
-              fontSize: "12px",
-              fontWeight: "600",
-              minWidth: "16px",
-              color: active ? "var(--text-primary)" : "var(--text-secondary)",
-              flexShrink: 0
-            },
+            className: `ui-clip-axis-label${active ? " is-active" : ""}`,
             children: axis.toUpperCase()
           }
         ),
-        /* @__PURE__ */ jsx("div", { style: { flex: 1 }, children: /* @__PURE__ */ jsx(
+        /* @__PURE__ */ jsx("div", { className: "ui-inline-actions-stretch", children: /* @__PURE__ */ jsx(
           DualSlider,
           {
             min: 0,
@@ -8199,14 +9559,7 @@ const AxisSliderRow = ({ axis, label, active, value, onToggle, onChange, disable
         /* @__PURE__ */ jsxs(
           "span",
           {
-            style: {
-              fontSize: "11px",
-              color: "var(--text-primary)",
-              minWidth: "66px",
-              textAlign: "right",
-              flexShrink: 0,
-              fontVariantNumeric: "tabular-nums"
-            },
+            className: "ui-clip-axis-value",
             children: [
               String(Math.round(value[0])).padStart(2, "0"),
               "-",
@@ -8240,13 +9593,14 @@ const ClipPanel = ({
     FloatingPanel,
     {
       title: t("clip_title"),
+      closeLabel: t("panel_close") || "关闭",
       onClose,
       width: 320,
       height: 420,
       resizable: false,
       storageId: "tool_clip",
-      children: /* @__PURE__ */ jsxs("div", { style: { height: "100%", display: "flex", flexDirection: "column", gap: 12, padding: 12 }, children: [
-        /* @__PURE__ */ jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 8 }, children: [
+      children: /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-body", children: [
+        /* @__PURE__ */ jsxs("div", { className: "ui-panel-section", children: [
           /* @__PURE__ */ jsxs("div", { className: "ui-form-row", children: [
             /* @__PURE__ */ jsx("span", { className: "ui-form-label", children: t("clip_enable") }),
             /* @__PURE__ */ jsx("div", { className: "ui-form-value", children: /* @__PURE__ */ jsx(Switch, { checked: clipEnabled, onChange: (v) => setClipEnabled(v) }) })
@@ -8286,13 +9640,7 @@ const ClipPanel = ({
         /* @__PURE__ */ jsxs(
           "div",
           {
-            style: {
-              flex: 1,
-              display: "flex",
-              flexDirection: "column",
-              opacity: clipEnabled ? 1 : 0.4,
-              pointerEvents: clipEnabled ? "auto" : "none"
-            },
+            className: `ui-panel-section ui-panel-section-fill${clipEnabled ? "" : " ui-is-disabled"}`,
             children: [
               /* @__PURE__ */ jsx(
                 AxisSliderRow,
@@ -8333,7 +9681,7 @@ const ClipPanel = ({
             ]
           }
         ),
-        /* @__PURE__ */ jsx("div", { style: { display: "flex", justifyContent: "flex-end" }, children: /* @__PURE__ */ jsx(Button, { variant: "default", onClick: handleReset, disabled: !clipEnabled, children: t("clip_reset") || "重置范围" }) })
+        /* @__PURE__ */ jsx("div", { className: "ui-panel-footer", children: /* @__PURE__ */ jsx(Button, { variant: "default", onClick: handleReset, disabled: !clipEnabled, children: t("clip_reset") || "重置范围" }) })
       ] })
     }
   );
@@ -8345,8 +9693,8 @@ const ExportPanel = ({ t, onClose, onExport, getDefaultFileName, theme }) => {
   useEffect(() => {
     setFileName(getDefaultFileName(format));
   }, [format, getDefaultFileName]);
-  return /* @__PURE__ */ jsx(FloatingPanel, { title: t("export_title"), onClose, width: 320, height: 450, resizable: false, theme, storageId: "tool_export", children: /* @__PURE__ */ jsxs("div", { style: { padding: 16 }, children: [
-    /* @__PURE__ */ jsxs("div", { style: { marginBottom: 10, fontSize: 12, color: theme.textMuted }, children: [
+  return /* @__PURE__ */ jsx(FloatingPanel, { title: t("export_title"), closeLabel: t("panel_close") || "关闭", onClose, width: 320, height: 520, resizable: false, theme, storageId: "tool_export", children: /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-body", children: [
+    /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-caption", children: [
       t("export_format"),
       ":"
     ] }),
@@ -8354,24 +9702,23 @@ const ExportPanel = ({ t, onClose, onExport, getDefaultFileName, theme }) => {
       { id: "glb", label: "GLB", desc: t("export_glb") },
       { id: "lmb", label: "LMB", desc: t("export_lmb") },
       { id: "nbim", label: "NBIM", desc: t("export_nbim") }
-    ].map((opt) => /* @__PURE__ */ jsxs("label", { style: {
-      display: "flex",
-      alignItems: "center",
-      padding: "10px",
-      cursor: "pointer",
-      border: `1px solid ${format === opt.id ? theme.accent : theme.border}`,
-      borderRadius: 0,
-      marginBottom: 8,
-      backgroundColor: format === opt.id ? `${theme.accent}15` : "transparent",
-      transition: "all 0.2s"
-    }, children: [
-      /* @__PURE__ */ jsx("input", { type: "radio", name: "exportFmt", checked: format === opt.id, onChange: () => setFormat(opt.id), style: { marginRight: 10 } }),
-      /* @__PURE__ */ jsxs("div", { children: [
-        /* @__PURE__ */ jsx("div", { style: { color: theme.text, fontWeight: "bold", fontSize: 14 }, children: opt.label }),
-        /* @__PURE__ */ jsx("div", { style: { fontSize: 11, color: theme.textMuted }, children: opt.desc })
+    ].map((opt) => /* @__PURE__ */ jsxs("label", { className: `ui-choice-card ${format === opt.id ? "active" : ""}`, children: [
+      /* @__PURE__ */ jsx(
+        "input",
+        {
+          type: "radio",
+          name: "exportFmt",
+          checked: format === opt.id,
+          onChange: () => setFormat(opt.id),
+          className: "ui-choice-card-radio"
+        }
+      ),
+      /* @__PURE__ */ jsxs("div", { className: "ui-choice-card-content", children: [
+        /* @__PURE__ */ jsx("div", { className: "ui-choice-card-title", children: opt.label }),
+        /* @__PURE__ */ jsx("div", { className: "ui-choice-card-desc", children: opt.desc })
       ] })
     ] }, opt.id)),
-    /* @__PURE__ */ jsxs("div", { style: { marginTop: 12, marginBottom: 8, fontSize: 12, color: theme.textMuted }, children: [
+    /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-spaced", children: [
       t("export_filename") || "文件名",
       ":"
     ] }),
@@ -8382,17 +9729,16 @@ const ExportPanel = ({ t, onClose, onExport, getDefaultFileName, theme }) => {
         value: fileName,
         onChange: (e) => setFileName(e.target.value),
         placeholder: t("export_filename_placeholder") || "请输入文件名",
-        className: "ui-input ui-input-compact",
-        style: { width: "100%", marginBottom: 6 }
+        className: "ui-input ui-input-compact"
       }
     ),
-    /* @__PURE__ */ jsx("div", { style: { fontSize: 11, color: theme.textMuted }, children: t("export_filename_hint") || "留空时自动按模型名生成" }),
+    /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-muted", children: t("export_filename_hint") || "留空时自动按模型名生成" }),
     /* @__PURE__ */ jsx(
       Button,
       {
         theme,
         onClick: () => onExport(format, fileName),
-        style: { width: "100%", marginTop: 10, height: 40 },
+        className: "ui-toolpanel-submit",
         children: t("export_btn")
       }
     )
@@ -8417,56 +9763,40 @@ const ScreenshotPanel = ({ t, onClose, onCapture, theme }) => {
     FloatingPanel,
     {
       title: t("op_screenshot") || "场景截图",
+      closeLabel: t("panel_close") || "关闭",
       onClose,
       width: 320,
-      height: 280,
+      height: 340,
       resizable: false,
       theme,
       storageId: "tool_screenshot",
-      children: /* @__PURE__ */ jsxs("div", { style: { padding: 16 }, children: [
-        /* @__PURE__ */ jsxs("div", { style: { marginBottom: 10, fontSize: 12, color: theme.textMuted }, children: [
+      children: /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-body", children: [
+        /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-caption", children: [
           t("screenshot_mode") || "截图方式",
           ":"
         ] }),
-        options.map((opt) => /* @__PURE__ */ jsxs(
-          "label",
-          {
-            style: {
-              display: "flex",
-              alignItems: "center",
-              padding: "10px",
-              cursor: "pointer",
-              border: `1px solid ${mode === opt.id ? theme.accent : theme.border}`,
-              borderRadius: 0,
-              marginBottom: 8,
-              backgroundColor: mode === opt.id ? `${theme.accent}15` : "transparent",
-              transition: "all 0.2s"
-            },
-            children: [
-              /* @__PURE__ */ jsx(
-                "input",
-                {
-                  type: "radio",
-                  name: "screenshotMode",
-                  checked: mode === opt.id,
-                  onChange: () => setMode(opt.id),
-                  style: { marginRight: 10 }
-                }
-              ),
-              /* @__PURE__ */ jsxs("div", { children: [
-                /* @__PURE__ */ jsx("div", { style: { color: theme.text, fontWeight: "bold", fontSize: 14 }, children: opt.label }),
-                /* @__PURE__ */ jsx("div", { style: { fontSize: 11, color: theme.textMuted }, children: opt.desc })
-              ] })
-            ]
-          },
-          opt.id
-        )),
+        options.map((opt) => /* @__PURE__ */ jsxs("label", { className: `ui-choice-card ${mode === opt.id ? "active" : ""}`, children: [
+          /* @__PURE__ */ jsx(
+            "input",
+            {
+              type: "radio",
+              name: "screenshotMode",
+              checked: mode === opt.id,
+              onChange: () => setMode(opt.id),
+              className: "ui-choice-card-radio"
+            }
+          ),
+          /* @__PURE__ */ jsxs("div", { className: "ui-choice-card-content", children: [
+            /* @__PURE__ */ jsx("div", { className: "ui-choice-card-title", children: opt.label }),
+            /* @__PURE__ */ jsx("div", { className: "ui-choice-card-desc", children: opt.desc })
+          ] })
+        ] }, opt.id)),
         /* @__PURE__ */ jsx(
           Button,
           {
             theme,
             onClick: () => onCapture(mode),
-            style: { width: "100%", marginTop: 10, height: 40 },
+            className: "ui-toolpanel-submit",
             children: t("btn_confirm") || "确定"
           }
         )
@@ -8475,6 +9805,12 @@ const ScreenshotPanel = ({ t, onClose, onCapture, theme }) => {
   );
 };
 
+const DEFAULT_SAVE_OPTIONS = {
+  visibility: true,
+  selection: true,
+  clip: true,
+  explode: true
+};
 const ViewpointPanel = ({
   t,
   onClose,
@@ -8487,6 +9823,7 @@ const ViewpointPanel = ({
 }) => {
   const [newName, setNewName] = useState("");
   const [editingNames, setEditingNames] = useState({});
+  const [saveOptions, setSaveOptions] = useState(DEFAULT_SAVE_OPTIONS);
   useEffect(() => {
     setNewName(`${t("viewpoint_title") || "视点"} ${viewpoints.length + 1}`);
   }, [viewpoints.length, t]);
@@ -8501,7 +9838,7 @@ const ViewpointPanel = ({
   const handleSave = () => {
     const normalized = newName.trim();
     if (!normalized) return;
-    onSave(normalized);
+    onSave(normalized, saveOptions);
     setNewName(`${t("viewpoint_title") || "视点"} ${viewpoints.length + 1}`);
   };
   const handleRenameCommit = (id) => {
@@ -8519,13 +9856,14 @@ const ViewpointPanel = ({
     FloatingPanel,
     {
       title: t("viewpoint_title") || "视点管理",
+      closeLabel: t("panel_close") || "关闭",
       onClose,
       width: 320,
       height: 470,
       resizable: true,
       theme,
       storageId: "tool_viewpoint",
-      children: /* @__PURE__ */ jsxs("div", { style: { height: "100%", display: "flex", flexDirection: "column", gap: 12, padding: 12 }, children: [
+      children: /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-body ui-toolpanel-body-dense", children: [
         /* @__PURE__ */ jsxs("div", { className: "ui-inline-actions", children: [
           /* @__PURE__ */ jsx(
             "input",
@@ -8537,13 +9875,46 @@ const ViewpointPanel = ({
                 if (e.key === "Enter") handleSave();
               },
               className: "ui-input",
-              placeholder: t("viewpoint_title") || "视点名称",
-              style: { flex: 1 }
+              placeholder: t("viewpoint_title") || "视点名称"
             }
           ),
           /* @__PURE__ */ jsx(Button, { variant: "primary", onClick: handleSave, children: t("btn_confirm") || "保存" })
         ] }),
-        /* @__PURE__ */ jsx("div", { style: { flex: 1, overflow: "auto", minHeight: 0 }, children: viewpoints.length === 0 ? /* @__PURE__ */ jsx("div", { className: "ui-empty-state", children: t("viewpoint_empty") || "暂无保存的视点" }) : /* @__PURE__ */ jsx("div", { className: "ui-viewpoint-grid", children: viewpoints.map((vp) => /* @__PURE__ */ jsxs("div", { className: "ui-viewpoint-card-v2", children: [
+        /* @__PURE__ */ jsxs("div", { className: "ui-viewpoint-options", children: [
+          /* @__PURE__ */ jsx(
+            Checkbox,
+            {
+              label: t("viewpoint_save_visibility") || "保存可见性",
+              checked: saveOptions.visibility,
+              onChange: (checked) => setSaveOptions((prev) => ({ ...prev, visibility: checked }))
+            }
+          ),
+          /* @__PURE__ */ jsx(
+            Checkbox,
+            {
+              label: t("viewpoint_save_selection") || "保存选择",
+              checked: saveOptions.selection,
+              onChange: (checked) => setSaveOptions((prev) => ({ ...prev, selection: checked }))
+            }
+          ),
+          /* @__PURE__ */ jsx(
+            Checkbox,
+            {
+              label: t("viewpoint_save_clip") || "保存剖切",
+              checked: saveOptions.clip,
+              onChange: (checked) => setSaveOptions((prev) => ({ ...prev, clip: checked }))
+            }
+          ),
+          /* @__PURE__ */ jsx(
+            Checkbox,
+            {
+              label: t("viewpoint_save_explode") || "保存爆炸图",
+              checked: saveOptions.explode,
+              onChange: (checked) => setSaveOptions((prev) => ({ ...prev, explode: checked }))
+            }
+          )
+        ] }),
+        /* @__PURE__ */ jsx("div", { className: "ui-viewpoint-list-wrap", children: viewpoints.length === 0 ? /* @__PURE__ */ jsx("div", { className: "ui-empty-state", children: t("viewpoint_empty") || "暂无保存的视点" }) : /* @__PURE__ */ jsx("div", { className: "ui-viewpoint-grid", children: viewpoints.map((vp) => /* @__PURE__ */ jsxs("div", { className: "ui-viewpoint-card-v2", children: [
           /* @__PURE__ */ jsxs(
             "div",
             {
@@ -8589,126 +9960,29 @@ const ViewpointPanel = ({
                 }
               }
             }
-          )
+          ),
+          /* @__PURE__ */ jsxs("div", { className: "ui-viewpoint-flags", children: [
+            vp.saveOptions?.visibility !== false && /* @__PURE__ */ jsx("span", { children: t("viewpoint_flag_visibility") || "可见性" }),
+            vp.saveOptions?.selection !== false && /* @__PURE__ */ jsx("span", { children: t("viewpoint_flag_selection") || "选择" }),
+            vp.saveOptions?.clip !== false && /* @__PURE__ */ jsx("span", { children: t("viewpoint_flag_clip") || "剖切" }),
+            vp.saveOptions?.explode !== false && /* @__PURE__ */ jsx("span", { children: t("viewpoint_flag_explode") || "爆炸图" })
+          ] })
         ] }, vp.id)) }) })
       ] })
     }
   );
 };
 
-const formatTime = (val) => {
-  const hours = Math.floor(val / 2);
-  const mins = val % 2 * 30;
-  return `${hours.toString().padStart(2, "0")}:${mins.toString().padStart(2, "0")}`;
-};
-const timeToSlider = (time) => {
-  return Math.round(time * 2);
-};
-const SunPanel = ({ t, onClose, settings, onUpdate, theme }) => {
-  const timeValue = timeToSlider(settings.sunTime !== void 0 ? settings.sunTime : 12);
-  return /* @__PURE__ */ jsx(FloatingPanel, { title: t("st_sun_simulation") || "光照模拟", onClose, width: 320, resizable: false, theme, storageId: "tool_sun", children: /* @__PURE__ */ jsxs("div", { style: { padding: "16px", display: "flex", flexDirection: "column", height: "100%", overflowY: "auto" }, children: [
-    /* @__PURE__ */ jsxs("div", { style: { marginBottom: 16, paddingBottom: 12, borderBottom: "1px solid var(--border-color)" }, children: [
-      /* @__PURE__ */ jsx(
-        Checkbox,
-        {
-          label: t("st_sun_enabled") || "启用太阳光",
-          checked: settings.sunEnabled || false,
-          onChange: (val) => onUpdate({ sunEnabled: val }),
-          style: { fontWeight: "bold", fontSize: 13 }
-        }
-      ),
-      /* @__PURE__ */ jsx("div", { style: { fontSize: 11, color: "var(--text-muted)", marginTop: 8, fontStyle: "italic" }, children: t("st_sun_info") })
-    ] }),
-    settings.sunEnabled && /* @__PURE__ */ jsxs(Fragment, { children: [
-      /* @__PURE__ */ jsx("div", { style: { marginBottom: 16 }, children: /* @__PURE__ */ jsxs("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6, fontSize: 12, color: "var(--text-secondary)" }, children: [
-        /* @__PURE__ */ jsx("span", { children: t("st_sun_latitude") || "纬度" }),
-        /* @__PURE__ */ jsx(
-          InputNumber,
-          {
-            min: -90,
-            max: 90,
-            value: settings.sunLatitude || 0,
-            onChange: (val) => onUpdate({ sunLatitude: val }),
-            unit: "°",
-            style: { width: 80 }
-          }
-        )
-      ] }) }),
-      /* @__PURE__ */ jsx("div", { style: { marginBottom: 16 }, children: /* @__PURE__ */ jsxs("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6, fontSize: 12, color: "var(--text-secondary)" }, children: [
-        /* @__PURE__ */ jsx("span", { children: t("st_sun_longitude") || "经度" }),
-        /* @__PURE__ */ jsx(
-          InputNumber,
-          {
-            min: -180,
-            max: 180,
-            value: settings.sunLongitude || 0,
-            onChange: (val) => onUpdate({ sunLongitude: val }),
-            unit: "°",
-            style: { width: 80 }
-          }
-        )
-      ] }) }),
-      /* @__PURE__ */ jsxs("div", { style: { marginBottom: 16 }, children: [
-        /* @__PURE__ */ jsxs("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6, fontSize: 12, color: "var(--text-secondary)" }, children: [
-          /* @__PURE__ */ jsx("span", { children: t("st_sun_time") || "时间" }),
-          /* @__PURE__ */ jsx("div", { style: { display: "flex", alignItems: "center", gap: 4, color: "var(--text-primary)" }, children: /* @__PURE__ */ jsx("span", { children: formatTime(timeValue) }) })
-        ] }),
-        /* @__PURE__ */ jsx(
-          Slider,
-          {
-            min: 0,
-            max: 48,
-            step: 1,
-            value: timeValue,
-            onChange: (val) => {
-              onUpdate({ sunTime: val / 2 });
-            }
-          }
-        ),
-        /* @__PURE__ */ jsxs("div", { style: { display: "flex", justifyContent: "space-between", fontSize: 10, color: "var(--text-muted)", padding: "0 4px", marginTop: 2 }, children: [
-          /* @__PURE__ */ jsx("span", { children: "0:00" }),
-          /* @__PURE__ */ jsx("span", { children: "6:00" }),
-          /* @__PURE__ */ jsx("span", { children: "12:00" }),
-          /* @__PURE__ */ jsx("span", { children: "18:00" }),
-          /* @__PURE__ */ jsx("span", { children: "24:00" })
-        ] })
-      ] }),
-      /* @__PURE__ */ jsx("div", { style: { marginBottom: 8 }, children: /* @__PURE__ */ jsx(
-        Checkbox,
-        {
-          label: t("st_sun_shadow") || "显示阴影",
-          checked: settings.sunShadow || false,
-          onChange: (val) => onUpdate({ sunShadow: val }),
-          style: { fontSize: 12 }
-        }
-      ) })
-    ] })
-  ] }) });
-};
-
 const Row = ({ label, children, stretch = false }) => /* @__PURE__ */ jsxs(
   "div",
   {
-    className: "flex items-center justify-between",
-    style: { marginBottom: "8px", minHeight: "28px", gap: "12px" },
+    className: "ui-form-row ui-form-row-tight",
     children: [
-      /* @__PURE__ */ jsx(
-        "span",
-        {
-          className: "text-sm text-secondary flex-shrink-0",
-          style: { minWidth: "84px" },
-          children: label
-        }
-      ),
+      /* @__PURE__ */ jsx("span", { className: "ui-form-label", children: label }),
       /* @__PURE__ */ jsx(
         "div",
         {
-          className: "flex items-center",
-          style: {
-            flex: stretch ? 1 : "0 1 auto",
-            justifyContent: stretch ? "flex-start" : "flex-end",
-            minWidth: stretch ? 0 : void 0
-          },
+          className: `ui-form-value${stretch ? " ui-form-value-stretch ui-form-value-start" : ""}`,
           children
         }
       )
@@ -8731,67 +10005,568 @@ const ExplodePanel = ({
     FloatingPanel,
     {
       title: t("explode_title") || "爆炸图",
+      closeLabel: t("panel_close") || "关闭",
       onClose,
       width: 340,
       storageId: "tool_explode",
       modal: false,
       autoHeight: true,
       theme,
-      children: /* @__PURE__ */ jsxs(
-        "div",
-        {
-          style: {
-            padding: "12px",
-            display: "flex",
-            flexDirection: "column",
-            gap: "8px"
+      children: /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-body ui-toolpanel-body-compact", children: [
+        /* @__PURE__ */ jsx(Row, { label: t("explode_enable") || "启用", children: /* @__PURE__ */ jsx(Switch, { checked: enabled, onChange: onEnabledChange }) }),
+        /* @__PURE__ */ jsx(Row, { label: t("explode_strength") || "强度", stretch: true, children: /* @__PURE__ */ jsxs("div", { className: "ui-slider-field", children: [
+          /* @__PURE__ */ jsx("div", { className: "ui-inline-actions-stretch", children: /* @__PURE__ */ jsx(
+            Slider,
+            {
+              min: 0,
+              max: 100,
+              step: 1,
+              value: strength,
+              onChange: onStrengthChange
+            }
+          ) }),
+          /* @__PURE__ */ jsxs("div", { className: "ui-slider-value ui-slider-value-strong", children: [
+            strength,
+            "%"
+          ] })
+        ] }) }),
+        /* @__PURE__ */ jsx(Row, { label: t("explode_mode") || "方向", stretch: true, children: /* @__PURE__ */ jsx(
+          SegmentedControl,
+          {
+            options: [
+              { value: "radial", label: t("explode_mode_radial") || "四周" },
+              { value: "horizontal", label: t("explode_mode_horizontal") || "横向" },
+              { value: "vertical", label: t("explode_mode_vertical") || "纵向" }
+            ],
+            value: mode,
+            onChange: (value) => onModeChange(value)
+          }
+        ) }),
+        /* @__PURE__ */ jsx("div", { className: "ui-panel-footer ui-panel-footer-spaced", children: /* @__PURE__ */ jsx(Button, { className: "ui-properties-action", onClick: onReset, children: t("explode_reset") || "重置" }) })
+      ] })
+    }
+  );
+};
+
+const operatorOptions = [
+  { value: "equals", labelKey: "search_op_equals", fallback: "等于" },
+  { value: "contains", labelKey: "search_op_contains", fallback: "包含" },
+  { value: "notContains", labelKey: "search_op_not_contains", fallback: "不包含" },
+  { value: "startsWith", labelKey: "search_op_starts_with", fallback: "开头" },
+  { value: "endsWith", labelKey: "search_op_ends_with", fallback: "结尾" }
+];
+const connectorOptions = [
+  { value: "AND", labelKey: "search_connector_and", fallback: "且" },
+  { value: "OR", labelKey: "search_connector_or", fallback: "或" }
+];
+const SearchPanel = ({
+  t,
+  onClose,
+  conditions,
+  results,
+  searching,
+  searchProgress,
+  searchStatus,
+  onConditionsChange,
+  onSearch,
+  onCancelSearch,
+  onApplyResultHighlight,
+  onClearResult,
+  theme
+}) => {
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(50);
+  useEffect(() => {
+    setPage(1);
+  }, [results.length, pageSize]);
+  const totalPages = Math.max(1, Math.ceil(results.length / pageSize));
+  const currentPage = Math.min(page, totalPages);
+  const pageStart = (currentPage - 1) * pageSize;
+  const pageItems = useMemo(() => results.slice(pageStart, pageStart + pageSize), [results, pageStart, pageSize]);
+  const updateCondition = (id, patch) => {
+    onConditionsChange(conditions.map((item) => item.id === id ? { ...item, ...patch } : item));
+  };
+  const addCondition = () => {
+    const nextId = `cond_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+    onConditionsChange([
+      ...conditions,
+      {
+        id: nextId,
+        propertyName: "",
+        operator: "contains",
+        value: "",
+        connector: "AND"
+      }
+    ]);
+  };
+  const removeCondition = (id) => {
+    const next = conditions.filter((item) => item.id !== id);
+    onConditionsChange(next.length > 0 ? next : [{ id: "cond_init", propertyName: "", operator: "contains", value: "" }]);
+  };
+  return /* @__PURE__ */ jsx(
+    FloatingPanel,
+    {
+      title: t("tb_search") || "属性搜索",
+      closeLabel: t("panel_close") || "关闭",
+      onClose,
+      width: 420,
+      storageId: "tool_search",
+      autoHeight: true,
+      theme,
+      children: /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-body", children: [
+        /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-row-between", children: [
+          /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-caption", children: t("search_conditions") || "搜索条件" }),
+          /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-row", children: [
+            /* @__PURE__ */ jsx(Button, { className: "ui-properties-action", onClick: addCondition, children: t("search_add_condition") || "添加条件" }),
+            /* @__PURE__ */ jsx(Button, { className: "ui-properties-action", onClick: onSearch, disabled: searching, children: searching ? t("searching") || "搜索中..." : t("search_run") || "搜索" })
+          ] })
+        ] }),
+        conditions.map((condition, index) => /* @__PURE__ */ jsxs(
+          "div",
+          {
+            className: `ui-toolpanel-grid ui-toolpanel-grid-condition ${index > 0 ? "ui-toolpanel-grid-condition-linked" : "ui-toolpanel-grid-condition-first"}`,
+            children: [
+              index > 0 && /* @__PURE__ */ jsx(
+                Select,
+                {
+                  value: condition.connector || "AND",
+                  options: connectorOptions.map((item) => ({ value: item.value, label: t(item.labelKey) || item.fallback })),
+                  onChange: (value) => updateCondition(condition.id, { connector: value }),
+                  className: "ui-input-compact",
+                  style: { width: "64px", flexShrink: 0 }
+                }
+              ),
+              /* @__PURE__ */ jsx(
+                "input",
+                {
+                  className: "ui-input ui-input-compact",
+                  placeholder: t("search_field_name") || "属性名",
+                  value: condition.propertyName,
+                  onChange: (e) => updateCondition(condition.id, { propertyName: e.target.value }),
+                  style: { flex: 1, minWidth: 0 }
+                }
+              ),
+              /* @__PURE__ */ jsx(
+                Select,
+                {
+                  value: condition.operator,
+                  options: operatorOptions.map((item) => ({ value: item.value, label: t(item.labelKey) || item.fallback })),
+                  onChange: (value) => updateCondition(condition.id, { operator: value }),
+                  className: "ui-input-compact",
+                  style: { width: "92px" }
+                }
+              ),
+              /* @__PURE__ */ jsx(
+                "input",
+                {
+                  className: "ui-input ui-input-compact",
+                  placeholder: t("search_field_value") || "属性值",
+                  value: condition.value,
+                  onChange: (e) => updateCondition(condition.id, { value: e.target.value }),
+                  style: { flex: 1, minWidth: 0 }
+                }
+              ),
+              index > 0 ? /* @__PURE__ */ jsx(
+                "button",
+                {
+                  className: "ui-search-clear ui-search-clear-static",
+                  onClick: () => removeCondition(condition.id),
+                  title: t("remove_condition") || "移除条件",
+                  style: { flexShrink: 0, width: "24px" },
+                  children: /* @__PURE__ */ jsx(IconClose, { width: 14, height: 14 })
+                }
+              ) : /* @__PURE__ */ jsx("div", { style: { width: "24px", flexShrink: 0 } })
+            ]
           },
-          children: [
-            /* @__PURE__ */ jsx(Row, { label: t("explode_enable") || "启用", children: /* @__PURE__ */ jsx(Switch, { checked: enabled, onChange: onEnabledChange }) }),
-            /* @__PURE__ */ jsx(Row, { label: t("explode_strength") || "强度", stretch: true, children: /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", gap: "8px", width: "100%" }, children: [
-              /* @__PURE__ */ jsx("div", { style: { flex: 1, minWidth: 0 }, children: /* @__PURE__ */ jsx(
-                Slider,
-                {
-                  min: 0,
-                  max: 100,
-                  step: 1,
-                  value: strength,
-                  onChange: onStrengthChange
-                }
-              ) }),
-              /* @__PURE__ */ jsxs(
-                "div",
-                {
-                  style: {
-                    color: "var(--text-secondary)",
-                    fontSize: "12px",
-                    minWidth: "42px",
-                    textAlign: "right",
-                    fontVariantNumeric: "tabular-nums"
-                  },
-                  children: [
-                    strength,
-                    "%"
-                  ]
-                }
-              )
-            ] }) }),
-            /* @__PURE__ */ jsx(Row, { label: t("explode_mode") || "方向", stretch: true, children: /* @__PURE__ */ jsx(
-              SegmentedControl$1,
+          condition.id
+        )),
+        /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-row-between ui-toolpanel-caption", children: [
+          /* @__PURE__ */ jsxs("span", { children: [
+            t("search_results") || "搜索结果",
+            ": ",
+            results.length
+          ] }),
+          /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-row", children: [
+            /* @__PURE__ */ jsx("span", { children: t("search_page_size") || "每页" }),
+            /* @__PURE__ */ jsx(
+              Select,
               {
+                value: String(pageSize),
+                onChange: (value) => setPageSize(Number(value) || 50),
                 options: [
-                  { value: "radial", label: t("explode_mode_radial") || "四周" },
-                  { value: "horizontal", label: t("explode_mode_horizontal") || "横向" },
-                  { value: "vertical", label: t("explode_mode_vertical") || "纵向" }
+                  { value: "20", label: "20" },
+                  { value: "50", label: "50" },
+                  { value: "100", label: "100" }
                 ],
-                value: mode,
-                onChange: (value) => onModeChange(value)
+                className: "ui-input-compact",
+                style: { minWidth: 68 }
               }
-            ) }),
-            /* @__PURE__ */ jsx("div", { style: { display: "flex", justifyContent: "flex-end", paddingTop: "4px" }, children: /* @__PURE__ */ jsx(Button, { className: "ui-properties-action", onClick: onReset, children: t("explode_reset") || "重置" }) })
-          ]
-        }
-      )
+            )
+          ] })
+        ] }),
+        /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-results-box ui-search-results-box", children: results.length === 0 ? /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-results-empty", children: t("search_no_results") || "暂无结果" }) : pageItems.map((item) => /* @__PURE__ */ jsx(
+          "div",
+          {
+            className: "ui-search-result-item ui-search-result-item-simple",
+            title: `${item.uuid}
+${item.matchedBy.join("\n")}`,
+            children: /* @__PURE__ */ jsxs(
+              "button",
+              {
+                className: "ui-search-result-main",
+                onClick: () => onApplyResultHighlight(item.uuid),
+                children: [
+                  /* @__PURE__ */ jsx("span", { children: item.name || item.uuid }),
+                  /* @__PURE__ */ jsx("span", { className: "ui-result-item-secondary", children: [item.type, item.modelId, ...item.matchedBy].filter(Boolean).join(" · ") })
+                ]
+              }
+            )
+          },
+          item.uuid
+        )) }),
+        results.length > 0 && /* @__PURE__ */ jsx(
+          PaginationControls,
+          {
+            prevTitle: t("search_page_prev") || "上一页",
+            nextTitle: t("search_page_next") || "下一页",
+            currentPage,
+            totalPages,
+            onPrev: () => setPage((prev) => Math.max(1, prev - 1)),
+            onNext: () => setPage((prev) => Math.min(totalPages, prev + 1)),
+            rightContent: /* @__PURE__ */ jsx(Button, { className: "ui-properties-action", onClick: onClearResult, children: t("search_clear") || "清除结果" })
+          }
+        ),
+        searching && /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-overlay", children: /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-overlay-card", children: [
+          /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-overlay-title", children: searchStatus || (t("searching") || "搜索中...") }),
+          /* @__PURE__ */ jsx("div", { className: "ui-progress-bar ui-progress-bar-full", children: /* @__PURE__ */ jsx("div", { className: "ui-progress-fill", style: { width: `${Math.max(0, Math.min(100, searchProgress))}%` } }) }),
+          /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-row-between ui-toolpanel-caption ui-toolpanel-caption-spaced", children: [
+            /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-muted", children: [
+              Math.round(searchProgress),
+              "%"
+            ] }),
+            /* @__PURE__ */ jsx(Button, { className: "ui-properties-action", onClick: onCancelSearch, children: t("search_cancel") || "取消搜索" })
+          ] })
+        ] }) })
+      ] })
+    }
+  );
+};
+
+const ClashPanel = ({
+  t,
+  onClose,
+  running,
+  progress,
+  status,
+  scannedCount,
+  pairsScanned,
+  results,
+  resultFilter,
+  modelOptions,
+  setA,
+  setB,
+  tolerance,
+  minOverlapVolume,
+  clearanceDistance,
+  useNarrowPhase,
+  useTrianglePhase,
+  includeSameModel,
+  onSetAChange,
+  onSetBChange,
+  onToleranceChange,
+  onMinOverlapVolumeChange,
+  onClearanceDistanceChange,
+  onUseNarrowPhaseChange,
+  onUseTrianglePhaseChange,
+  onIncludeSameModelChange,
+  onRun,
+  onCancel,
+  onClear,
+  onExportCsv,
+  onIsolateByStatus,
+  onRestoreVisibility,
+  onResultFilterChange,
+  typeFilter,
+  onTypeFilterChange,
+  onUpdateResultStatus,
+  onMarkFilteredStatus,
+  onSetASelectAll,
+  onSetAClear,
+  onSetBSelectAll,
+  onSetBClear,
+  onFocusResult,
+  theme
+}) => {
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(50);
+  const [scopeExpanded, setScopeExpanded] = useState(modelOptions.length <= 4);
+  const [advancedExpanded, setAdvancedExpanded] = useState(false);
+  useEffect(() => {
+    setPage(1);
+  }, [results.length, pageSize]);
+  const filteredResults = results;
+  const totalPages = Math.max(1, Math.ceil(filteredResults.length / pageSize));
+  const currentPage = Math.min(page, totalPages);
+  const pageStart = (currentPage - 1) * pageSize;
+  const pageItems = useMemo(() => filteredResults.slice(pageStart, pageStart + pageSize), [filteredResults, pageStart, pageSize]);
+  const setAIds = useMemo(() => new Set(setA), [setA]);
+  const setBIds = useMemo(() => new Set(setB), [setB]);
+  const readyText = status || (running ? t("clash_running") || "正在执行碰撞检查..." : t("clash_ready") || "准备就绪");
+  const scopeSummary = `${t("clash_set_a") || "模型集 A"} ${setA.length} · ${t("clash_set_b") || "模型集 B"} ${setB.length}`;
+  const toggleFromSet = (source, id, onChange) => {
+    const nextSet = new Set(source);
+    if (nextSet.has(id)) nextSet.delete(id);
+    else nextSet.add(id);
+    onChange(Array.from(nextSet));
+  };
+  return /* @__PURE__ */ jsx(
+    FloatingPanel,
+    {
+      title: t("tb_clash") || "碰撞检查",
+      closeLabel: t("panel_close") || "关闭",
+      onClose,
+      width: 500,
+      storageId: "tool_clash",
+      autoHeight: true,
+      theme,
+      children: /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-body ui-clash-panel", children: [
+        /* @__PURE__ */ jsxs("div", { className: "ui-clash-hero", children: [
+          /* @__PURE__ */ jsxs("div", { className: "ui-clash-hero-main", children: [
+            /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-caption-strong ui-clash-hero-title", children: readyText }),
+            /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-caption ui-clash-hero-meta", children: [
+              t("clash_scope_visible") || "范围：当前可见构件",
+              " · ",
+              t("clash_candidates") || "候选",
+              " ",
+              scannedCount,
+              " · ",
+              t("clash_pairs_scanned") || "已扫描对数",
+              " ",
+              pairsScanned
+            ] })
+          ] }),
+          /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-row ui-toolpanel-wrap ui-clash-hero-actions", children: [
+            !running ? /* @__PURE__ */ jsx(Button, { className: "ui-properties-action", onClick: onRun, variant: "primary", children: t("clash_run") || "开始检查" }) : /* @__PURE__ */ jsx(Button, { className: "ui-properties-action", onClick: onCancel, children: t("search_cancel") || "取消搜索" }),
+            /* @__PURE__ */ jsx(Button, { className: "ui-properties-action", onClick: onClear, children: t("clash_clear") || "清空结果" }),
+            /* @__PURE__ */ jsx(Button, { className: "ui-properties-action", onClick: onExportCsv, disabled: results.length === 0, children: t("clash_export_csv") || "导出 CSV" })
+          ] }),
+          /* @__PURE__ */ jsx("div", { className: "ui-progress-bar ui-progress-bar-full ui-clash-progress", children: /* @__PURE__ */ jsx("div", { className: "ui-progress-fill", style: { width: `${Math.max(0, Math.min(100, progress))}%` } }) })
+        ] }),
+        /* @__PURE__ */ jsxs("div", { className: "ui-clash-section", children: [
+          /* @__PURE__ */ jsxs(
+            "button",
+            {
+              type: "button",
+              className: "ui-clash-section-toggle",
+              onClick: () => setScopeExpanded((prev) => !prev),
+              children: [
+                /* @__PURE__ */ jsx("span", { className: "ui-toolpanel-caption-strong ui-clash-section-title", children: t("clash_scope_visible") || "检测范围" }),
+                /* @__PURE__ */ jsx("span", { className: "ui-toolpanel-caption ui-clash-section-summary", children: scopeSummary })
+              ]
+            }
+          ),
+          scopeExpanded && /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-grid ui-toolpanel-grid-2", children: [
+            /* @__PURE__ */ jsxs("div", { className: "ui-selection-box", children: [
+              /* @__PURE__ */ jsxs("div", { className: "ui-selection-box-header", children: [
+                /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-caption-strong", children: t("clash_set_a") || "模型集 A" }),
+                /* @__PURE__ */ jsxs("div", { className: "ui-selection-box-actions", children: [
+                  /* @__PURE__ */ jsx("button", { className: "ui-statusbar-tag ui-statusbar-tag-compact", onClick: onSetASelectAll, children: t("select_all") || "全选" }),
+                  /* @__PURE__ */ jsx("button", { className: "ui-statusbar-tag ui-statusbar-tag-compact", onClick: onSetAClear, children: t("search_clear") || "清空" })
+                ] })
+              ] }),
+              /* @__PURE__ */ jsx("div", { className: "ui-selection-box-list ui-clash-selection-list", children: modelOptions.length === 0 ? /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-muted", children: t("clash_no_models") || "暂无模型" }) : modelOptions.map((item) => /* @__PURE__ */ jsx(
+                Checkbox,
+                {
+                  checked: setAIds.has(item.id),
+                  onChange: () => toggleFromSet(setA, item.id, onSetAChange),
+                  label: item.name,
+                  labelStyle: { fontSize: 11 }
+                },
+                `a_${item.id}`
+              )) })
+            ] }),
+            /* @__PURE__ */ jsxs("div", { className: "ui-selection-box", children: [
+              /* @__PURE__ */ jsxs("div", { className: "ui-selection-box-header", children: [
+                /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-caption-strong", children: t("clash_set_b") || "模型集 B" }),
+                /* @__PURE__ */ jsxs("div", { className: "ui-selection-box-actions", children: [
+                  /* @__PURE__ */ jsx("button", { className: "ui-statusbar-tag ui-statusbar-tag-compact", onClick: onSetBSelectAll, children: t("select_all") || "全选" }),
+                  /* @__PURE__ */ jsx("button", { className: "ui-statusbar-tag ui-statusbar-tag-compact", onClick: onSetBClear, children: t("search_clear") || "清空" })
+                ] })
+              ] }),
+              /* @__PURE__ */ jsx("div", { className: "ui-selection-box-list ui-clash-selection-list", children: modelOptions.length === 0 ? /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-muted", children: t("clash_no_models") || "暂无模型" }) : modelOptions.map((item) => /* @__PURE__ */ jsx(
+                Checkbox,
+                {
+                  checked: setBIds.has(item.id),
+                  onChange: () => toggleFromSet(setB, item.id, onSetBChange),
+                  label: item.name,
+                  labelStyle: { fontSize: 11 }
+                },
+                `b_${item.id}`
+              )) })
+            ] })
+          ] })
+        ] }),
+        /* @__PURE__ */ jsxs("div", { className: "ui-clash-section", children: [
+          /* @__PURE__ */ jsxs(
+            "button",
+            {
+              type: "button",
+              className: "ui-clash-section-toggle",
+              onClick: () => setAdvancedExpanded((prev) => !prev),
+              children: [
+                /* @__PURE__ */ jsx("span", { className: "ui-toolpanel-caption-strong ui-clash-section-title", children: t("settings_more") || "高级设置" }),
+                /* @__PURE__ */ jsxs("span", { className: "ui-toolpanel-caption ui-clash-section-summary", children: [
+                  t("clash_tolerance") || "容差",
+                  " / ",
+                  t("clash_min_overlap") || "最小重叠体积",
+                  " / ",
+                  t("clash_clearance_distance") || "最小净空距离"
+                ] })
+              ]
+            }
+          ),
+          advancedExpanded && /* @__PURE__ */ jsxs(Fragment, { children: [
+            /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-grid ui-toolpanel-grid-2", children: [
+              /* @__PURE__ */ jsxs("div", { children: [
+                /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-spaced", children: t("clash_tolerance") || "容差" }),
+                /* @__PURE__ */ jsx(
+                  InputNumber,
+                  {
+                    className: "ui-input-compact",
+                    value: Number.isFinite(tolerance) ? tolerance : 0,
+                    min: 0,
+                    step: 1e-3,
+                    onChange: (value) => onToleranceChange(Math.max(0, value || 0)),
+                    style: { width: "100%" }
+                  }
+                )
+              ] }),
+              /* @__PURE__ */ jsxs("div", { children: [
+                /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-spaced", children: t("clash_min_overlap") || "最小重叠体积" }),
+                /* @__PURE__ */ jsx(
+                  InputNumber,
+                  {
+                    className: "ui-input-compact",
+                    value: Number.isFinite(minOverlapVolume) ? minOverlapVolume : 0,
+                    min: 0,
+                    step: 1e-6,
+                    onChange: (value) => onMinOverlapVolumeChange(Math.max(0, value || 0)),
+                    style: { width: "100%" }
+                  }
+                )
+              ] })
+            ] }),
+            /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-grid ui-toolpanel-grid-2", children: [
+              /* @__PURE__ */ jsxs("div", { children: [
+                /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-spaced", children: t("clash_clearance_distance") || "最小净空距离" }),
+                /* @__PURE__ */ jsx(
+                  InputNumber,
+                  {
+                    className: "ui-input-compact",
+                    value: Number.isFinite(clearanceDistance) ? clearanceDistance : 0,
+                    min: 0,
+                    step: 1e-3,
+                    onChange: (value) => onClearanceDistanceChange(Math.max(0, value || 0)),
+                    style: { width: "100%" }
+                  }
+                )
+              ] }),
+              /* @__PURE__ */ jsxs("div", { className: "ui-clash-option-stack", children: [
+                /* @__PURE__ */ jsx(
+                  Checkbox,
+                  {
+                    checked: useNarrowPhase,
+                    onChange: onUseNarrowPhaseChange,
+                    label: t("clash_narrow_phase") || "启用精筛（OBB）",
+                    labelStyle: { fontSize: 12 }
+                  }
+                ),
+                /* @__PURE__ */ jsx(
+                  Checkbox,
+                  {
+                    checked: useTrianglePhase,
+                    onChange: onUseTrianglePhaseChange,
+                    label: t("clash_triangle_phase") || "启用三角面复核",
+                    labelStyle: { fontSize: 12 }
+                  }
+                ),
+                /* @__PURE__ */ jsx(
+                  Checkbox,
+                  {
+                    checked: includeSameModel,
+                    onChange: onIncludeSameModelChange,
+                    label: t("clash_include_same_model") || "包含同模型内检测",
+                    labelStyle: { fontSize: 12 }
+                  }
+                )
+              ] })
+            ] })
+          ] })
+        ] }),
+        /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-row-between ui-clash-results-header", children: [
+          /* @__PURE__ */ jsxs("div", { children: [
+            /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-caption-strong ui-clash-results-title", children: [
+              t("clash_results") || "碰撞结果",
+              " ",
+              filteredResults.length
+            ] }),
+            /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-muted", children: t("locate_in_view") || "点击条目定位到视图" })
+          ] }),
+          /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-row", children: /* @__PURE__ */ jsx(
+            Select,
+            {
+              value: String(pageSize),
+              onChange: (value) => setPageSize(Number(value) || 50),
+              options: [
+                { value: "20", label: "20" },
+                { value: "50", label: "50" },
+                { value: "100", label: "100" }
+              ],
+              className: "ui-input-compact",
+              style: { minWidth: 68 }
+            }
+          ) })
+        ] }),
+        /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-results-box ui-clash-results-box", children: filteredResults.length === 0 ? /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-results-empty", children: t("clash_no_results") || "暂无碰撞结果" }) : pageItems.map((item) => /* @__PURE__ */ jsxs(
+          "button",
+          {
+            className: "ui-search-result-item ui-clash-result-item",
+            onClick: () => onFocusResult(item),
+            title: `${item.aUuid} <> ${item.bUuid}`,
+            children: [
+              /* @__PURE__ */ jsx("div", { className: "ui-clash-result-top", children: /* @__PURE__ */ jsxs("span", { className: "ui-clash-result-title", children: [
+                item.aName || item.aUuid,
+                " ",
+                " <> ",
+                " ",
+                item.bName || item.bUuid
+              ] }) }),
+              /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-row-between ui-clash-result-meta", children: [
+                /* @__PURE__ */ jsxs("span", { className: "ui-result-item-secondary", children: [
+                  item.aUuid,
+                  " ",
+                  " <> ",
+                  " ",
+                  item.bUuid
+                ] }),
+                /* @__PURE__ */ jsx("span", { className: "ui-result-item-secondary", children: item.type === "hard" ? `${t("clash_overlap_volume") || "重叠体积"}: ${item.overlapVolume.toFixed(6)}` : `${t("clash_clearance_value") || "净空距离"}: ${item.distance.toFixed(6)}` })
+              ] })
+            ]
+          },
+          item.id
+        )) }),
+        filteredResults.length > 0 && /* @__PURE__ */ jsx(
+          PaginationControls,
+          {
+            prevTitle: t("search_page_prev") || "上一页",
+            nextTitle: t("search_page_next") || "下一页",
+            currentPage,
+            totalPages,
+            onPrev: () => setPage((prev) => Math.max(1, prev - 1)),
+            onNext: () => setPage((prev) => Math.min(totalPages, prev + 1))
+          }
+        )
+      ] })
     }
   );
 };
@@ -8799,14 +10574,14 @@ const ExplodePanel = ({
 const LoadingOverlay = ({ t, loading, status, progress, theme }) => {
   if (!loading) return null;
   return /* @__PURE__ */ jsx("div", { className: "ui-loading-overlay", children: /* @__PURE__ */ jsxs("div", { className: "ui-loading-box", children: [
-    /* @__PURE__ */ jsxs("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }, children: [
-      /* @__PURE__ */ jsx("div", { style: { fontWeight: "600", color: "var(--text-primary)", fontSize: "14px" }, children: status }),
-      /* @__PURE__ */ jsxs("div", { style: { color: "var(--text-primary)", fontSize: "14px", fontWeight: "bold" }, children: [
+    /* @__PURE__ */ jsxs("div", { className: "ui-loading-header", children: [
+      /* @__PURE__ */ jsx("div", { className: "ui-loading-title", children: status }),
+      /* @__PURE__ */ jsxs("div", { className: "ui-loading-percent", children: [
         Math.round(progress),
         "%"
       ] })
     ] }),
-    /* @__PURE__ */ jsx("div", { className: "ui-progress-bar", style: { marginTop: "12px" }, children: /* @__PURE__ */ jsx(
+    /* @__PURE__ */ jsx("div", { className: "ui-progress-bar ui-loading-progress", children: /* @__PURE__ */ jsx(
       "div",
       {
         className: "ui-progress-fill",
@@ -8816,21 +10591,78 @@ const LoadingOverlay = ({ t, loading, status, progress, theme }) => {
         }
       }
     ) }),
-    /* @__PURE__ */ jsxs("div", { style: { display: "flex", alignItems: "center", gap: "8px", marginTop: "12px", fontSize: "12px", color: "var(--text-muted)" }, children: [
-      /* @__PURE__ */ jsxs("svg", { style: { width: "14px", height: "14px", animation: "spin 1s linear infinite" }, viewBox: "0 0 24 24", children: [
-        /* @__PURE__ */ jsx("circle", { style: { opacity: 0.25 }, cx: "12", cy: "12", r: "10", stroke: "currentColor", strokeWidth: "4", fill: "none" }),
-        /* @__PURE__ */ jsx("path", { style: { opacity: 0.75 }, fill: "currentColor", d: "M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" })
+    /* @__PURE__ */ jsxs("div", { className: "ui-loading-meta", children: [
+      /* @__PURE__ */ jsxs("svg", { className: "ui-loading-spinner", viewBox: "0 0 24 24", children: [
+        /* @__PURE__ */ jsx("circle", { className: "ui-loading-spinner-track", cx: "12", cy: "12", r: "10", stroke: "currentColor", strokeWidth: "4", fill: "none" }),
+        /* @__PURE__ */ jsx("path", { className: "ui-loading-spinner-head", fill: "currentColor", d: "M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" })
       ] }),
-      /* @__PURE__ */ jsx("style", { children: `
-                        @keyframes spin {
-                            from { transform: rotate(0deg); }
-                            to { transform: rotate(360deg); }
-                        }
-                    ` }),
       /* @__PURE__ */ jsx("span", { children: progress === 100 ? t("processing") : t("loading_resources") })
     ] })
   ] }) });
 };
+
+function normalizePropertyToken(value) {
+  return String(value ?? "").normalize("NFKC").trim().replace(/\s+/g, " ").toLocaleLowerCase();
+}
+function stringifyPropertyValue(value) {
+  if (value === null || value === void 0) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return value.map((item) => stringifyPropertyValue(item)).filter(Boolean).join(", ");
+  if (typeof value === "object") {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+function toListItems(input) {
+  if (Array.isArray(input)) return input;
+  return Object.entries(input).map(([key, value]) => ({ key, value }));
+}
+function createPropertyEntries(groupName, input, fallbackSource) {
+  return toListItems(input).map((item, index) => {
+    const key = String(item.key ?? "").trim();
+    const value = stringifyPropertyValue(item.value);
+    if (!key || !value) return null;
+    const path = `${groupName}.${key}`;
+    return {
+      id: item.id || `${groupName}::${key}::${index}`,
+      group: groupName,
+      key,
+      value,
+      path,
+      rawKey: item.rawKey,
+      source: item.source || fallbackSource,
+      normalizedGroup: normalizePropertyToken(groupName),
+      normalizedKey: normalizePropertyToken(key),
+      normalizedPath: normalizePropertyToken(path),
+      normalizedValue: normalizePropertyToken(value)
+    };
+  }).filter(Boolean);
+}
+function buildPropertyGroupsFromRecord(groups, fallbackSource) {
+  if (!groups) return [];
+  return Object.entries(groups).map(([groupName, input]) => ({
+    name: groupName,
+    items: createPropertyEntries(groupName, input, fallbackSource)
+  })).filter((group) => group.items.length > 0);
+}
+function filterPropertyGroups(groups, query) {
+  const normalizedQuery = normalizePropertyToken(query);
+  if (!normalizedQuery) return groups;
+  return groups.map((group) => ({
+    ...group,
+    items: group.items.filter(
+      (item) => item.normalizedGroup.includes(normalizedQuery) || item.normalizedKey.includes(normalizedQuery) || item.normalizedPath.includes(normalizedQuery) || item.normalizedValue.includes(normalizedQuery)
+    )
+  })).filter((group) => group.items.length > 0);
+}
+function serializePropertyGroups(groups) {
+  return groups.map((group) => [`[${group.name}]`, ...group.items.map((item) => `${item.key}: ${item.value}`)].join("\n")).join("\n\n");
+}
 
 const PropertiesPanel = ({ t, selectedProps }) => {
   const [collapsed, setCollapsed] = useState(/* @__PURE__ */ new Set());
@@ -8873,29 +10705,22 @@ const PropertiesPanel = ({ t, selectedProps }) => {
       console.error("Failed to copy", e);
     }
   };
-  const serializeGroups = (groups) => Object.entries(groups).map(
-    ([group, props]) => [`[${group}]`, ...Object.entries(props).map(([key, value]) => `${key}: ${value}`)].join("\n")
-  ).join("\n\n");
   const filteredProps = useMemo(() => {
-    if (!currentGroups || !searchQuery) return currentGroups;
-    const query = searchQuery.toLowerCase();
-    const result = {};
-    Object.entries(currentGroups).forEach(([group, props]) => {
-      const filteredGroupProps = {};
-      Object.entries(props).forEach(([k, v]) => {
-        if (group.toLowerCase().includes(query) || k.toLowerCase().includes(query) || String(v).toLowerCase().includes(query)) {
-          filteredGroupProps[k] = v;
-        }
-      });
-      if (Object.keys(filteredGroupProps).length > 0) {
-        result[group] = filteredGroupProps;
-      }
-    });
-    return result;
+    if (!currentGroups) return null;
+    return filterPropertyGroups(currentGroups, searchQuery);
   }, [currentGroups, searchQuery]);
-  const groupCount = filteredProps ? Object.keys(filteredProps).length : 0;
-  const itemCount = filteredProps ? Object.values(filteredProps).reduce((sum, props) => sum + Object.keys(props).length, 0) : 0;
-  return /* @__PURE__ */ jsxs("div", { style: { flex: 1, display: "flex", flexDirection: "column", height: "100%", overflow: "hidden", position: "relative" }, children: [
+  useEffect(() => {
+    if (!filteredProps || !searchQuery) return;
+    const matchedGroups = new Set(filteredProps.map((group) => group.name));
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      matchedGroups.forEach((groupName) => next.delete(groupName));
+      return next;
+    });
+  }, [filteredProps, searchQuery]);
+  const groupCount = filteredProps ? filteredProps.length : 0;
+  const itemCount = filteredProps ? filteredProps.reduce((sum, group) => sum + group.items.length, 0) : 0;
+  return /* @__PURE__ */ jsxs("div", { className: "ui-properties-panel", children: [
     selectedProps && /* @__PURE__ */ jsxs("div", { className: "ui-properties-toolbar", children: [
       /* @__PURE__ */ jsx("div", { className: "ui-search-input-wrap", children: /* @__PURE__ */ jsx(
         "input",
@@ -8909,35 +10734,25 @@ const PropertiesPanel = ({ t, selectedProps }) => {
       ) }),
       /* @__PURE__ */ jsxs("div", { className: "ui-properties-subbar", children: [
         /* @__PURE__ */ jsxs("div", { className: "ui-properties-meta", children: [
-          (searchQuery ? `${t("search_results") || "结果数"}` : `${t("prop_groups") || "分组"}`) + `: ${groupCount}`,
+          (searchQuery ? t("search_results") : t("prop_groups")) + `: ${groupCount}`,
           /* @__PURE__ */ jsx("span", { children: " · " }),
-          (t("prop_items") || "条目") + `: ${itemCount}`
+          t("prop_items") + `: ${itemCount}`
         ] }),
         /* @__PURE__ */ jsx("div", { className: "ui-properties-actions", children: /* @__PURE__ */ jsx(
           "button",
           {
-            className: "ui-properties-action",
-            onClick: () => currentGroups && handleCopy(serializeGroups(currentGroups)),
+            className: "ui-properties-action ui-properties-icon-btn",
+            onClick: () => currentGroups && handleCopy(serializePropertyGroups(currentGroups)),
             disabled: !currentGroups,
-            title: t("copy_all_props") || "复制全部",
-            style: {
-              background: "transparent",
-              border: "none",
-              color: "var(--text-secondary)",
-              cursor: "pointer",
-              padding: 0,
-              display: "flex",
-              alignItems: "center",
-              opacity: currentGroups ? 1 : 0.5
-            },
+            title: t("copy_all_props"),
             children: /* @__PURE__ */ jsx(IconCopy, { size: 14 })
           }
         ) })
       ] })
     ] }),
-    /* @__PURE__ */ jsx("div", { className: "flex-1 overflow-y-auto", children: filteredProps ? Object.entries(filteredProps).map(([group, props]) => /* @__PURE__ */ jsxs("div", { children: [
-      /* @__PURE__ */ jsxs("div", { className: `ui-prop-group${collapsed.has(group) ? " collapsed" : ""}`, onClick: () => toggleGroup(group), children: [
-        /* @__PURE__ */ jsx("span", { children: group }),
+    /* @__PURE__ */ jsx("div", { className: "ui-properties-scroll", children: filteredProps ? filteredProps.map((group) => /* @__PURE__ */ jsxs("div", { children: [
+      /* @__PURE__ */ jsxs("div", { className: `ui-prop-group${collapsed.has(group.name) ? " collapsed" : ""}`, onClick: () => toggleGroup(group.name), children: [
+        /* @__PURE__ */ jsx("span", { children: group.name }),
         /* @__PURE__ */ jsxs("div", { className: "ui-prop-group-actions", children: [
           /* @__PURE__ */ jsx(
             "button",
@@ -8945,50 +10760,38 @@ const PropertiesPanel = ({ t, selectedProps }) => {
               className: "ui-prop-copy",
               onClick: (e) => {
                 e.stopPropagation();
-                handleCopy(
-                  [`[${group}]`, ...Object.entries(props).map(([k, v]) => `${k}: ${v}`)].join("\n")
-                );
+                handleCopy([`[${group.name}]`, ...group.items.map((item) => `${item.key}: ${item.value}`)].join("\n"));
               },
-              title: t("copy_group_props") || "复制组",
+              title: t("copy_group_props"),
               children: /* @__PURE__ */ jsx(IconCopy, { size: 12 })
             }
           ),
-          /* @__PURE__ */ jsx("span", { style: { opacity: 0.6, display: "flex", alignItems: "center", marginLeft: 4 }, children: collapsed.has(group) ? /* @__PURE__ */ jsx(IconChevronRight, { width: 14, height: 14 }) : /* @__PURE__ */ jsx(IconChevronDown, { width: 14, height: 14 }) })
+          /* @__PURE__ */ jsx("span", { className: "ui-prop-group-chevron", children: collapsed.has(group.name) ? /* @__PURE__ */ jsx(IconChevronRight, { width: 14, height: 14 }) : /* @__PURE__ */ jsx(IconChevronDown, { width: 14, height: 14 }) })
         ] })
       ] }),
-      !collapsed.has(group) && Object.entries(props).map(([k, v]) => /* @__PURE__ */ jsxs("div", { className: "ui-prop-row", children: [
-        /* @__PURE__ */ jsx("div", { className: "ui-prop-key", title: k, children: k }),
+      !collapsed.has(group.name) && group.items.map((item) => /* @__PURE__ */ jsxs("div", { className: "ui-prop-row", children: [
+        /* @__PURE__ */ jsx(
+          "div",
+          {
+            className: "ui-prop-key",
+            title: `${item.path} (${t("click_to_copy")})`,
+            onClick: () => handleCopy(item.key),
+            children: item.key
+          }
+        ),
         /* @__PURE__ */ jsx(
           "div",
           {
             className: "ui-prop-value",
-            title: String(v),
-            onClick: () => handleCopy(String(v)),
-            style: { cursor: "copy" },
-            children: String(v)
+            title: `${item.value}
+${item.path}`,
+            onClick: () => handleCopy(item.value),
+            children: item.value
           }
         )
-      ] }, k))
-    ] }, group)) : /* @__PURE__ */ jsx("div", { style: { padding: 20, color: "var(--text-muted)", textAlign: "center", marginTop: 20 }, children: t("no_selection") }) }),
-    copiedText && /* @__PURE__ */ jsx(
-      "div",
-      {
-        style: {
-          position: "absolute",
-          bottom: "20px",
-          left: "50%",
-          transform: "translateX(-50%)",
-          background: "rgba(0,0,0,0.7)",
-          color: "white",
-          padding: "6px 12px",
-          borderRadius: "4px",
-          fontSize: "12px",
-          zIndex: 100,
-          pointerEvents: "none"
-        },
-        children: t("copied") || "已复制"
-      }
-    )
+      ] }, item.id))
+    ] }, group.name)) : /* @__PURE__ */ jsx("div", { className: "ui-properties-empty", children: t("no_selection") }) }),
+    copiedText && /* @__PURE__ */ jsx("div", { className: "ui-copy-toast", children: t("copied") })
   ] });
 };
 
@@ -9007,66 +10810,27 @@ const ConfirmModal = ({ isOpen, title, message, onConfirm, onCancel, t, theme })
       children: /* @__PURE__ */ jsxs(
         "div",
         {
-          style: {
-            display: "flex",
-            flexDirection: "column",
-            height: "100%",
-            padding: "16px",
-            gap: "16px"
-          },
+          className: "ui-modal-body ui-modal-body-confirm",
           children: [
-            /* @__PURE__ */ jsx(
-              "div",
-              {
-                className: "text-base",
-                style: {
-                  flex: 1,
-                  display: "flex",
-                  alignItems: "center",
-                  color: "var(--text-primary)",
-                  lineHeight: 1.6
-                },
-                children: message
-              }
-            ),
-            /* @__PURE__ */ jsxs(
-              "div",
-              {
-                style: {
-                  display: "flex",
-                  justifyContent: "flex-end",
-                  gap: "10px"
-                },
-                children: [
-                  /* @__PURE__ */ jsx(
-                    "button",
-                    {
-                      className: "ui-btn ui-btn-ghost w-[80px]",
-                      onClick: onCancel,
-                      children: t("btn_cancel")
-                    }
-                  ),
-                  /* @__PURE__ */ jsx(
-                    "button",
-                    {
-                      className: "ui-btn ui-btn-danger w-[80px]",
-                      style: { backgroundColor: "var(--error)", borderColor: "var(--error)", color: "white" },
-                      onClick: onConfirm,
-                      children: (() => {
-                        const text = t("btn_confirm").trim();
-                        if (text.toLowerCase() === "confirm") {
-                          return "Confirm";
-                        }
-                        if (text === "确定" || text === "确认") {
-                          return text;
-                        }
-                        return text || (t("confirm") || "Confirm");
-                      })()
-                    }
-                  )
-                ]
-              }
-            )
+            /* @__PURE__ */ jsx("div", { className: "ui-modal-message", children: message }),
+            /* @__PURE__ */ jsxs("div", { className: "ui-modal-actions", children: [
+              /* @__PURE__ */ jsx(
+                "button",
+                {
+                  className: "ui-btn ui-btn-default ui-modal-action-btn",
+                  onClick: onCancel,
+                  children: t("btn_cancel")
+                }
+              ),
+              /* @__PURE__ */ jsx(
+                "button",
+                {
+                  className: "ui-btn ui-btn-danger ui-modal-action-btn",
+                  onClick: onConfirm,
+                  children: t("btn_confirm")
+                }
+              )
+            ] })
           ]
         }
       )
@@ -9087,59 +10851,51 @@ const AboutModal = ({ isOpen, onClose, t, theme }) => {
       modal: true,
       movable: false,
       theme,
-      children: /* @__PURE__ */ jsxs("div", { style: { padding: "12px", display: "flex", flexDirection: "column", gap: "10px", height: "100%", overflowY: "auto" }, children: [
-        /* @__PURE__ */ jsxs("div", { style: { textAlign: "center" }, children: [
-          /* @__PURE__ */ jsx("div", { style: { fontSize: "20px", fontWeight: "bold", marginBottom: "6px", color: "var(--text-primary)" }, children: "3D Browser" }),
-          /* @__PURE__ */ jsx("div", { style: { fontSize: "11px", opacity: 0.7 }, children: "Professional 3D Model Viewer" })
+      children: /* @__PURE__ */ jsxs("div", { className: "ui-modal-body ui-modal-body-scroll ui-about-modal", children: [
+        /* @__PURE__ */ jsxs("div", { className: "ui-about-hero", children: [
+          /* @__PURE__ */ jsx("div", { className: "ui-about-app-name", children: "3D Browser" }),
+          /* @__PURE__ */ jsx("div", { className: "ui-about-tagline", children: t("about_tagline") })
         ] }),
-        /* @__PURE__ */ jsxs("div", { style: { width: "100%", display: "flex", flexDirection: "column", gap: "8px", fontSize: "12px" }, children: [
-          /* @__PURE__ */ jsxs("div", { style: { display: "flex", justifyContent: "space-between", borderBottom: "1px solid var(--border-color)", paddingBottom: "6px" }, children: [
-            /* @__PURE__ */ jsx("span", { style: { opacity: 0.7 }, children: t("about_version") }),
-            /* @__PURE__ */ jsx("span", { style: { fontWeight: "500" }, children: "1.5.7" })
+        /* @__PURE__ */ jsxs("div", { className: "ui-about-meta-card", children: [
+          /* @__PURE__ */ jsxs("div", { className: "ui-about-meta-row", children: [
+            /* @__PURE__ */ jsx("span", { className: "ui-about-meta-label", children: t("about_version") }),
+            /* @__PURE__ */ jsx("span", { className: "ui-about-meta-value", children: "1.6.0" })
           ] }),
-          /* @__PURE__ */ jsxs("div", { style: { display: "flex", justifyContent: "space-between", borderBottom: "1px solid var(--border-color)", paddingBottom: "6px" }, children: [
-            /* @__PURE__ */ jsx("span", { style: { opacity: 0.7 }, children: t("about_author") }),
-            /* @__PURE__ */ jsx("span", { style: { fontWeight: "500" }, children: "zhangly1403@163.com" })
+          /* @__PURE__ */ jsxs("div", { className: "ui-about-meta-row", children: [
+            /* @__PURE__ */ jsx("span", { className: "ui-about-meta-label", children: t("about_author") }),
+            /* @__PURE__ */ jsx("span", { className: "ui-about-meta-value", children: "zhangly1403@163.com" })
           ] }),
-          /* @__PURE__ */ jsxs("div", { style: { display: "flex", justifyContent: "space-between", borderBottom: "1px solid var(--border-color)", paddingBottom: "6px" }, children: [
-            /* @__PURE__ */ jsx("span", { style: { opacity: 0.7 }, children: t("project_url") }),
+          /* @__PURE__ */ jsxs("div", { className: "ui-about-meta-row", children: [
+            /* @__PURE__ */ jsx("span", { className: "ui-about-meta-label", children: t("project_url") }),
             /* @__PURE__ */ jsx("a", { href: "https://github.com/zly258/3dbrowser", target: "_blank", rel: "noopener noreferrer", className: "ui-link", children: "github.com/zly258/3dbrowser" })
           ] }),
-          /* @__PURE__ */ jsxs("div", { style: { display: "flex", justifyContent: "space-between", borderBottom: "1px solid var(--border-color)", paddingBottom: "6px" }, children: [
-            /* @__PURE__ */ jsx("span", { style: { opacity: 0.7 }, children: t("about_license") }),
-            /* @__PURE__ */ jsx("span", { style: { fontWeight: "500", color: "var(--error)" }, children: t("about_license_nc") })
+          /* @__PURE__ */ jsxs("div", { className: "ui-about-meta-row", children: [
+            /* @__PURE__ */ jsx("span", { className: "ui-about-meta-label", children: t("about_license") }),
+            /* @__PURE__ */ jsx("span", { className: "ui-about-meta-value ui-about-license-badge", children: t("about_license_nc") })
           ] })
         ] }),
-        /* @__PURE__ */ jsxs("div", { style: { border: "1px solid var(--border-color)", borderRadius: "4px", overflow: "hidden" }, children: [
+        /* @__PURE__ */ jsxs("div", { className: "ui-about-license-card", children: [
           /* @__PURE__ */ jsxs(
             "div",
             {
-              style: {
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                padding: "8px 12px",
-                backgroundColor: "var(--bg-header)",
-                cursor: "pointer",
-                userSelect: "none"
-              },
+              className: "ui-about-license-toggle",
               onClick: () => setShowLicenseDetails(!showLicenseDetails),
               children: [
-                /* @__PURE__ */ jsx("span", { style: { fontWeight: "500", fontSize: "12px" }, children: t("license_details") }),
+                /* @__PURE__ */ jsx("span", { className: "ui-about-license-title", children: t("license_details") }),
                 showLicenseDetails ? /* @__PURE__ */ jsx(IconChevronUp, { width: 14, height: 14 }) : /* @__PURE__ */ jsx(IconChevronDown, { width: 14, height: 14 })
               ]
             }
           ),
-          showLicenseDetails && /* @__PURE__ */ jsxs("div", { style: { padding: "12px", fontSize: "11px", lineHeight: "1.5", backgroundColor: "var(--bg-primary)", maxHeight: "180px", overflowY: "auto" }, children: [
-            /* @__PURE__ */ jsx("div", { style: { whiteSpace: "pre-wrap", marginBottom: "8px" }, children: t("license_summary") }),
-            /* @__PURE__ */ jsxs("div", { style: { fontSize: "10px", opacity: 0.7, marginTop: "8px" }, children: [
+          showLicenseDetails && /* @__PURE__ */ jsxs("div", { className: "ui-about-license-content", children: [
+            /* @__PURE__ */ jsx("div", { className: "ui-about-license-summary", children: t("license_summary") }),
+            /* @__PURE__ */ jsxs("div", { className: "ui-about-license-link", children: [
               t("full_license"),
               " ",
               /* @__PURE__ */ jsx("a", { href: "https://creativecommons.org/licenses/by-nc/4.0/", target: "_blank", rel: "noopener noreferrer", className: "ui-link", children: "CC BY-NC 4.0" })
             ] })
           ] })
         ] }),
-        /* @__PURE__ */ jsx("div", { style: { fontSize: "11px", opacity: 0.5, textAlign: "center", marginTop: "auto" }, children: "Copyright © 2026. All rights reserved." })
+        /* @__PURE__ */ jsx("div", { className: "ui-about-footer", children: t("about_copyright") })
       ] })
     }
   );
@@ -9155,7 +10911,7 @@ const ViewCube = ({ sceneMgr, lang = "zh", theme }) => {
   const raycaster = useRef(new THREE.Raycaster());
   const mouse = useRef(new THREE.Vector2());
   const hoveredPart = useRef(null);
-  const cubeSize = sceneMgr?.settings?.viewCubeSize || 100;
+  const cubeSize = sceneMgr?.settings?.viewCubeSize || 120;
   const t = (key) => getTranslation(lang, key);
   useEffect(() => {
     if (!canvasRef.current || !containerRef.current) return;
@@ -9378,7 +11134,7 @@ const ViewCube = ({ sceneMgr, lang = "zh", theme }) => {
         height: `${cubeSize}px`,
         zIndex: 100,
         pointerEvents: "auto",
-        borderRadius: "8px",
+        borderRadius: "var(--radius-lg)",
         overflow: "hidden"
       },
       onClick: handleClick,
@@ -9417,9 +11173,9 @@ class ErrorBoundary extends Component {
         padding: "40px",
         textAlign: "center"
       }, children: [
-        /* @__PURE__ */ jsx("div", { style: { fontSize: "64px" }, children: "⚠️" }),
-        /* @__PURE__ */ jsx("h1", { style: { fontSize: "24px", margin: 0 }, children: t("error_title") }),
-        /* @__PURE__ */ jsx("p", { style: { color: theme.textMuted, maxWidth: "600px", lineHeight: "1.6" }, children: t("error_msg") }),
+        /* @__PURE__ */ jsx("div", { style: { fontSize: "48px", lineHeight: 1 }, children: "⚠️" }),
+        /* @__PURE__ */ jsx("h1", { style: { fontSize: "var(--font-size-title)", margin: 0, fontWeight: 700 }, children: t("error_title") }),
+        /* @__PURE__ */ jsx("p", { style: { color: theme.textMuted, maxWidth: "600px", lineHeight: "1.6", fontSize: "var(--font-size-body)" }, children: t("error_msg") }),
         /* @__PURE__ */ jsx(
           "button",
           {
@@ -9429,9 +11185,11 @@ class ErrorBoundary extends Component {
               backgroundColor: theme.accent,
               color: "#fff",
               border: "none",
-              borderRadius: "6px",
+              borderRadius: "var(--radius-md)",
               cursor: "pointer",
-              fontWeight: "bold"
+              fontWeight: 600,
+              fontSize: "var(--font-size-body)",
+              minHeight: "var(--control-h-md)"
             },
             children: t("error_reload")
           }
@@ -9707,7 +11465,7 @@ async function loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t,
       });
     }
     if (ext === "ifc") {
-      const { loadIFC } = await import('./IFCLoader-DMndQRjK.js');
+      const { loadIFC } = await import('./ifcLoader-UXbmG1k2.js');
       reportStage("parse", 0);
       const ifcSettings = {
         ...settings,
@@ -9780,7 +11538,7 @@ async function loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t,
       const buffer = typeof fileOrUrl === "string" ? await fetch(url).then((r) => r.arrayBuffer()) : await fileOrUrl.arrayBuffer();
       const normalizedLibPath = normalizeLibPath(libPath);
       const wasmUrl = `${normalizedLibPath}/occt-import-js/occt-import-js.wasm`;
-      const { OCCTLoader } = await import('./OCCTLoader-CiM09x_z.js');
+      const { OCCTLoader } = await import('./occtLoader-CiM09x_z.js');
       const loader = new OCCTLoader(wasmUrl);
       reportStage("parse", 0);
       return await loader.load(buffer, t, (p, msg) => reportStage("parse", p, msg));
@@ -9973,8 +11731,19 @@ function useFileLoadingFlow({
     try {
       await loadItemsIntoScene(items);
       updateTree();
+      const hasNbim = items.some((item) => {
+        const path = typeof item === "string" ? item : item.name;
+        return path.toLowerCase().endsWith(".nbim");
+      });
+      if (hasNbim) {
+        const stats = managerRef.current.getStats?.();
+        if (stats && stats.meshes <= 0) {
+          throw new Error("NBIM 加载完成但没有可渲染外形，请检查文件格式或分块数据");
+        }
+      } else {
+        managerRef.current?.fitView(false);
+      }
       setStatus(t("success"));
-      managerRef.current?.fitView(false);
     } catch (err) {
       setStatus(t("failed"));
       setToast({ message: `${t("failed")}: ${err.message}`, type: "error" });
@@ -9986,6 +11755,23 @@ function useFileLoadingFlow({
     processFiles,
     loadItemsIntoScene
   };
+}
+
+function useSceneStats({ mgrInstance, showStats, setStats }) {
+  useEffect(() => {
+    if (!mgrInstance || !showStats) return;
+    const updateStats = () => {
+      if (document.visibilityState !== "visible") return;
+      setStats(mgrInstance.getStats());
+    };
+    updateStats();
+    const statsInterval = window.setInterval(updateStats, 1e3);
+    document.addEventListener("visibilitychange", updateStats);
+    return () => {
+      window.clearInterval(statsInterval);
+      document.removeEventListener("visibilitychange", updateStats);
+    };
+  }, [mgrInstance, setStats, showStats]);
 }
 
 function toggleUuidSelection(current, uuid) {
@@ -10029,17 +11815,2762 @@ function buildSelectedPropertyGroups({
   nbimProps,
   nbimLabel = "BIM 属性"
 }) {
-  const groups = {
-    [basicLabel]: basicProps,
-    [geoLabel]: geoProps
-  };
+  const groups = [
+    {
+      name: basicLabel,
+      items: createPropertyEntries(basicLabel, basicProps, "basic")
+    },
+    {
+      name: geoLabel,
+      items: createPropertyEntries(geoLabel, geoProps, "geometry")
+    }
+  ];
   if (ifcProps) {
-    Object.assign(groups, ifcProps);
-  }
-  if (nbimProps) {
-    groups[nbimLabel] = nbimProps;
+    groups.push(...buildPropertyGroupsFromRecord(ifcProps, "ifc"));
   }
   return groups;
+}
+
+function resolveSelectionTarget(sceneManager, selectionObject, focusUuid) {
+  let realObject = focusUuid === (selectionObject?.uuid || selectionObject?.id) && selectionObject instanceof THREE.Object3D ? selectionObject : sceneManager.contentGroup.getObjectByProperty("uuid", focusUuid);
+  if (!realObject) {
+    const nodes = sceneManager.getStructureNodes(focusUuid);
+    if (nodes && nodes.length > 0) {
+      realObject = nodes[0];
+    }
+  }
+  return realObject || selectionObject;
+}
+function resolveTargetElevation(target) {
+  if (typeof target?.userData?.ifcMetadata?.elevation === "number") {
+    return target.userData.ifcMetadata.elevation;
+  }
+  if (!(target instanceof THREE.Object3D)) return void 0;
+  let cursor = target;
+  while (cursor) {
+    const elevation = cursor.userData?.ifcMetadata?.elevation;
+    if (typeof elevation === "number" && Number.isFinite(elevation)) {
+      return elevation;
+    }
+    cursor = cursor.parent;
+  }
+  return void 0;
+}
+async function fetchIfcGroups(target, cache) {
+  const resolveIfcContext = (candidate) => {
+    let cursor = candidate instanceof THREE.Object3D ? candidate : null;
+    let expressID = candidate?.userData?.expressID;
+    while (cursor) {
+      if (cursor.userData?.expressID !== void 0 && expressID === void 0) {
+        expressID = cursor.userData.expressID;
+      }
+      if (cursor.userData?.ifcManager && cursor.userData?.modelID !== void 0) {
+        return {
+          ifcRoot: cursor,
+          expressID
+        };
+      }
+      cursor = cursor.parent;
+    }
+    return null;
+  };
+  const ifcContext = resolveIfcContext(target);
+  if (!ifcContext?.ifcRoot || ifcContext.expressID === void 0) return null;
+  try {
+    const cacheKey = `${ifcContext.ifcRoot.userData.modelID}:${ifcContext.expressID}`;
+    const cached = cache.get(cacheKey);
+    if (cached) return cached;
+    const ifcManager = ifcContext.ifcRoot.userData.ifcManager;
+    const ifcProps = await ifcManager.getItemProperties(ifcContext.ifcRoot.userData.modelID, ifcContext.expressID);
+    const groups = ifcProps?.rawGroups || ifcProps?.groups || ifcProps?.normalizedGroups || null;
+    if (groups) {
+      cache.set(cacheKey, groups);
+    }
+    return groups;
+  } catch (error) {
+    console.error("IFC Props Error", error);
+    return null;
+  }
+}
+function buildSelectionPropertyGroups({
+  sceneManager,
+  focusUuid,
+  target,
+  t,
+  ifcGroups,
+  clashSummary,
+  isDev = false
+}) {
+  const basicProps = {};
+  const geoProps = {};
+  const targetElevation = resolveTargetElevation(target);
+  const resolvedName = [target?.name, target?.userData?.name].find((value) => typeof value === "string" && value.trim().length > 0);
+  const wrappedId = sceneManager.getBimIdByUuid(focusUuid) || focusUuid;
+  if (resolvedName) {
+    basicProps[t("prop_name")] = resolvedName;
+  }
+  basicProps[t("prop_id")] = wrappedId;
+  basicProps[t("prop_type")] = target.type || (target.children ? "Group" : "Mesh");
+  if (typeof targetElevation === "number" && Number.isFinite(targetElevation)) {
+    basicProps[t("prop_storey_elevation")] = String(targetElevation);
+  }
+  if (target.getWorldPosition) {
+    const worldPosition = new THREE.Vector3();
+    target.getWorldPosition(worldPosition);
+    geoProps[t("prop_pos")] = `${worldPosition.x.toFixed(2)}, ${worldPosition.y.toFixed(2)}, ${worldPosition.z.toFixed(2)}`;
+  }
+  if (target.isMesh || target.type === "Mesh") {
+    if (target instanceof THREE.Mesh) {
+      const box = new THREE.Box3().setFromObject(target);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      geoProps[t("prop_dim")] = `${size.x.toFixed(2)} x ${size.y.toFixed(2)} x ${size.z.toFixed(2)}`;
+      if (target.geometry) {
+        geoProps[t("prop_vert")] = (target.geometry.attributes.position?.count || 0).toLocaleString();
+        geoProps[t("prop_tri")] = target.geometry.index ? (target.geometry.index.count / 3).toLocaleString() : ((target.geometry.attributes.position?.count || 0) / 3).toLocaleString();
+      }
+    } else if (target.userData?.boundingBox) {
+      const size = new THREE.Vector3();
+      target.userData.boundingBox.getSize(size);
+      geoProps[t("prop_dim")] = `${size.x.toFixed(2)} x ${size.y.toFixed(2)} x ${size.z.toFixed(2)}`;
+    }
+    if (target.isInstancedMesh) {
+      geoProps[t("prop_inst")] = target.count.toLocaleString();
+    }
+    const geometryData = sceneManager.getObjectGeometryData(focusUuid);
+    if (geometryData.area > 0) {
+      geoProps[t("prop_area")] = geometryData.area.toFixed(3);
+    }
+    if (geometryData.volume > 0) {
+      geoProps[t("prop_volume")] = geometryData.volume.toFixed(3);
+    }
+  } else if (target.userData?.boundingBox) {
+    const size = new THREE.Vector3();
+    target.userData.boundingBox.getSize(size);
+    geoProps[t("prop_dim")] = `${size.x.toFixed(2)} x ${size.y.toFixed(2)} x ${size.z.toFixed(2)}`;
+  }
+  const nbimProps = sceneManager.getNbimProperties(focusUuid);
+  const nbimIfcGroups = sceneManager.getNbimIfcPropertyGroups(focusUuid, "raw");
+  if (isDev && nbimProps && Object.keys(nbimProps).length > 0) {
+    console.group(`NBIM 选中属性: ${focusUuid}`);
+    console.log(nbimProps);
+    console.log(JSON.stringify(nbimProps, null, 2));
+    console.groupEnd();
+  }
+  if (isDev && nbimIfcGroups) {
+    console.group(`NBIM IFC 组属性: ${focusUuid}`);
+    console.log(nbimIfcGroups);
+    console.log(JSON.stringify(nbimIfcGroups, null, 2));
+    console.groupEnd();
+  }
+  const groups = buildSelectedPropertyGroups({
+    basicLabel: t("pg_basic"),
+    geoLabel: t("pg_geo"),
+    basicProps,
+    geoProps,
+    ifcProps: ifcGroups || nbimIfcGroups || null,
+    nbimProps: null
+  });
+  if (clashSummary) {
+    const clashLabel = t("pg_clash");
+    groups.push({
+      name: clashLabel,
+      items: createPropertyEntries(clashLabel, [
+        { key: t("clash_group_all"), value: String(clashSummary.total) },
+        { key: t("clash_group_new"), value: String(clashSummary.newCount) },
+        { key: t("clash_group_confirmed"), value: String(clashSummary.confirmedCount) },
+        { key: t("clash_group_resolved"), value: String(clashSummary.resolvedCount) },
+        { key: t("prop_status"), value: t(`clash_group_${clashSummary.worstStatus}`) }
+      ].map((item, index) => ({ ...item, id: `clash-summary::${index}` })))
+    });
+  }
+  return groups;
+}
+
+function useViewerSelection({
+  sceneMgrRef,
+  selectedUuids,
+  setSelectedUuids,
+  setSelectedProps,
+  setHiddenUuids,
+  setIsolatedUuids,
+  updateTree,
+  propOnSelect,
+  ifcPropertyCacheRef,
+  clashSummaryByUuid,
+  focusObjectsInView,
+  t,
+  isDev = false
+}) {
+  const [locatedUuid, setLocatedUuid] = useState(null);
+  const [locateResultUuids, setLocateResultUuids] = useState([]);
+  const resetLocateState = useCallback(() => {
+    setLocatedUuid(null);
+    setLocateResultUuids([]);
+  }, []);
+  const handleSelect = useCallback(async (obj, _intersect, isMultiSelect = false) => {
+    const sceneManager = sceneMgrRef.current;
+    if (!sceneManager) return;
+    if (!obj) {
+      setSelectedUuids([]);
+      setSelectedProps(null);
+      sceneManager.highlightObjects([]);
+      return;
+    }
+    const rawUuid = obj.uuid || obj.id;
+    const uuid = sceneManager.resolveSelectionUuid(rawUuid);
+    if (!uuid) return;
+    const nextUuids = isMultiSelect ? selectedUuids.includes(uuid) ? selectedUuids.filter((id) => id !== uuid) : [...selectedUuids, uuid] : [uuid];
+    setSelectedUuids(nextUuids);
+    sceneManager.highlightObjects(nextUuids);
+    const focusUuid = nextUuids[nextUuids.length - 1];
+    if (!focusUuid) {
+      setSelectedProps(null);
+      return;
+    }
+    propOnSelect?.(focusUuid, obj);
+    const target = resolveSelectionTarget(sceneManager, obj, focusUuid);
+    const ifcGroups = await fetchIfcGroups(target, ifcPropertyCacheRef.current || /* @__PURE__ */ new Map());
+    const selectedGroups = buildSelectionPropertyGroups({
+      sceneManager,
+      focusUuid,
+      target,
+      t,
+      ifcGroups,
+      clashSummary: clashSummaryByUuid[focusUuid],
+      isDev
+    });
+    setSelectedProps(selectedGroups);
+  }, [
+    clashSummaryByUuid,
+    ifcPropertyCacheRef,
+    isDev,
+    propOnSelect,
+    sceneMgrRef,
+    selectedUuids,
+    setSelectedProps,
+    setSelectedUuids,
+    t
+  ]);
+  const handleLocateObject = useCallback((obj) => {
+    const sceneManager = sceneMgrRef.current;
+    if (!sceneManager || !obj) return false;
+    const rawUuid = obj.uuid || obj.id;
+    if (!rawUuid) return false;
+    const uuid = sceneManager.resolveSelectionUuid(rawUuid);
+    if (!uuid) return false;
+    const bounds = sceneManager.getBoundsForObject(uuid);
+    if (!bounds) return false;
+    setLocatedUuid(uuid);
+    return focusObjectsInView({ uuids: [uuid], focusUuid: uuid, updateSelection: false });
+  }, [focusObjectsInView, sceneMgrRef]);
+  const handleLocateResultsChange = useCallback((uuids) => {
+    const changed = !(locateResultUuids.length === uuids.length && locateResultUuids.every((uuid, index) => uuid === uuids[index]));
+    if (!changed) return;
+    setLocateResultUuids(uuids);
+    const sceneManager = sceneMgrRef.current;
+    if (!sceneManager || uuids.length > 0) return;
+    sceneManager.clearLocateFocus();
+  }, [locateResultUuids, sceneMgrRef]);
+  const handleClearLocate = useCallback(() => {
+    resetLocateState();
+    sceneMgrRef.current?.clearLocateFocus();
+    sceneMgrRef.current?.highlightObjects(selectedUuids);
+  }, [resetLocateState, sceneMgrRef, selectedUuids]);
+  return {
+    locatedUuid,
+    locateResultUuids,
+    resetLocateState,
+    handleSelect,
+    handleLocateObject,
+    handleLocateResultsChange,
+    handleClearLocate
+  };
+}
+
+function useViewerActions({
+  sceneMgrRef,
+  t,
+  setLoading,
+  setProgress,
+  setStatus,
+  setToast,
+  setActiveTool,
+  setConfirmState,
+  setSelectedUuids,
+  setSelectedProps,
+  setChunkProgress,
+  resetLocateState,
+  clearSearchResult,
+  resetClashState,
+  resetMeasurementState,
+  resetExplodeState,
+  updateTree,
+  ifcPropertyCacheRef,
+  completedFileSetsRef
+}) {
+  const getExportModelNames = useCallback(() => {
+    const manager = sceneMgrRef.current;
+    if (!manager) return [];
+    const names = [];
+    manager.contentGroup.children.forEach((child) => {
+      if (child.userData?.isOptimizedGroup) return;
+      if (child.name.startsWith("optimized_")) return;
+      const rawName = (typeof child.userData?.modelName === "string" ? child.userData.modelName : "") || (child.children?.[0]?.name || "") || child.name;
+      const baseName = sanitizeFileStem(stripFileExtension(rawName));
+      names.push(baseName);
+    });
+    return Array.from(new Set(names));
+  }, [sceneMgrRef]);
+  const getDefaultExportFileName = useCallback((format) => {
+    const modelNames = getExportModelNames();
+    if (modelNames.length === 1) {
+      return modelNames[0];
+    }
+    const now = /* @__PURE__ */ new Date();
+    const pad = (value) => String(value).padStart(2, "0");
+    const suffix = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+    return `${t("export_batch_name")}_${suffix}`;
+  }, [getExportModelNames, t]);
+  const resolveExportFilename = useCallback((format, requestedName) => {
+    const fallback = getDefaultExportFileName(format);
+    const stem = sanitizeFileStem(stripFileExtension((requestedName || "").trim()) || fallback);
+    return `${stem}.${format}`;
+  }, [getDefaultExportFileName]);
+  const handleExport = useCallback(async (format, requestedName) => {
+    const manager = sceneMgrRef.current;
+    if (!manager) return;
+    const content = manager.contentGroup;
+    const resolvedFileName = resolveExportFilename(format, requestedName);
+    const resolvedStem = stripFileExtension(resolvedFileName);
+    if (format === "nbim") {
+      if (content.children.length === 0) {
+        setToast({ message: t("no_models"), type: "info" });
+        return;
+      }
+      setLoading(true);
+      setStatus(`${t("processing")}...`);
+      setActiveTool("none");
+      window.setTimeout(async () => {
+        try {
+          await sceneMgrRef.current?.exportNbim(resolvedStem);
+          setToast({ message: t("success"), type: "success" });
+        } catch (error) {
+          console.error(error);
+          setToast({ message: `${t("failed")}: ${error.message}`, type: "error" });
+        } finally {
+          setLoading(false);
+        }
+      }, 100);
+      return;
+    }
+    const modelsToExport = content.children.filter((child) => !child.userData.isOptimizedGroup);
+    if (modelsToExport.length === 0) {
+      setToast({ message: t("no_models"), type: "info" });
+      return;
+    }
+    const exportGroup = new THREE.Group();
+    modelsToExport.forEach((model) => exportGroup.add(model.clone()));
+    setLoading(true);
+    setProgress(0);
+    setStatus(`${t("processing")}...`);
+    setActiveTool("none");
+    window.setTimeout(async () => {
+      try {
+        let blob = null;
+        if (format === "glb") {
+          blob = await exportGLB(exportGroup);
+        } else if (format === "lmb") {
+          blob = await exportLMB(exportGroup, (message) => setStatus(cleanLoadingStatus(message)));
+        }
+        if (blob) {
+          const url = URL.createObjectURL(blob);
+          const anchor = document.createElement("a");
+          anchor.href = url;
+          anchor.download = resolvedFileName;
+          anchor.click();
+          URL.revokeObjectURL(url);
+          setToast({ message: t("success"), type: "success" });
+        }
+      } catch (error) {
+        console.error(error);
+        setToast({ message: `${t("failed")}: ${error.message}`, type: "error" });
+      } finally {
+        setLoading(false);
+        setProgress(0);
+      }
+    }, 100);
+  }, [resolveExportFilename, sceneMgrRef, setActiveTool, setLoading, setProgress, setStatus, setToast, t]);
+  const handleClear = useCallback(async () => {
+    const manager = sceneMgrRef.current;
+    if (!manager) return;
+    setConfirmState({
+      isOpen: true,
+      title: t("op_clear"),
+      message: t("confirm_clear"),
+      action: async () => {
+        setLoading(true);
+        setProgress(0);
+        setStatus(`${t("op_clear")}...`);
+        try {
+          await sceneMgrRef.current?.clear();
+          setSelectedUuids([]);
+          resetLocateState();
+          setSelectedProps(null);
+          clearSearchResult();
+          resetClashState();
+          ifcPropertyCacheRef.current.clear();
+          resetMeasurementState();
+          setChunkProgress({ loaded: 0, total: 0 });
+          completedFileSetsRef.current.clear();
+          resetExplodeState();
+          updateTree();
+          setStatus(t("ready"));
+        } catch (error) {
+          console.error("清空场景失败:", error);
+        } finally {
+          setLoading(false);
+        }
+      }
+    });
+  }, [
+    clearSearchResult,
+    completedFileSetsRef,
+    ifcPropertyCacheRef,
+    resetClashState,
+    resetExplodeState,
+    resetLocateState,
+    resetMeasurementState,
+    sceneMgrRef,
+    setChunkProgress,
+    setConfirmState,
+    setLoading,
+    setProgress,
+    setSelectedProps,
+    setSelectedUuids,
+    setStatus,
+    t,
+    updateTree
+  ]);
+  const handleScreenshot = useCallback((mode = "scene") => {
+    const manager = sceneMgrRef.current;
+    if (!manager) return;
+    try {
+      const renderer = manager.renderer;
+      const scene = manager.scene;
+      const previousBackground = scene.background;
+      if (mode === "transparent") {
+        scene.background = null;
+        renderer.setClearAlpha(0);
+      } else {
+        renderer.setClearAlpha(1);
+      }
+      renderer.render(scene, manager.camera);
+      const dataUrl = manager.canvas.toDataURL("image/png");
+      const anchor = document.createElement("a");
+      anchor.href = dataUrl;
+      anchor.download = mode === "transparent" ? "screenshot-transparent.png" : "screenshot.png";
+      anchor.click();
+      scene.background = previousBackground;
+      renderer.setClearAlpha(1);
+      renderer.render(scene, manager.camera);
+      setToast({ message: t("success"), type: "success" });
+    } catch (error) {
+      console.error(error);
+      setToast({ message: t("failed"), type: "error" });
+    }
+  }, [sceneMgrRef, setToast, t]);
+  return {
+    getDefaultExportFileName,
+    handleExport,
+    handleClear,
+    handleScreenshot
+  };
+}
+
+function useViewerCanvasInteractions({
+  sceneMgrRef,
+  canvasRef,
+  activeTool,
+  setActiveTool,
+  measureType,
+  setMeasureType,
+  pickEnabled,
+  selectedUuids,
+  setSelectedUuids,
+  setSelectedProps,
+  setMousePos,
+  setHighlightedMeasureId,
+  handleSelect,
+  handleContextMenu,
+  handleUndoVisibility,
+  clearSelectionState
+}) {
+  const pointerDownRef = useRef(null);
+  const mouseMoveRafRef = useRef(null);
+  const pendingMousePointRef = useRef(null);
+  useEffect(() => {
+    const manager = sceneMgrRef.current;
+    const canvas = canvasRef.current;
+    if (!manager || !canvas) return;
+    const clickMoveThreshold = 6;
+    const handleMouseDown = (event) => {
+      pointerDownRef.current = {
+        x: event.clientX,
+        y: event.clientY,
+        moved: false,
+        button: event.button
+      };
+    };
+    const handleClick = (event) => {
+      const pointerState = pointerDownRef.current;
+      if (!pointerState || pointerState.button !== 0 || pointerState.moved) {
+        pointerDownRef.current = null;
+        return;
+      }
+      pointerDownRef.current = null;
+      if (activeTool === "boxSelect") return;
+      if (activeTool === "measure") {
+        if (measureType !== "none") {
+          const intersect = manager.getRayIntersects(event.clientX, event.clientY);
+          if (intersect) {
+            const modelUuid = intersect.object.uuid;
+            manager.addMeasurePoint(intersect.point, modelUuid);
+            return;
+          }
+        }
+        const measurementId = manager.pickMeasurement(event.clientX, event.clientY);
+        if (measurementId) {
+          setHighlightedMeasureId(measurementId);
+          manager.highlightMeasurement(measurementId);
+          return;
+        }
+        setHighlightedMeasureId(null);
+        manager.highlightMeasurement(null);
+        return;
+      }
+      if (pickEnabled) {
+        const result = manager.pick(event.clientX, event.clientY);
+        void handleSelect(result ? result.object : null, result ? result.intersect : null, event.ctrlKey);
+      }
+    };
+    const handleMouseMove = (event) => {
+      if (pointerDownRef.current && !pointerDownRef.current.moved) {
+        const dx = event.clientX - pointerDownRef.current.x;
+        const dy = event.clientY - pointerDownRef.current.y;
+        if (dx * dx + dy * dy > clickMoveThreshold * clickMoveThreshold) {
+          pointerDownRef.current.moved = true;
+        }
+      }
+      if (activeTool === "measure") {
+        manager.updateMeasureHover(event.clientX, event.clientY);
+        setMousePos(null);
+        return;
+      }
+      if (event.buttons !== 0) {
+        pendingMousePointRef.current = null;
+        if (mouseMoveRafRef.current !== null) {
+          cancelAnimationFrame(mouseMoveRafRef.current);
+          mouseMoveRafRef.current = null;
+        }
+        setMousePos(null);
+        return;
+      }
+      pendingMousePointRef.current = { x: event.clientX, y: event.clientY };
+      if (mouseMoveRafRef.current !== null) return;
+      mouseMoveRafRef.current = requestAnimationFrame(() => {
+        mouseMoveRafRef.current = null;
+        const pending = pendingMousePointRef.current;
+        if (!pending) return;
+        const intersect = manager.getRayIntersects(pending.x, pending.y);
+        setMousePos(intersect ? intersect.point : null);
+      });
+    };
+    const handleKeyDown = (event) => {
+      if ((event.key === "z" || event.key === "Z") && (event.ctrlKey || event.metaKey)) {
+        handleUndoVisibility();
+        return;
+      }
+      if (event.key === "Escape") {
+        if (activeTool === "measure" && measureType !== "none") {
+          setMeasureType("none");
+          manager.startMeasurement("none");
+        }
+        if (activeTool === "boxSelect") {
+          manager.cancelBoxSelect();
+          setActiveTool("none");
+        }
+        clearSelectionState();
+      }
+    };
+    canvas.addEventListener("mousedown", handleMouseDown);
+    canvas.addEventListener("click", handleClick);
+    canvas.addEventListener("mousemove", handleMouseMove);
+    canvas.addEventListener("contextmenu", handleContextMenu);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      if (mouseMoveRafRef.current !== null) {
+        cancelAnimationFrame(mouseMoveRafRef.current);
+        mouseMoveRafRef.current = null;
+      }
+      pendingMousePointRef.current = null;
+      canvas.removeEventListener("mousedown", handleMouseDown);
+      canvas.removeEventListener("click", handleClick);
+      canvas.removeEventListener("mousemove", handleMouseMove);
+      canvas.removeEventListener("contextmenu", handleContextMenu);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [
+    activeTool,
+    canvasRef,
+    clearSelectionState,
+    handleContextMenu,
+    handleSelect,
+    handleUndoVisibility,
+    measureType,
+    pickEnabled,
+    sceneMgrRef,
+    setActiveTool,
+    setHighlightedMeasureId,
+    setMeasureType,
+    setMousePos
+  ]);
+  useEffect(() => {
+    const manager = sceneMgrRef.current;
+    const canvas = canvasRef.current;
+    if (!manager || !canvas || activeTool !== "boxSelect") return;
+    manager.controls.mouseButtons.LEFT = void 0;
+    const onPointerDown = (event) => {
+      if (event.button !== 0) return;
+      manager.startBoxSelect(event.clientX, event.clientY);
+    };
+    const onPointerMove = (event) => {
+      manager.updateBoxSelect(event.clientX, event.clientY);
+    };
+    const onPointerUp = (event) => {
+      if (event.button !== 0) return;
+      const uuids = manager.endBoxSelect();
+      if (uuids.length > 0) {
+        const nextUuids = event.shiftKey ? [.../* @__PURE__ */ new Set([...selectedUuids, ...uuids])] : uuids;
+        setSelectedUuids(nextUuids);
+        setSelectedProps(null);
+        manager.highlightObjects(nextUuids);
+      }
+    };
+    canvas.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    return () => {
+      canvas.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+      if (manager.controls) {
+        manager.controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
+      }
+      manager.cancelBoxSelect();
+    };
+  }, [activeTool, canvasRef, sceneMgrRef, selectedUuids, setSelectedProps, setSelectedUuids]);
+}
+
+const SUPPORTED_DROP_EXTENSIONS = [
+  ".lmb",
+  ".glb",
+  ".gltf",
+  ".ifc",
+  ".nbim",
+  ".fbx",
+  ".obj",
+  ".stl",
+  ".ply",
+  ".3mf",
+  ".stp",
+  ".step",
+  ".igs",
+  ".iges"
+];
+function useViewerFileActions({
+  sceneMgrRef,
+  t,
+  processFiles,
+  loadItemsIntoScene,
+  setLoading,
+  setStatus,
+  setProgress,
+  setToast,
+  setActiveTool,
+  setSelectedUuids,
+  setSelectedProps,
+  resetMeasurementState,
+  updateTree,
+  isDev
+}) {
+  const handleOpenFiles = useCallback(async (event) => {
+    if (!event.target.files?.length) return;
+    await processFiles(Array.from(event.target.files));
+    event.target.value = "";
+  }, [processFiles]);
+  const handleBatchConvert = useCallback(async (event) => {
+    const manager = sceneMgrRef.current;
+    if (!event.target.files?.length || !manager) return;
+    const files = Array.from(event.target.files);
+    event.target.value = "";
+    const invalidFiles = files.filter((file) => file.name.toLowerCase().endsWith(".nbim"));
+    if (invalidFiles.length > 0) {
+      setToast({ message: t("unsupported_format"), type: "info" });
+      return;
+    }
+    manager.setChunkLoadingEnabled?.(false);
+    manager.setContentVisible?.(false);
+    setLoading(true);
+    setStatus(`${t("processing")}...`);
+    setProgress(0);
+    setActiveTool("none");
+    try {
+      await manager.clear();
+      setSelectedUuids([]);
+      setSelectedProps(null);
+      resetMeasurementState();
+      updateTree();
+      await loadItemsIntoScene(files);
+      updateTree();
+      setStatus(`${t("processing")}...`);
+      await manager.exportNbim();
+      setStatus(t("success"));
+      setToast({ message: t("success"), type: "success" });
+    } catch (error) {
+      console.error("[ThreeViewer] handleBatchConvert error:", error);
+      setStatus(t("failed"));
+      setToast({ message: `${t("failed")}: ${error.message}`, type: "error" });
+    } finally {
+      try {
+        await sceneMgrRef.current?.clear();
+        updateTree();
+      } catch {
+      }
+      sceneMgrRef.current?.setChunkLoadingEnabled?.(true);
+      sceneMgrRef.current?.setContentVisible?.(true);
+      setLoading(false);
+    }
+  }, [
+    loadItemsIntoScene,
+    resetMeasurementState,
+    sceneMgrRef,
+    setActiveTool,
+    setLoading,
+    setProgress,
+    setSelectedProps,
+    setSelectedUuids,
+    setStatus,
+    setToast,
+    t,
+    updateTree
+  ]);
+  const handleOpenUrl = useCallback(async () => {
+    const url = window.prompt(t("menu_open_url"), "http://");
+    if (!url || !url.startsWith("http")) return;
+    if (isDev) {
+      console.log("[ThreeViewer] handleOpenUrl called with:", url);
+    }
+    setLoading(true);
+    setStatus(`${t("processing")}...`);
+    try {
+      await processFiles([url]);
+    } catch (error) {
+      console.error("[ThreeViewer] handleOpenUrl error:", error);
+      setStatus(t("failed"));
+      setToast({ message: `${t("failed")}: ${error.message}`, type: "error" });
+    } finally {
+      setLoading(false);
+    }
+  }, [isDev, processFiles, setLoading, setStatus, setToast, t]);
+  const handleDragOver = useCallback((event) => {
+    event.preventDefault();
+    event.stopPropagation();
+  }, []);
+  const handleDrop = useCallback(async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!event.dataTransfer.files?.length) return;
+    const files = Array.from(event.dataTransfer.files);
+    const validFiles = files.filter((file) => {
+      const extension = file.name.substring(file.name.lastIndexOf(".")).toLowerCase();
+      return SUPPORTED_DROP_EXTENSIONS.includes(extension);
+    });
+    if (validFiles.length < files.length) {
+      setToast({ message: t("unsupported_format"), type: "info" });
+    }
+    if (validFiles.length > 0) {
+      await processFiles(validFiles);
+    }
+  }, [processFiles, setToast, t]);
+  return {
+    handleOpenFiles,
+    handleBatchConvert,
+    handleOpenUrl,
+    handleDragOver,
+    handleDrop
+  };
+}
+
+function useViewerLayout(options) {
+  const {
+    propShowOutline,
+    propShowProperties,
+    setShowOutline,
+    setShowProps
+  } = options;
+  const [leftWidth, setLeftWidth] = useState(260);
+  const [rightWidth, setRightWidth] = useState(300);
+  const resizingLeft = useRef(false);
+  const resizingRight = useRef(false);
+  useEffect(() => {
+    if (propShowOutline !== void 0) {
+      setShowOutline(propShowOutline);
+    }
+  }, [propShowOutline, setShowOutline]);
+  useEffect(() => {
+    if (propShowProperties !== void 0) {
+      setShowProps(propShowProperties);
+    }
+  }, [propShowProperties, setShowProps]);
+  useEffect(() => {
+    const handleMove = (event) => {
+      if (resizingLeft.current) {
+        setLeftWidth(Math.max(150, Math.min(500, event.clientX)));
+      }
+      if (resizingRight.current) {
+        const nextWidth = window.innerWidth - event.clientX;
+        setRightWidth(Math.max(200, Math.min(600, nextWidth)));
+      }
+    };
+    const handleUp = () => {
+      resizingLeft.current = false;
+      resizingRight.current = false;
+    };
+    window.addEventListener("mousemove", handleMove);
+    window.addEventListener("mouseup", handleUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMove);
+      window.removeEventListener("mouseup", handleUp);
+    };
+  }, []);
+  return {
+    leftWidth,
+    rightWidth,
+    resizingLeft,
+    resizingRight
+  };
+}
+
+const DEFAULT_CLIP_VALUES = { x: [0, 100], y: [0, 100], z: [0, 100] };
+const DEFAULT_CLIP_ACTIVE = { x: false, y: false, z: false };
+function useViewerTools({ initialSettings, mgrInstance }) {
+  const [activeTool, setActiveTool] = useState("none");
+  const [explodeEnabled, setExplodeEnabled] = useState(false);
+  const [explodeStrength, setExplodeStrength] = useState(32);
+  const [explodeMode, setExplodeMode] = useState("radial");
+  const [measureType, setMeasureType] = useState("none");
+  const [measureHistory, setMeasureHistory] = useState([]);
+  const [highlightedMeasureId, setHighlightedMeasureId] = useState(null);
+  const [clipEnabled, setClipEnabled] = useState(false);
+  const [clipValues, setClipValues] = useState(DEFAULT_CLIP_VALUES);
+  const [clipActive, setClipActive] = useState(DEFAULT_CLIP_ACTIVE);
+  const [clipHelperVisible, setClipHelperVisible] = usePersistentState(
+    "3dbrowser_clipHelperVisible",
+    initialSettings?.clip?.helperVisible ?? false,
+    {
+      serializer: (value) => String(value),
+      parser: (raw) => raw === "true"
+    }
+  );
+  const [clipHelperOpacity, setClipHelperOpacity] = usePersistentState(
+    "3dbrowser_clipHelperOpacity",
+    initialSettings?.clip?.helperOpacity ?? 0.12,
+    {
+      serializer: (value) => String(value),
+      parser: (raw) => {
+        const parsed = Number(raw);
+        return Number.isFinite(parsed) ? parsed : 0.12;
+      }
+    }
+  );
+  const normalizedClipHelperOpacity = useMemo(
+    () => Math.min(0.35, Math.max(0.05, clipHelperOpacity)),
+    [clipHelperOpacity]
+  );
+  useEffect(() => {
+    if (normalizedClipHelperOpacity !== clipHelperOpacity) {
+      setClipHelperOpacity(normalizedClipHelperOpacity);
+    }
+  }, [clipHelperOpacity, normalizedClipHelperOpacity, setClipHelperOpacity]);
+  useEffect(() => {
+    if (!mgrInstance) return;
+    mgrInstance.setClipHelperOptions({
+      visible: clipHelperVisible,
+      opacity: normalizedClipHelperOpacity
+    });
+  }, [clipHelperVisible, mgrInstance, normalizedClipHelperOpacity]);
+  useEffect(() => {
+    if (!mgrInstance) return;
+    if (activeTool !== "measure") {
+      mgrInstance.clearMeasurementPreview();
+      mgrInstance.highlightMeasurement(null);
+      setHighlightedMeasureId(null);
+      setMeasureType("none");
+    }
+  }, [activeTool, mgrInstance]);
+  useEffect(() => {
+    if (!mgrInstance) return;
+    mgrInstance.setClippingEnabled(clipEnabled);
+    if (!clipEnabled) return;
+    let bounds = mgrInstance.computeTotalBounds(true);
+    if (bounds.isEmpty()) {
+      bounds = mgrInstance.computeTotalBounds(false);
+    }
+    if (!bounds.isEmpty()) {
+      mgrInstance.updateClippingPlanes(bounds, clipValues, clipActive);
+    }
+  }, [clipActive, clipEnabled, clipValues, mgrInstance]);
+  useEffect(() => {
+    if (!mgrInstance) return;
+    mgrInstance.startMeasurement(measureType);
+  }, [measureType, mgrInstance]);
+  useEffect(() => {
+    if (!mgrInstance) return;
+    mgrInstance.setExplodeEnabled(explodeEnabled);
+  }, [explodeEnabled, mgrInstance]);
+  useEffect(() => {
+    if (!mgrInstance) return;
+    mgrInstance.setExplodeStrength(explodeStrength);
+  }, [explodeStrength, mgrInstance]);
+  useEffect(() => {
+    if (!mgrInstance) return;
+    mgrInstance.setExplodeMode(explodeMode);
+  }, [explodeMode, mgrInstance]);
+  const resetExplodeState = () => {
+    setExplodeEnabled(false);
+    setExplodeStrength(32);
+    setExplodeMode("radial");
+  };
+  const resetMeasurementState = () => {
+    setMeasureHistory([]);
+    setHighlightedMeasureId(null);
+    setMeasureType("none");
+  };
+  const handleMeasureUpdate = (records) => {
+    setMeasureHistory(records.map((record) => ({ id: record.id, type: record.type, val: record.val })));
+  };
+  return {
+    activeTool,
+    setActiveTool,
+    explodeEnabled,
+    setExplodeEnabled,
+    explodeStrength,
+    setExplodeStrength,
+    explodeMode,
+    setExplodeMode,
+    resetExplodeState,
+    measureType,
+    setMeasureType,
+    measureHistory,
+    setMeasureHistory,
+    highlightedMeasureId,
+    setHighlightedMeasureId,
+    resetMeasurementState,
+    handleMeasureUpdate,
+    clipEnabled,
+    setClipEnabled,
+    clipValues,
+    setClipValues,
+    clipActive,
+    setClipActive,
+    clipHelperVisible,
+    setClipHelperVisible,
+    clipHelperOpacity: normalizedClipHelperOpacity,
+    setClipHelperOpacity
+  };
+}
+
+const VISIBILITY_BATCH_SIZE = 400;
+function nextAnimationFrame() {
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => resolve());
+  });
+}
+function useViewerVisibility({
+  sceneMgrRef,
+  selectedUuids,
+  setSelectedUuids,
+  setSelectedProps,
+  updateTree,
+  resetLocateState
+}) {
+  const [contextMenu, setContextMenu] = useState({
+    x: 0,
+    y: 0,
+    visible: false
+  });
+  const [hiddenUuids, setHiddenUuids] = useState(/* @__PURE__ */ new Set());
+  const [isolatedUuids, setIsolatedUuids] = useState(/* @__PURE__ */ new Set());
+  const visibilityStackRef = useRef([]);
+  const closeContextMenu = useCallback(() => {
+    setContextMenu((prev) => ({ ...prev, visible: false }));
+  }, []);
+  const handleContextMenu = useCallback((event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setContextMenu({
+      x: event.clientX,
+      y: event.clientY,
+      visible: true
+    });
+  }, []);
+  const handleHideSelected = useCallback(() => {
+    const sceneManager = sceneMgrRef.current;
+    if (!sceneManager || selectedUuids.length === 0) return;
+    const stateToRestore = selectedUuids.map((uuid) => {
+      const object = sceneManager.contentGroup.getObjectByProperty("uuid", uuid);
+      return { uuid, visible: object ? object.visible : true };
+    });
+    visibilityStackRef.current.push(stateToRestore);
+    const uuidsToHide = [...selectedUuids];
+    setSelectedUuids([]);
+    setSelectedProps(null);
+    sceneManager.highlightObjects([]);
+    closeContextMenu();
+    void (async () => {
+      for (let index = 0; index < uuidsToHide.length; index += VISIBILITY_BATCH_SIZE) {
+        const chunk = uuidsToHide.slice(index, index + VISIBILITY_BATCH_SIZE);
+        const isLastChunk = index + VISIBILITY_BATCH_SIZE >= uuidsToHide.length;
+        sceneManager.setObjectsVisibility(chunk, false, { deferRefresh: !isLastChunk });
+        if (index + VISIBILITY_BATCH_SIZE < uuidsToHide.length) {
+          await nextAnimationFrame();
+        }
+      }
+      const nextHiddenUuids = new Set(hiddenUuids);
+      const nextIsolatedUuids = new Set(isolatedUuids);
+      uuidsToHide.forEach((uuid) => {
+        nextHiddenUuids.add(uuid);
+        nextIsolatedUuids.delete(uuid);
+      });
+      setHiddenUuids(nextHiddenUuids);
+      setIsolatedUuids(nextIsolatedUuids);
+      updateTree();
+    })();
+  }, [
+    closeContextMenu,
+    hiddenUuids,
+    isolatedUuids,
+    sceneMgrRef,
+    selectedUuids,
+    setSelectedProps,
+    setSelectedUuids,
+    updateTree
+  ]);
+  const handleShowAll = useCallback(() => {
+    const sceneManager = sceneMgrRef.current;
+    if (!sceneManager) return;
+    if (hiddenUuids.size > 0 || isolatedUuids.size > 0) {
+      sceneManager.setAllVisibility(true);
+      setHiddenUuids(/* @__PURE__ */ new Set());
+      setIsolatedUuids(/* @__PURE__ */ new Set());
+      updateTree();
+    }
+    resetLocateState();
+    sceneManager.clearLocateFocus();
+    closeContextMenu();
+  }, [closeContextMenu, hiddenUuids, isolatedUuids, resetLocateState, sceneMgrRef, updateTree]);
+  const handleToggleVisibility = useCallback((uuid, visible) => {
+    const sceneManager = sceneMgrRef.current;
+    if (!sceneManager) return;
+    visibilityStackRef.current.push([{ uuid, visible: !visible }]);
+    sceneManager.setObjectVisibility(uuid, visible);
+    const nextHiddenUuids = new Set(hiddenUuids);
+    if (visible) {
+      nextHiddenUuids.delete(uuid);
+    } else {
+      nextHiddenUuids.add(uuid);
+    }
+    setHiddenUuids(nextHiddenUuids);
+    updateTree();
+  }, [hiddenUuids, sceneMgrRef, updateTree]);
+  const handleHideObject = useCallback((uuid) => {
+    const sceneManager = sceneMgrRef.current;
+    if (!sceneManager) return;
+    visibilityStackRef.current.push([{ uuid, visible: true }]);
+    sceneManager.setObjectVisibility(uuid, false);
+    setHiddenUuids((prev) => new Set(prev).add(uuid));
+    setSelectedUuids((prev) => prev.filter((id) => id !== uuid));
+    updateTree();
+  }, [sceneMgrRef, setSelectedUuids, updateTree]);
+  const handleIsolateObject = useCallback((uuid) => {
+    const sceneManager = sceneMgrRef.current;
+    if (!sceneManager) return;
+    sceneManager.isolateObjects([uuid]);
+    setHiddenUuids(/* @__PURE__ */ new Set());
+    setIsolatedUuids(/* @__PURE__ */ new Set([uuid]));
+    setSelectedUuids([uuid]);
+    sceneManager.highlightObjects([uuid]);
+    updateTree();
+    closeContextMenu();
+  }, [closeContextMenu, sceneMgrRef, setSelectedUuids, updateTree]);
+  const handleIsolateSelection = useCallback(() => {
+    const sceneManager = sceneMgrRef.current;
+    if (!sceneManager || selectedUuids.length === 0) return;
+    const nextIsolated = selectedUuids.filter((id) => !isolatedUuids.has(id));
+    if (nextIsolated.length > 0) {
+      sceneManager.isolateObjects(selectedUuids);
+      setIsolatedUuids(/* @__PURE__ */ new Set([...isolatedUuids, ...nextIsolated]));
+      setHiddenUuids(/* @__PURE__ */ new Set());
+      updateTree();
+    }
+    closeContextMenu();
+  }, [closeContextMenu, isolatedUuids, sceneMgrRef, selectedUuids, updateTree]);
+  const handleUndoVisibility = useCallback(() => {
+    const sceneManager = sceneMgrRef.current;
+    if (!sceneManager || visibilityStackRef.current.length === 0) return;
+    const lastAction = visibilityStackRef.current.pop();
+    if (!lastAction) return;
+    sceneManager.applyVisibilityBatch(lastAction, {
+      recomputeBounds: true,
+      refreshExplode: false,
+      invalidateInteractables: true
+    });
+    const nextHiddenUuids = new Set(hiddenUuids);
+    lastAction.forEach((change) => {
+      if (change.visible) {
+        nextHiddenUuids.delete(change.uuid);
+      } else {
+        nextHiddenUuids.add(change.uuid);
+      }
+    });
+    setHiddenUuids(nextHiddenUuids);
+    updateTree();
+  }, [hiddenUuids, sceneMgrRef, updateTree]);
+  return {
+    contextMenu,
+    hiddenUuids,
+    isolatedUuids,
+    setHiddenUuids,
+    setIsolatedUuids,
+    handleContextMenu,
+    closeContextMenu,
+    handleHideSelected,
+    handleShowAll,
+    handleToggleVisibility,
+    handleHideObject,
+    handleIsolateObject,
+    handleIsolateSelection,
+    handleUndoVisibility
+  };
+}
+
+function useViewpoints({
+  currentFileSetId,
+  sceneMgrRef,
+  setToast,
+  setConfirmState,
+  t,
+  captureStateSnapshot,
+  restoreStateSnapshot
+}) {
+  const [viewpoints, setViewpoints] = useState([]);
+  useEffect(() => {
+    if (!currentFileSetId) {
+      setViewpoints([]);
+      return;
+    }
+    try {
+      const saved = localStorage.getItem(`viewpoints_${currentFileSetId}`);
+      setViewpoints(saved ? JSON.parse(saved) : []);
+    } catch (error) {
+      console.error("Failed to load viewpoints", error);
+      setViewpoints([]);
+    }
+  }, [currentFileSetId]);
+  const persistViewpoints = useCallback((nextViewpoints) => {
+    if (!currentFileSetId) return;
+    setViewpoints(nextViewpoints);
+    try {
+      localStorage.setItem(`viewpoints_${currentFileSetId}`, JSON.stringify(nextViewpoints));
+    } catch (error) {
+      console.error("Failed to persist viewpoints", error);
+    }
+  }, [currentFileSetId]);
+  const captureViewThumbnail = useCallback(() => {
+    const manager = sceneMgrRef.current;
+    if (!manager) return "";
+    try {
+      manager.renderer.render(manager.scene, manager.camera);
+      const srcCanvas = manager.canvas;
+      const scale = Math.min(640 / srcCanvas.width, 360 / srcCanvas.height);
+      const dstWidth = Math.round(srcCanvas.width * scale);
+      const dstHeight = Math.round(srcCanvas.height * scale);
+      const tempCanvas = document.createElement("canvas");
+      tempCanvas.width = dstWidth;
+      tempCanvas.height = dstHeight;
+      const context = tempCanvas.getContext("2d");
+      if (!context) return "";
+      context.drawImage(srcCanvas, 0, 0, dstWidth, dstHeight);
+      return tempCanvas.toDataURL("image/jpeg", 0.92);
+    } catch (error) {
+      console.error("Failed to capture thumbnail", error);
+      return "";
+    }
+  }, [sceneMgrRef]);
+  const handleSaveViewpoint = useCallback((customName, saveOptions = {
+    visibility: true,
+    selection: true,
+    clip: true,
+    explode: true
+  }, replaceId) => {
+    const manager = sceneMgrRef.current;
+    if (!manager || !currentFileSetId) {
+      setToast({ message: t("no_models"), type: "info" });
+      return;
+    }
+    if (manager.contentGroup.children.length === 0) {
+      setToast({ message: t("no_models"), type: "info" });
+      return;
+    }
+    const name = customName || `${t("viewpoint_title")} ${viewpoints.length + 1}`;
+    const cameraState = manager.getCameraState();
+    const image = captureViewThumbnail();
+    const stateSnapshot = captureStateSnapshot(saveOptions);
+    const nextViewpoints = replaceId ? viewpoints.map((viewpoint) => viewpoint.id === replaceId ? { ...viewpoint, name, cameraState, image, saveOptions, stateSnapshot } : viewpoint) : [...viewpoints, { id: Date.now().toString(), name, cameraState, image, saveOptions, stateSnapshot }];
+    persistViewpoints(nextViewpoints);
+    setToast({ message: t("success"), type: "success" });
+  }, [captureStateSnapshot, captureViewThumbnail, currentFileSetId, persistViewpoints, sceneMgrRef, setToast, t, viewpoints]);
+  const handleUpdateViewpointName = useCallback((id, newName) => {
+    persistViewpoints(viewpoints.map((viewpoint) => viewpoint.id === id ? { ...viewpoint, name: newName } : viewpoint));
+  }, [persistViewpoints, viewpoints]);
+  const handleLoadViewpoint = useCallback(async (viewpoint) => {
+    if (!viewpoint.cameraState) return;
+    sceneMgrRef.current?.setCameraState(viewpoint.cameraState);
+    await restoreStateSnapshot(viewpoint.stateSnapshot);
+    setToast({ message: `${t("viewpoint_loading")}: ${viewpoint.name}`, type: "info" });
+  }, [restoreStateSnapshot, sceneMgrRef, setToast, t]);
+  const handleOverwriteViewpoint = useCallback((id) => {
+    const viewpoint = viewpoints.find((item) => item.id === id);
+    if (!viewpoint) return;
+    handleSaveViewpoint(
+      viewpoint.name,
+      viewpoint.saveOptions || {
+        visibility: true,
+        selection: true,
+        clip: true,
+        explode: true
+      },
+      id
+    );
+  }, [handleSaveViewpoint, viewpoints]);
+  const handleDeleteViewpoint = useCallback((id) => {
+    const viewpoint = viewpoints.find((item) => item.id === id);
+    setConfirmState({
+      isOpen: true,
+      title: t("viewpoint_title"),
+      message: `${t("confirm_delete")} "${viewpoint?.name || t("viewpoint_default_name")}"?`,
+      action: () => {
+        persistViewpoints(viewpoints.filter((item) => item.id !== id));
+      }
+    });
+  }, [persistViewpoints, setConfirmState, t, viewpoints]);
+  return {
+    viewpoints,
+    handleSaveViewpoint,
+    handleUpdateViewpointName,
+    handleLoadViewpoint,
+    handleOverwriteViewpoint,
+    handleDeleteViewpoint
+  };
+}
+
+const SUPPORTED_DRAG_EXTENSIONS = [".lmb", ".glb", ".gltf", ".ifc", ".nbim", ".fbx", ".obj", ".stl", ".ply", ".3ds", ".dae", ".stp", ".step", ".igs", ".iges"];
+const IGNORED_GLOBAL_ERRORS = [
+  "ResizeObserver loop completed",
+  "ResizeObserver loop limit",
+  "texImage3D: FLIP_Y or PREMULTIPLY_ALPHA"
+];
+function useViewportLifecycle({
+  allowDragOpen,
+  mgrInstance,
+  viewportRef,
+  t,
+  processFiles,
+  setToast,
+  setErrorState
+}) {
+  useEffect(() => {
+    if (!viewportRef.current || !mgrInstance) return;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      const { width, height } = entry.contentRect;
+      if (width === 0 || height === 0) return;
+      requestAnimationFrame(() => {
+        mgrInstance.resize(width, height);
+      });
+    });
+    observer.observe(viewportRef.current);
+    const handleWindowResize = () => {
+      if (!viewportRef.current) return;
+      const rect = viewportRef.current.getBoundingClientRect();
+      mgrInstance.resize(rect.width, rect.height);
+    };
+    window.addEventListener("resize", handleWindowResize);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", handleWindowResize);
+    };
+  }, [mgrInstance, viewportRef]);
+  useEffect(() => {
+    const handleDragOver = (event) => {
+      if (!allowDragOpen) return;
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    const handleDrop = async (event) => {
+      if (!allowDragOpen) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const files = event.dataTransfer?.files ? Array.from(event.dataTransfer.files) : [];
+      if (files.length === 0) return;
+      const unsupportedFiles = files.filter((file) => {
+        const ext = `.${file.name.split(".").pop()?.toLowerCase()}`;
+        return !SUPPORTED_DRAG_EXTENSIONS.includes(ext);
+      });
+      if (unsupportedFiles.length > 0) {
+        setToast({
+          message: `${t("failed")}: 不支持的格式 - ${unsupportedFiles.map((file) => file.name).join(", ")}`,
+          type: "error"
+        });
+      }
+      const supportedFiles = files.filter((file) => {
+        const ext = `.${file.name.split(".").pop()?.toLowerCase()}`;
+        return SUPPORTED_DRAG_EXTENSIONS.includes(ext);
+      });
+      if (supportedFiles.length > 0) {
+        await processFiles(supportedFiles);
+      }
+    };
+    window.addEventListener("dragover", handleDragOver);
+    window.addEventListener("drop", handleDrop);
+    return () => {
+      window.removeEventListener("dragover", handleDragOver);
+      window.removeEventListener("drop", handleDrop);
+    };
+  }, [allowDragOpen, processFiles, setToast, t]);
+  useEffect(() => {
+    const handleError = (event) => {
+      const message = event.message || "";
+      if (!message && !event.error || IGNORED_GLOBAL_ERRORS.some((item) => message.includes(item))) {
+        return;
+      }
+      console.error("Global Error:", event.error || message);
+      setErrorState({
+        isOpen: true,
+        title: t("failed"),
+        message: message || "An unexpected error occurred",
+        detail: event.error?.stack || ""
+      });
+    };
+    const handleRejection = (event) => {
+      if (!event.reason) return;
+      const message = event.reason?.message || String(event.reason);
+      if (IGNORED_GLOBAL_ERRORS.some((item) => message.includes(item))) {
+        return;
+      }
+      console.error("Unhandled Rejection:", event.reason);
+      setErrorState({
+        isOpen: true,
+        title: t("failed"),
+        message: message || "A promise was rejected without reason",
+        detail: event.reason?.stack || ""
+      });
+    };
+    window.addEventListener("error", handleError);
+    window.addEventListener("unhandledrejection", handleRejection);
+    return () => {
+      window.removeEventListener("error", handleError);
+      window.removeEventListener("unhandledrejection", handleRejection);
+    };
+  }, [setErrorState, t]);
+}
+
+function appendPropertyEntries(entries, groupName, value, source) {
+  if (!value) return;
+  entries.push(...createPropertyEntries(groupName, value, source));
+}
+function flattenNestedRecord(groupName, input, entries, source) {
+  Object.entries(input).forEach(([key, value]) => {
+    if (Array.isArray(value) || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      appendPropertyEntries(entries, groupName, [{ key, value, source }], source);
+      return;
+    }
+    if (value && typeof value === "object") {
+      Object.entries(value).forEach(([subKey, subValue]) => {
+        appendPropertyEntries(entries, groupName, [{ key: `${key}.${subKey}`, value: subValue, rawKey: subKey, source }], source);
+      });
+    }
+  });
+}
+function usePropertySearch({
+  sceneMgrRef,
+  selectedUuids,
+  setSelectedUuids,
+  onSelectObject,
+  focusObjectsInView,
+  t,
+  setToast
+}) {
+  const [searchConditions, setSearchConditions] = useState([
+    { id: "cond_init", propertyName: "", operator: "contains", value: "" }
+  ]);
+  const [searchResults, setSearchResults] = useState([]);
+  const [searching, setSearching] = useState(false);
+  const [searchProgress, setSearchProgress] = useState(0);
+  const [searchStatus, setSearchStatus] = useState("");
+  const searchRunTokenRef = useRef(0);
+  const searchInFlightRef = useRef(false);
+  const resolveModelId = useCallback((uuid, obj) => {
+    let cursor = obj;
+    while (cursor) {
+      const owner = cursor.userData?.originalUuid || cursor.userData?.modelUuid || cursor.userData?.rootUuid;
+      if (owner) return String(owner);
+      cursor = cursor.parent;
+    }
+    const structureNode = sceneMgrRef.current?.getStructureNodes(uuid)?.[0];
+    if (structureNode?.userData?.originalUuid) return String(structureNode.userData.originalUuid);
+    return uuid;
+  }, [sceneMgrRef]);
+  const buildSearchPropertyEntries = useCallback((uuid, obj) => {
+    const entries = [];
+    appendPropertyEntries(entries, "Object", [
+      { key: "name", value: obj?.name, source: "object" },
+      { key: "type", value: obj?.type, source: "object" },
+      { key: "uuid", value: uuid, source: "object" },
+      { key: "bimid", value: sceneMgrRef.current?.getBimIdByUuid(uuid) || "", source: "object" }
+    ]);
+    const userData = obj?.userData || {};
+    Object.entries(userData).forEach(([key, value]) => {
+      if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+        appendPropertyEntries(entries, "UserData", [{ key, value, source: "userData" }], "userData");
+      } else if (Array.isArray(value)) {
+        value.forEach((item, index) => {
+          appendPropertyEntries(entries, "UserData", [{ key, value: item, id: `userData::${key}::${index}`, source: "userData" }], "userData");
+        });
+      }
+    });
+    const ifcMeta = obj?.userData?.ifcMetadata || {};
+    flattenNestedRecord("IFC Metadata", ifcMeta, entries, "ifcMetadata");
+    const nbimProps = sceneMgrRef.current?.getNbimProperties(uuid);
+    if (nbimProps && typeof nbimProps === "object") {
+      flattenNestedRecord("NBIM", nbimProps, entries, "nbim");
+    }
+    const nbimIfcGroups = sceneMgrRef.current?.getNbimIfcPropertyGroups(uuid, "normalized");
+    if (nbimIfcGroups && typeof nbimIfcGroups === "object") {
+      Object.entries(nbimIfcGroups).forEach(([groupName, groupEntries]) => {
+        appendPropertyEntries(entries, groupName, groupEntries, "nbim-ifc");
+      });
+    }
+    return entries;
+  }, [sceneMgrRef]);
+  const collectSearchCandidates = useCallback(() => {
+    const candidates = [];
+    const visited = /* @__PURE__ */ new Set();
+    const sceneMgr = sceneMgrRef.current;
+    if (!sceneMgr) return candidates;
+    sceneMgr.contentGroup.updateMatrixWorld(true);
+    sceneMgr.contentGroup.traverse((obj) => {
+      const mesh = obj;
+      if (!mesh.isMesh || !mesh.visible || !mesh.geometry) return;
+      if (mesh.userData?.isIfcGridHelper) return;
+      if (visited.has(mesh.uuid)) return;
+      visited.add(mesh.uuid);
+      candidates.push({
+        uuid: mesh.uuid,
+        name: mesh.name || mesh.uuid,
+        type: mesh.type || "Mesh",
+        modelId: resolveModelId(mesh.uuid, mesh),
+        sourceLabel: "object",
+        source: mesh
+      });
+    });
+    const walkNodes = (nodes) => {
+      nodes.forEach((node) => {
+        if (!node || node.visible === false) return;
+        const id = String(node.id || "");
+        if (id && node.bimId && !visited.has(id)) {
+          visited.add(id);
+          candidates.push({
+            uuid: id,
+            name: String(node.name || id),
+            type: String(node.type || "Node"),
+            modelId: String(node.userData?.originalUuid || node.id || id),
+            sourceLabel: "structure",
+            source: {
+              name: node.name,
+              type: node.type,
+              userData: node.userData || {}
+            }
+          });
+        }
+        if (Array.isArray(node.children) && node.children.length > 0) {
+          walkNodes(node.children);
+        }
+      });
+    };
+    if (Array.isArray(sceneMgr.structureRoot?.children) && sceneMgr.structureRoot.children.length > 0) {
+      walkNodes(sceneMgr.structureRoot.children);
+    }
+    return candidates;
+  }, [resolveModelId, sceneMgrRef]);
+  const evaluateCondition = useCallback((value, operator, query) => {
+    if (operator === "equals") return value === query;
+    if (operator === "contains") return value.includes(query);
+    if (operator === "notContains") return !value.includes(query);
+    if (operator === "startsWith") return value.startsWith(query);
+    if (operator === "endsWith") return value.endsWith(query);
+    return false;
+  }, []);
+  const matchesPropertyName = useCallback((entry, query) => {
+    if (!query) return false;
+    return entry.normalizedKey === query || entry.normalizedPath === query || !!entry.rawKey && normalizePropertyToken(entry.rawKey) === query || entry.normalizedPath.endsWith(`.${query}`);
+  }, []);
+  const handleRunPropertySearch = useCallback(async () => {
+    if (!sceneMgrRef.current) return;
+    if (searchInFlightRef.current) return;
+    const normalizedConditions = searchConditions.map((item) => ({
+      ...item,
+      normalizedPropertyName: normalizePropertyToken(item.propertyName),
+      normalizedValue: normalizePropertyToken(item.value)
+    })).filter((item) => item.normalizedPropertyName && item.normalizedValue);
+    if (normalizedConditions.length === 0) {
+      setSearchResults([]);
+      setSearching(false);
+      setSearchProgress(0);
+      setSearchStatus("");
+      setToast({ message: t("search_invalid_condition"), type: "info" });
+      sceneMgrRef.current.highlightObjects(selectedUuids);
+      return;
+    }
+    const runToken = ++searchRunTokenRef.current;
+    const searchStartAt = performance.now();
+    searchInFlightRef.current = true;
+    setSearching(true);
+    setSearchProgress(0);
+    setSearchStatus(t("searching"));
+    try {
+      const candidates = collectSearchCandidates();
+      const total = candidates.length;
+      const batchSize = 600;
+      const nextResults = [];
+      let lastProgressAt = performance.now();
+      let cancelled = false;
+      for (let i = 0; i < candidates.length; i++) {
+        if (searchRunTokenRef.current !== runToken) {
+          cancelled = true;
+          setSearchStatus(t("search_cancelled"));
+          break;
+        }
+        const item = candidates[i];
+        const entries = buildSearchPropertyEntries(item.uuid, item.source);
+        let result = null;
+        const matchedBy = /* @__PURE__ */ new Set();
+        normalizedConditions.forEach((condition, index) => {
+          const matchedEntries = entries.filter((entry) => matchesPropertyName(entry, condition.normalizedPropertyName));
+          const matched = matchedEntries.some((entry) => evaluateCondition(entry.normalizedValue, condition.operator, condition.normalizedValue));
+          if (matched) {
+            matchedEntries.forEach((entry) => {
+              if (evaluateCondition(entry.normalizedValue, condition.operator, condition.normalizedValue)) {
+                matchedBy.add(entry.path);
+              }
+            });
+          }
+          if (index === 0 || result === null) result = matched;
+          else if ((condition.connector || "AND") === "AND") result = Boolean(result) && matched;
+          else result = Boolean(result) || matched;
+        });
+        if (result) {
+          nextResults.push({
+            uuid: item.uuid,
+            name: item.name || item.uuid,
+            type: item.type,
+            modelId: item.modelId,
+            source: item.sourceLabel,
+            matchedBy: Array.from(matchedBy)
+          });
+        }
+        if ((i + 1) % batchSize === 0 || i === candidates.length - 1) {
+          const now = performance.now();
+          const progress = total > 0 ? (i + 1) / total * 100 : 100;
+          if (now - lastProgressAt > 120 || i === candidates.length - 1) {
+            setSearchProgress(progress);
+            lastProgressAt = now;
+          }
+          await new Promise((resolve) => window.setTimeout(resolve, 0));
+        }
+      }
+      if (!cancelled) {
+        setSearchResults(nextResults);
+        setSearchProgress(100);
+        setSearchStatus(`${t("search_results")}: ${nextResults.length}`);
+      }
+    } finally {
+      const elapsed = performance.now() - searchStartAt;
+      const minVisibleMs = 220;
+      if (elapsed < minVisibleMs) {
+        await new Promise((resolve) => window.setTimeout(resolve, minVisibleMs - elapsed));
+      }
+      setSearching(false);
+      searchInFlightRef.current = false;
+    }
+  }, [buildSearchPropertyEntries, collectSearchCandidates, evaluateCondition, matchesPropertyName, sceneMgrRef, searchConditions, selectedUuids, setToast, t]);
+  const handleApplySearchResultHighlight = useCallback((uuid) => {
+    if (!sceneMgrRef.current) return;
+    const target = sceneMgrRef.current.contentGroup.getObjectByProperty("uuid", uuid);
+    focusObjectsInView({ uuids: [uuid], focusUuid: uuid });
+    if (target) {
+      void onSelectObject(target);
+      return;
+    }
+    setSelectedUuids([uuid]);
+  }, [focusObjectsInView, onSelectObject, sceneMgrRef, setSelectedUuids]);
+  const handleClearSearchResult = useCallback(() => {
+    searchRunTokenRef.current++;
+    setSearchResults([]);
+    setSearching(false);
+    setSearchProgress(0);
+    setSearchStatus("");
+    searchInFlightRef.current = false;
+    if (!sceneMgrRef.current) return;
+    sceneMgrRef.current.highlightObjects(selectedUuids);
+  }, [sceneMgrRef, selectedUuids]);
+  const handleCancelSearch = useCallback(() => {
+    if (!searchInFlightRef.current) return;
+    searchRunTokenRef.current++;
+    setSearchStatus(t("search_cancelling"));
+  }, [t]);
+  return {
+    searchConditions,
+    setSearchConditions,
+    searchResults,
+    searching,
+    searchProgress,
+    searchStatus,
+    handleRunPropertySearch,
+    handleApplySearchResultHighlight,
+    handleClearSearchResult,
+    handleCancelSearch
+  };
+}
+
+// module scope helper variables
+
+const a = {
+	c: null, // center
+	u: [ new Vector3(), new Vector3(), new Vector3() ], // basis vectors
+	e: [] // half width
+};
+
+const b = {
+	c: null, // center
+	u: [ new Vector3(), new Vector3(), new Vector3() ], // basis vectors
+	e: [] // half width
+};
+
+const R = [[], [], []];
+const AbsR = [[], [], []];
+const t = [];
+
+const xAxis = new Vector3();
+const yAxis = new Vector3();
+const zAxis = new Vector3();
+const v1 = new Vector3();
+const size = new Vector3();
+const closestPoint = new Vector3();
+const rotationMatrix = new Matrix3();
+const aabb = new Box3();
+const matrix = new Matrix4();
+const inverse = new Matrix4();
+const localRay = new Ray();
+
+/**
+ * Represents an oriented bounding box (OBB) in 3D space.
+ *
+ * @three_import import { OBB } from 'three/addons/math/OBB.js';
+ */
+class OBB {
+
+	/**
+	 * Constructs a new OBB.
+	 *
+	 * @param {Vector3} [center] - The center of the OBB.
+	 * @param {Vector3} [halfSize] - Positive halfwidth extents of the OBB along each axis.
+	 * @param {Matrix3} [rotation] - The rotation of the OBB.
+	 */
+	constructor( center = new Vector3(), halfSize = new Vector3(), rotation = new Matrix3() ) {
+
+		/**
+		 * The center of the OBB.
+		 *
+		 * @type {Vector3}
+		 */
+		this.center = center;
+
+		/**
+		 * Positive halfwidth extents of the OBB along each axis.
+		 *
+		 * @type {Vector3}
+		 */
+		this.halfSize = halfSize;
+
+		/**
+		 * The rotation of the OBB.
+		 *
+		 * @type {Matrix3}
+		 */
+		this.rotation = rotation;
+
+	}
+
+	/**
+	 * Sets the OBBs components to the given values.
+	 *
+	 * @param {Vector3} [center] - The center of the OBB.
+	 * @param {Vector3} [halfSize] - Positive halfwidth extents of the OBB along each axis.
+	 * @param {Matrix3} [rotation] - The rotation of the OBB.
+	 * @return {OBB} A reference to this OBB.
+	 */
+	set( center, halfSize, rotation ) {
+
+		this.center = center;
+		this.halfSize = halfSize;
+		this.rotation = rotation;
+
+		return this;
+
+	}
+
+	/**
+	 * Copies the values of the given OBB to this instance.
+	 *
+	 * @param {OBB} obb - The OBB to copy.
+	 * @return {OBB} A reference to this OBB.
+	 */
+	copy( obb ) {
+
+		this.center.copy( obb.center );
+		this.halfSize.copy( obb.halfSize );
+		this.rotation.copy( obb.rotation );
+
+		return this;
+
+	}
+
+	/**
+	 * Returns a new OBB with copied values from this instance.
+	 *
+	 * @return {OBB} A clone of this instance.
+	 */
+	clone() {
+
+		return new this.constructor().copy( this );
+
+	}
+
+	/**
+	 * Returns the size of this OBB.
+	 *
+	 * @param {Vector3} target - The target vector that is used to store the method's result.
+	 * @return {Vector3} The size.
+	 */
+	getSize( target ) {
+
+		return target.copy( this.halfSize ).multiplyScalar( 2 );
+
+	}
+
+	/**
+	 * Clamps the given point within the bounds of this OBB.
+	 *
+	 * @param {Vector3} point - The point that should be clamped within the bounds of this OBB.
+	 * @param {Vector3} target - The target vector that is used to store the method's result.
+	 * @returns {Vector3} - The clamped point.
+	 */
+	clampPoint( point, target ) {
+
+		// Reference: Closest Point on OBB to Point in Real-Time Collision Detection
+		// by Christer Ericson (chapter 5.1.4)
+
+		const halfSize = this.halfSize;
+
+		v1.subVectors( point, this.center );
+		this.rotation.extractBasis( xAxis, yAxis, zAxis );
+
+		// start at the center position of the OBB
+
+		target.copy( this.center );
+
+		// project the target onto the OBB axes and walk towards that point
+
+		const x = MathUtils.clamp( v1.dot( xAxis ), - halfSize.x, halfSize.x );
+		target.add( xAxis.multiplyScalar( x ) );
+
+		const y = MathUtils.clamp( v1.dot( yAxis ), - halfSize.y, halfSize.y );
+		target.add( yAxis.multiplyScalar( y ) );
+
+		const z = MathUtils.clamp( v1.dot( zAxis ), - halfSize.z, halfSize.z );
+		target.add( zAxis.multiplyScalar( z ) );
+
+		return target;
+
+	}
+
+	/**
+	 * Returns `true` if the given point lies within this OBB.
+	 *
+	 * @param {Vector3} point - The point to test.
+	 * @returns {boolean} - Whether the given point lies within this OBB or not.
+	 */
+	containsPoint( point ) {
+
+		v1.subVectors( point, this.center );
+		this.rotation.extractBasis( xAxis, yAxis, zAxis );
+
+		// project v1 onto each axis and check if these points lie inside the OBB
+
+		return Math.abs( v1.dot( xAxis ) ) <= this.halfSize.x &&
+				Math.abs( v1.dot( yAxis ) ) <= this.halfSize.y &&
+				Math.abs( v1.dot( zAxis ) ) <= this.halfSize.z;
+
+	}
+
+	/**
+	 * Returns `true` if the given AABB intersects this OBB.
+	 *
+	 * @param {Box3} box3 - The AABB to test.
+	 * @returns {boolean} - Whether the given AABB intersects this OBB or not.
+	 */
+	intersectsBox3( box3 ) {
+
+		return this.intersectsOBB( obb.fromBox3( box3 ) );
+
+	}
+
+	/**
+	 * Returns `true` if the given bounding sphere intersects this OBB.
+	 *
+	 * @param {Sphere} sphere - The bounding sphere to test.
+	 * @returns {boolean} - Whether the given bounding sphere intersects this OBB or not.
+	 */
+	intersectsSphere( sphere ) {
+
+		// find the point on the OBB closest to the sphere center
+
+		this.clampPoint( sphere.center, closestPoint );
+
+		// if that point is inside the sphere, the OBB and sphere intersect
+
+		return closestPoint.distanceToSquared( sphere.center ) <= ( sphere.radius * sphere.radius );
+
+	}
+
+	/**
+	 * Returns `true` if the given OBB intersects this OBB.
+	 *
+	 * @param {OBB} obb - The OBB to test.
+	 * @param {number} [epsilon=Number.EPSILON] - A small value to prevent arithmetic errors.
+	 * @returns {boolean} - Whether the given OBB intersects this OBB or not.
+	 */
+	intersectsOBB( obb, epsilon = Number.EPSILON ) {
+
+		// Reference: OBB-OBB Intersection in Real-Time Collision Detection
+		// by Christer Ericson (chapter 4.4.1)
+
+		// prepare data structures (the code uses the same nomenclature like the reference)
+
+		a.c = this.center;
+		a.e[ 0 ] = this.halfSize.x;
+		a.e[ 1 ] = this.halfSize.y;
+		a.e[ 2 ] = this.halfSize.z;
+		this.rotation.extractBasis( a.u[ 0 ], a.u[ 1 ], a.u[ 2 ] );
+
+		b.c = obb.center;
+		b.e[ 0 ] = obb.halfSize.x;
+		b.e[ 1 ] = obb.halfSize.y;
+		b.e[ 2 ] = obb.halfSize.z;
+		obb.rotation.extractBasis( b.u[ 0 ], b.u[ 1 ], b.u[ 2 ] );
+
+		// compute rotation matrix expressing b in a's coordinate frame
+
+		for ( let i = 0; i < 3; i ++ ) {
+
+			for ( let j = 0; j < 3; j ++ ) {
+
+				R[ i ][ j ] = a.u[ i ].dot( b.u[ j ] );
+
+			}
+
+		}
+
+		// compute translation vector
+
+		v1.subVectors( b.c, a.c );
+
+		// bring translation into a's coordinate frame
+
+		t[ 0 ] = v1.dot( a.u[ 0 ] );
+		t[ 1 ] = v1.dot( a.u[ 1 ] );
+		t[ 2 ] = v1.dot( a.u[ 2 ] );
+
+		// compute common subexpressions. Add in an epsilon term to
+		// counteract arithmetic errors when two edges are parallel and
+		// their cross product is (near) null
+
+		for ( let i = 0; i < 3; i ++ ) {
+
+			for ( let j = 0; j < 3; j ++ ) {
+
+				AbsR[ i ][ j ] = Math.abs( R[ i ][ j ] ) + epsilon;
+
+			}
+
+		}
+
+		let ra, rb;
+
+		// test axes L = A0, L = A1, L = A2
+
+		for ( let i = 0; i < 3; i ++ ) {
+
+			ra = a.e[ i ];
+			rb = b.e[ 0 ] * AbsR[ i ][ 0 ] + b.e[ 1 ] * AbsR[ i ][ 1 ] + b.e[ 2 ] * AbsR[ i ][ 2 ];
+			if ( Math.abs( t[ i ] ) > ra + rb ) return false;
+
+
+		}
+
+		// test axes L = B0, L = B1, L = B2
+
+		for ( let i = 0; i < 3; i ++ ) {
+
+			ra = a.e[ 0 ] * AbsR[ 0 ][ i ] + a.e[ 1 ] * AbsR[ 1 ][ i ] + a.e[ 2 ] * AbsR[ 2 ][ i ];
+			rb = b.e[ i ];
+			if ( Math.abs( t[ 0 ] * R[ 0 ][ i ] + t[ 1 ] * R[ 1 ][ i ] + t[ 2 ] * R[ 2 ][ i ] ) > ra + rb ) return false;
+
+		}
+
+		// test axis L = A0 x B0
+
+		ra = a.e[ 1 ] * AbsR[ 2 ][ 0 ] + a.e[ 2 ] * AbsR[ 1 ][ 0 ];
+		rb = b.e[ 1 ] * AbsR[ 0 ][ 2 ] + b.e[ 2 ] * AbsR[ 0 ][ 1 ];
+		if ( Math.abs( t[ 2 ] * R[ 1 ][ 0 ] - t[ 1 ] * R[ 2 ][ 0 ] ) > ra + rb ) return false;
+
+		// test axis L = A0 x B1
+
+		ra = a.e[ 1 ] * AbsR[ 2 ][ 1 ] + a.e[ 2 ] * AbsR[ 1 ][ 1 ];
+		rb = b.e[ 0 ] * AbsR[ 0 ][ 2 ] + b.e[ 2 ] * AbsR[ 0 ][ 0 ];
+		if ( Math.abs( t[ 2 ] * R[ 1 ][ 1 ] - t[ 1 ] * R[ 2 ][ 1 ] ) > ra + rb ) return false;
+
+		// test axis L = A0 x B2
+
+		ra = a.e[ 1 ] * AbsR[ 2 ][ 2 ] + a.e[ 2 ] * AbsR[ 1 ][ 2 ];
+		rb = b.e[ 0 ] * AbsR[ 0 ][ 1 ] + b.e[ 1 ] * AbsR[ 0 ][ 0 ];
+		if ( Math.abs( t[ 2 ] * R[ 1 ][ 2 ] - t[ 1 ] * R[ 2 ][ 2 ] ) > ra + rb ) return false;
+
+		// test axis L = A1 x B0
+
+		ra = a.e[ 0 ] * AbsR[ 2 ][ 0 ] + a.e[ 2 ] * AbsR[ 0 ][ 0 ];
+		rb = b.e[ 1 ] * AbsR[ 1 ][ 2 ] + b.e[ 2 ] * AbsR[ 1 ][ 1 ];
+		if ( Math.abs( t[ 0 ] * R[ 2 ][ 0 ] - t[ 2 ] * R[ 0 ][ 0 ] ) > ra + rb ) return false;
+
+		// test axis L = A1 x B1
+
+		ra = a.e[ 0 ] * AbsR[ 2 ][ 1 ] + a.e[ 2 ] * AbsR[ 0 ][ 1 ];
+		rb = b.e[ 0 ] * AbsR[ 1 ][ 2 ] + b.e[ 2 ] * AbsR[ 1 ][ 0 ];
+		if ( Math.abs( t[ 0 ] * R[ 2 ][ 1 ] - t[ 2 ] * R[ 0 ][ 1 ] ) > ra + rb ) return false;
+
+		// test axis L = A1 x B2
+
+		ra = a.e[ 0 ] * AbsR[ 2 ][ 2 ] + a.e[ 2 ] * AbsR[ 0 ][ 2 ];
+		rb = b.e[ 0 ] * AbsR[ 1 ][ 1 ] + b.e[ 1 ] * AbsR[ 1 ][ 0 ];
+		if ( Math.abs( t[ 0 ] * R[ 2 ][ 2 ] - t[ 2 ] * R[ 0 ][ 2 ] ) > ra + rb ) return false;
+
+		// test axis L = A2 x B0
+
+		ra = a.e[ 0 ] * AbsR[ 1 ][ 0 ] + a.e[ 1 ] * AbsR[ 0 ][ 0 ];
+		rb = b.e[ 1 ] * AbsR[ 2 ][ 2 ] + b.e[ 2 ] * AbsR[ 2 ][ 1 ];
+		if ( Math.abs( t[ 1 ] * R[ 0 ][ 0 ] - t[ 0 ] * R[ 1 ][ 0 ] ) > ra + rb ) return false;
+
+		// test axis L = A2 x B1
+
+		ra = a.e[ 0 ] * AbsR[ 1 ][ 1 ] + a.e[ 1 ] * AbsR[ 0 ][ 1 ];
+		rb = b.e[ 0 ] * AbsR[ 2 ][ 2 ] + b.e[ 2 ] * AbsR[ 2 ][ 0 ];
+		if ( Math.abs( t[ 1 ] * R[ 0 ][ 1 ] - t[ 0 ] * R[ 1 ][ 1 ] ) > ra + rb ) return false;
+
+		// test axis L = A2 x B2
+
+		ra = a.e[ 0 ] * AbsR[ 1 ][ 2 ] + a.e[ 1 ] * AbsR[ 0 ][ 2 ];
+		rb = b.e[ 0 ] * AbsR[ 2 ][ 1 ] + b.e[ 1 ] * AbsR[ 2 ][ 0 ];
+		if ( Math.abs( t[ 1 ] * R[ 0 ][ 2 ] - t[ 0 ] * R[ 1 ][ 2 ] ) > ra + rb ) return false;
+
+		// since no separating axis is found, the OBBs must be intersecting
+
+		return true;
+
+	}
+
+	/**
+	 * Returns `true` if the given plane intersects this OBB.
+	 *
+	 * @param {Plane} plane - The plane to test.
+	 * @returns {boolean} Whether the given plane intersects this OBB or not.
+	 */
+	intersectsPlane( plane ) {
+
+		// Reference: Testing Box Against Plane in Real-Time Collision Detection
+		// by Christer Ericson (chapter 5.2.3)
+
+		this.rotation.extractBasis( xAxis, yAxis, zAxis );
+
+		// compute the projection interval radius of this OBB onto L(t) = this->center + t * p.normal;
+
+		const r = this.halfSize.x * Math.abs( plane.normal.dot( xAxis ) ) +
+				this.halfSize.y * Math.abs( plane.normal.dot( yAxis ) ) +
+				this.halfSize.z * Math.abs( plane.normal.dot( zAxis ) );
+
+		// compute distance of the OBB's center from the plane
+
+		const d = plane.normal.dot( this.center ) - plane.constant;
+
+		// Intersection occurs when distance d falls within [-r,+r] interval
+
+		return Math.abs( d ) <= r;
+
+	}
+
+	/**
+	 * Performs a ray/OBB intersection test and stores the intersection point
+	 * in the given 3D vector.
+	 *
+	 * @param {Ray} ray - The ray to test.
+	 * @param {Vector3} target - The target vector that is used to store the method's result.
+	 * @return {?Vector3} The intersection point. If no intersection is detected, `null` is returned.
+	 */
+	intersectRay( ray, target ) {
+
+		// the idea is to perform the intersection test in the local space
+		// of the OBB.
+
+		this.getSize( size );
+		aabb.setFromCenterAndSize( v1.set( 0, 0, 0 ), size );
+
+		// create a 4x4 transformation matrix
+
+		matrix.setFromMatrix3( this.rotation );
+		matrix.setPosition( this.center );
+
+		// transform ray to the local space of the OBB
+
+		inverse.copy( matrix ).invert();
+		localRay.copy( ray ).applyMatrix4( inverse );
+
+		// perform ray <-> AABB intersection test
+
+		if ( localRay.intersectBox( aabb, target ) ) {
+
+			// transform the intersection point back to world space
+
+			return target.applyMatrix4( matrix );
+
+		} else {
+
+			return null;
+
+		}
+
+	}
+
+	/**
+	 * Returns `true` if the given ray intersects this OBB.
+	 *
+	 * @param {Ray} ray - The ray to test.
+	 * @returns {boolean} Whether the given ray intersects this OBB or not.
+	 */
+	intersectsRay( ray ) {
+
+		return this.intersectRay( ray, v1 ) !== null;
+
+	}
+
+	/**
+	 * Defines an OBB based on the given AABB.
+	 *
+	 * @param {Box3} box3 - The AABB to setup the OBB from.
+	 * @return {OBB} A reference of this OBB.
+	 */
+	fromBox3( box3 ) {
+
+		box3.getCenter( this.center );
+
+		box3.getSize( this.halfSize ).multiplyScalar( 0.5 );
+
+		this.rotation.identity();
+
+		return this;
+
+	}
+
+	/**
+	 * Returns `true` if the given OBB is equal to this OBB.
+	 *
+	 * @param {OBB} obb - The OBB to test.
+	 * @returns {boolean} Whether the given OBB is equal to this OBB or not.
+	 */
+	equals( obb ) {
+
+		return obb.center.equals( this.center ) &&
+			obb.halfSize.equals( this.halfSize ) &&
+			obb.rotation.equals( this.rotation );
+
+	}
+
+	/**
+	 * Applies the given transformation matrix to this OBB. This method can be
+	 * used to transform the bounding volume with the world matrix of a 3D object
+	 * in order to keep both entities in sync.
+	 *
+	 * @param {Matrix4} matrix - The matrix to apply.
+	 * @return {OBB} A reference of this OBB.
+	 */
+	applyMatrix4( matrix ) {
+
+		const e = matrix.elements;
+
+		let sx = v1.set( e[ 0 ], e[ 1 ], e[ 2 ] ).length();
+		const sy = v1.set( e[ 4 ], e[ 5 ], e[ 6 ] ).length();
+		const sz = v1.set( e[ 8 ], e[ 9 ], e[ 10 ] ).length();
+
+		const det = matrix.determinant();
+		if ( det < 0 ) sx = - sx;
+
+		rotationMatrix.setFromMatrix4( matrix );
+
+		const invSX = 1 / sx;
+		const invSY = 1 / sy;
+		const invSZ = 1 / sz;
+
+		rotationMatrix.elements[ 0 ] *= invSX;
+		rotationMatrix.elements[ 1 ] *= invSX;
+		rotationMatrix.elements[ 2 ] *= invSX;
+
+		rotationMatrix.elements[ 3 ] *= invSY;
+		rotationMatrix.elements[ 4 ] *= invSY;
+		rotationMatrix.elements[ 5 ] *= invSY;
+
+		rotationMatrix.elements[ 6 ] *= invSZ;
+		rotationMatrix.elements[ 7 ] *= invSZ;
+		rotationMatrix.elements[ 8 ] *= invSZ;
+
+		this.rotation.multiply( rotationMatrix );
+
+		this.halfSize.x *= sx;
+		this.halfSize.y *= sy;
+		this.halfSize.z *= sz;
+
+		v1.setFromMatrixPosition( matrix );
+		this.center.add( v1 );
+
+		return this;
+
+	}
+
+}
+
+const obb = new OBB();
+
+function buildBoxFromGeometry(geometry, matrixWorld) {
+  if (!geometry.boundingBox) geometry.computeBoundingBox();
+  return geometry.boundingBox ? geometry.boundingBox.clone().applyMatrix4(matrixWorld) : null;
+}
+function distanceBetweenBoxes(a, b) {
+  const dx = Math.max(0, a.min.x - b.max.x, b.min.x - a.max.x);
+  const dy = Math.max(0, a.min.y - b.max.y, b.min.y - a.max.y);
+  const dz = Math.max(0, a.min.z - b.max.z, b.min.z - a.max.z);
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+function buildObbFromGeometry(geometry, matrixWorld) {
+  if (!geometry.boundingBox) geometry.computeBoundingBox();
+  const bb = geometry.boundingBox;
+  if (!bb) return null;
+  const center = new THREE.Vector3();
+  const halfSize = new THREE.Vector3();
+  bb.getCenter(center);
+  bb.getSize(halfSize).multiplyScalar(0.5);
+  center.applyMatrix4(matrixWorld);
+  const rotation = new THREE.Matrix3().setFromMatrix4(matrixWorld);
+  return new OBB(center, halfSize, rotation);
+}
+function useClashCheck({
+  sceneMgrRef,
+  treeRoot,
+  clashModelOptions,
+  selectedUuids,
+  setSelectedUuids,
+  focusObjectsInView,
+  t
+}) {
+  const [clashResults, setClashResults] = useState([]);
+  const [clashRunning, setClashRunning] = useState(false);
+  const [clashProgress, setClashProgress] = useState(0);
+  const [clashStatus, setClashStatus] = useState("");
+  const [clashScannedCount, setClashScannedCount] = useState(0);
+  const [clashSetA, setClashSetA] = useState([]);
+  const [clashSetB, setClashSetB] = useState([]);
+  const [clashTolerance, setClashTolerance] = useState(0);
+  const [clashMinOverlapVolume, setClashMinOverlapVolume] = useState(0);
+  const [clashClearanceDistance, setClashClearanceDistance] = useState(0.05);
+  const [clashUseNarrowPhase, setClashUseNarrowPhase] = useState(true);
+  const [clashUseTrianglePhase, setClashUseTrianglePhase] = useState(false);
+  const [clashIncludeSameModel, setClashIncludeSameModel] = useState(false);
+  const [clashPairsScanned, setClashPairsScanned] = useState(0);
+  const [clashResultFilter, setClashResultFilter] = useState("ALL");
+  const [clashTypeFilter, setClashTypeFilter] = useState("ALL");
+  const clashRunTokenRef = useRef(0);
+  const clashInFlightRef = useRef(false);
+  const clashCandidateCacheRef = useRef(/* @__PURE__ */ new Map());
+  const clashModelNameById = useMemo(() => {
+    const map = /* @__PURE__ */ new Map();
+    clashModelOptions.forEach((option) => map.set(option.id, option.name));
+    return map;
+  }, [clashModelOptions]);
+  const resolveModelOwner = useCallback((obj) => {
+    let current = obj;
+    while (current) {
+      const owner = current.userData?.originalUuid;
+      if (owner) return String(owner);
+      current = current.parent;
+    }
+    return "";
+  }, []);
+  const buildMeshInfo = useCallback((uuid, geometry, matrixWorld) => {
+    const pos = geometry.attributes.position;
+    if (!pos) return null;
+    const index = geometry.index;
+    const triangleCount = index ? Math.floor(index.count / 3) : Math.floor(pos.count / 3);
+    return {
+      uuid,
+      geometry,
+      matrixWorld: matrixWorld.clone(),
+      triangleCount
+    };
+  }, []);
+  const collectClashCandidates = useCallback(() => {
+    const sceneMgr = sceneMgrRef.current;
+    if (!sceneMgr) return [];
+    const cached = clashCandidateCacheRef.current;
+    cached.clear();
+    sceneMgr.contentGroup.updateMatrixWorld(true);
+    sceneMgr.contentGroup.traverse((obj) => {
+      const mesh = obj;
+      if (!mesh.isMesh || !mesh.visible || !mesh.geometry) return;
+      if (mesh.userData?.isIfcGridHelper) return;
+      const box = buildBoxFromGeometry(mesh.geometry, mesh.matrixWorld);
+      if (!box || box.isEmpty()) return;
+      const modelId = resolveModelOwner(mesh);
+      const candidate = {
+        uuid: mesh.uuid,
+        name: mesh.name || mesh.uuid,
+        modelId,
+        modelName: clashModelNameById.get(modelId) || modelId || mesh.name || mesh.uuid,
+        box,
+        testBox: box.clone(),
+        obb: clashUseNarrowPhase ? buildObbFromGeometry(mesh.geometry, mesh.matrixWorld) : null,
+        meshInfo: buildMeshInfo(mesh.uuid, mesh.geometry, mesh.matrixWorld)
+      };
+      cached.set(candidate.uuid, candidate);
+    });
+    sceneMgr.optimizedMapping.forEach((mappings, originalUuid) => {
+      if (cached.has(originalUuid) || !mappings || mappings.length === 0) return;
+      const nodes = sceneMgr.getStructureNodes(originalUuid) || [];
+      if (nodes.length > 0 && nodes.every((node2) => node2.visible === false)) return;
+      const box = new THREE.Box3();
+      mappings.forEach((mapping) => {
+        const geometry = mapping.geometry || mapping.mesh.geometry;
+        if (!geometry) return;
+        const matrix = new THREE.Matrix4();
+        mapping.mesh.getMatrixAt(mapping.instanceId, matrix);
+        matrix.premultiply(mapping.mesh.matrixWorld);
+        const partBox = buildBoxFromGeometry(geometry, matrix);
+        if (partBox && !partBox.isEmpty()) box.union(partBox);
+      });
+      if (box.isEmpty()) return;
+      const node = nodes[0];
+      const modelId = node?.userData?.originalUuid ? String(node.userData.originalUuid) : "";
+      cached.set(originalUuid, {
+        uuid: originalUuid,
+        name: node?.name || originalUuid,
+        modelId,
+        modelName: clashModelNameById.get(modelId) || modelId || node?.name || originalUuid,
+        box,
+        testBox: box.clone(),
+        obb: null,
+        meshInfo: null
+      });
+    });
+    return Array.from(cached.values());
+  }, [buildMeshInfo, clashModelNameById, clashUseNarrowPhase, resolveModelOwner, sceneMgrRef]);
+  const collectTriangleCentersInBox = useCallback((meshInfo, box, maxCenters, maxTrianglesToScan) => {
+    const centers = [];
+    const pos = meshInfo.geometry.attributes.position;
+    if (!pos) return centers;
+    const index = meshInfo.geometry.index;
+    const triCount = index ? Math.floor(index.count / 3) : Math.floor(pos.count / 3);
+    const scanCount = Math.min(triCount, maxTrianglesToScan);
+    const stride = triCount > scanCount ? Math.max(1, Math.floor(triCount / scanCount)) : 1;
+    const a = new THREE.Vector3();
+    const b = new THREE.Vector3();
+    const c = new THREE.Vector3();
+    const center = new THREE.Vector3();
+    for (let ti = 0; ti < triCount; ti += stride) {
+      const i0 = index ? index.getX(ti * 3) : ti * 3;
+      const i1 = index ? index.getX(ti * 3 + 1) : ti * 3 + 1;
+      const i2 = index ? index.getX(ti * 3 + 2) : ti * 3 + 2;
+      a.fromBufferAttribute(pos, i0).applyMatrix4(meshInfo.matrixWorld);
+      b.fromBufferAttribute(pos, i1).applyMatrix4(meshInfo.matrixWorld);
+      c.fromBufferAttribute(pos, i2).applyMatrix4(meshInfo.matrixWorld);
+      center.copy(a).add(b).add(c).multiplyScalar(1 / 3);
+      if (!box.containsPoint(center)) continue;
+      centers.push(center.clone());
+      if (centers.length >= maxCenters) break;
+    }
+    return centers;
+  }, []);
+  const isPointInsideMeshByRaycast = useCallback((point, meshInfo) => {
+    const pos = meshInfo.geometry.attributes.position;
+    if (!pos) return false;
+    const index = meshInfo.geometry.index;
+    const triCount = index ? Math.floor(index.count / 3) : Math.floor(pos.count / 3);
+    const maxTrianglesToScan = 12e3;
+    const scanCount = Math.min(triCount, maxTrianglesToScan);
+    const stride = triCount > scanCount ? Math.max(1, Math.floor(triCount / scanCount)) : 1;
+    const origin = point.clone();
+    origin.x -= 1e-4;
+    const ray = new THREE.Ray(origin, new THREE.Vector3(1, 0, 0));
+    const hit = new THREE.Vector3();
+    const a = new THREE.Vector3();
+    const b = new THREE.Vector3();
+    const c = new THREE.Vector3();
+    let intersections = 0;
+    for (let ti = 0; ti < triCount; ti += stride) {
+      const i0 = index ? index.getX(ti * 3) : ti * 3;
+      const i1 = index ? index.getX(ti * 3 + 1) : ti * 3 + 1;
+      const i2 = index ? index.getX(ti * 3 + 2) : ti * 3 + 2;
+      a.fromBufferAttribute(pos, i0).applyMatrix4(meshInfo.matrixWorld);
+      b.fromBufferAttribute(pos, i1).applyMatrix4(meshInfo.matrixWorld);
+      c.fromBufferAttribute(pos, i2).applyMatrix4(meshInfo.matrixWorld);
+      const intersection = ray.intersectTriangle(a, b, c, false, hit);
+      if (!intersection || hit.x < origin.x) continue;
+      intersections++;
+    }
+    return intersections % 2 === 1;
+  }, []);
+  const passesTrianglePhase = useCallback((a, b, overlap) => {
+    if (!a.meshInfo || !b.meshInfo) return true;
+    if (a.meshInfo.triangleCount <= 0 || b.meshInfo.triangleCount <= 0) return true;
+    const triLimit = 3e4;
+    if (a.meshInfo.triangleCount > triLimit || b.meshInfo.triangleCount > triLimit) return true;
+    const centersA = collectTriangleCentersInBox(a.meshInfo, overlap, 4, 6e3);
+    const centersB = collectTriangleCentersInBox(b.meshInfo, overlap, 4, 6e3);
+    if (centersA.length === 0 || centersB.length === 0) return false;
+    return centersA.some((center) => isPointInsideMeshByRaycast(center, b.meshInfo)) || centersB.some((center) => isPointInsideMeshByRaycast(center, a.meshInfo));
+  }, [collectTriangleCentersInBox, isPointInsideMeshByRaycast]);
+  const handleRunClashCheck = useCallback(async () => {
+    if (!sceneMgrRef.current || clashInFlightRef.current) return;
+    const runToken = ++clashRunTokenRef.current;
+    const startedAt = performance.now();
+    clashInFlightRef.current = true;
+    setClashRunning(true);
+    setClashProgress(0);
+    setClashStatus(t("clash_collecting"));
+    setClashResults([]);
+    setClashPairsScanned(0);
+    try {
+      const rawCandidates = collectClashCandidates();
+      setClashScannedCount(rawCandidates.length);
+      if (rawCandidates.length < 2) {
+        setClashStatus(t("clash_insufficient_candidates"));
+        return;
+      }
+      const setAFilter = new Set(clashSetA);
+      const setBFilter = new Set(clashSetB);
+      const hasA = setAFilter.size > 0;
+      const hasB = setBFilter.size > 0;
+      const pairAllowed = (aModelId, bModelId) => {
+        if (!clashIncludeSameModel && aModelId && bModelId && aModelId === bModelId) return false;
+        if (hasA && hasB) {
+          return setAFilter.has(aModelId) && setBFilter.has(bModelId) || setAFilter.has(bModelId) && setBFilter.has(aModelId);
+        }
+        if (hasA) return setAFilter.has(aModelId) || setAFilter.has(bModelId);
+        if (hasB) return setBFilter.has(aModelId) || setBFilter.has(bModelId);
+        return true;
+      };
+      const candidateEligible = (modelId) => {
+        if (hasA && hasB) return setAFilter.has(modelId) || setBFilter.has(modelId);
+        if (hasA) return setAFilter.has(modelId);
+        if (hasB) return setBFilter.has(modelId);
+        return true;
+      };
+      const effectiveClearance = Math.max(0, clashClearanceDistance);
+      const bounded = rawCandidates.filter((candidate) => !candidate.box.isEmpty() && candidateEligible(candidate.modelId)).map((candidate) => {
+        const testBox = candidate.box.clone();
+        if (clashTolerance > 0 || effectiveClearance > 0) {
+          testBox.expandByScalar(Math.max(clashTolerance, effectiveClearance));
+        }
+        return {
+          ...candidate,
+          testBox
+        };
+      });
+      if (bounded.length < 2) {
+        setClashStatus(t("clash_no_results"));
+        setClashProgress(100);
+        return;
+      }
+      bounded.sort((a, b) => a.testBox.min.x - b.testBox.min.x);
+      setClashStatus(t("clash_running"));
+      const maxResults = 2e3;
+      const results = [];
+      const overlapBox = new THREE.Box3();
+      const overlapSize = new THREE.Vector3();
+      const n = bounded.length;
+      let pairChecks = 0;
+      for (let i = 0; i < n; i++) {
+        if (clashRunTokenRef.current !== runToken) {
+          setClashStatus(t("clash_cancelled"));
+          return;
+        }
+        const a = bounded[i];
+        const aMaxX = a.testBox.max.x;
+        for (let j = i + 1; j < n; j++) {
+          const b = bounded[j];
+          if (b.testBox.min.x > aMaxX) break;
+          if (!pairAllowed(a.modelId, b.modelId)) continue;
+          pairChecks++;
+          if (!a.testBox.intersectsBox(b.testBox)) continue;
+          if (clashUseNarrowPhase && a.obb && b.obb) {
+            const obbA = a.obb.clone();
+            const obbB = b.obb.clone();
+            if (clashTolerance > 0) {
+              obbA.halfSize.addScalar(clashTolerance);
+              obbB.halfSize.addScalar(clashTolerance);
+            }
+            if (!obbA.intersectsOBB(obbB, Number.EPSILON * 10)) continue;
+          }
+          overlapBox.copy(a.box).intersect(b.box);
+          const hasOverlap = !overlapBox.isEmpty();
+          let overlapVolume = 0;
+          if (hasOverlap) {
+            overlapBox.getSize(overlapSize);
+            overlapVolume = Math.max(0, overlapSize.x) * Math.max(0, overlapSize.y) * Math.max(0, overlapSize.z);
+          }
+          const distance = hasOverlap ? 0 : distanceBetweenBoxes(a.box, b.box);
+          const isHardClash = hasOverlap && overlapVolume >= clashMinOverlapVolume;
+          const isClearanceClash = !hasOverlap && effectiveClearance > 0 && distance <= effectiveClearance;
+          if (!isHardClash && !isClearanceClash) continue;
+          if (clashUseTrianglePhase && hasOverlap && !passesTrianglePhase(a, b, overlapBox)) continue;
+          const pairKey = [a.uuid, b.uuid].sort().join("::");
+          const clashType = isHardClash ? "hard" : "clearance";
+          const severity = clashType === "hard" ? overlapVolume > Math.max(0.5, clashMinOverlapVolume * 10) ? "high" : "medium" : distance <= Math.max(1e-3, effectiveClearance * 0.25) ? "high" : "low";
+          results.push({
+            id: `clash_${clashType}_${pairKey}_${results.length}`,
+            pairKey,
+            groupKey: `${clashType}::${a.modelId || "unknown"}::${b.modelId || "unknown"}::${pairKey}`,
+            ruleId: clashType === "hard" ? "hard-clash-default" : "clearance-default",
+            aUuid: a.uuid,
+            bUuid: b.uuid,
+            aName: a.name,
+            bName: b.name,
+            overlapVolume,
+            distance,
+            severity,
+            type: clashType,
+            status: "new"
+          });
+          if (results.length >= maxResults) break;
+        }
+        if (results.length >= maxResults) break;
+        if ((i + 1) % 50 === 0 || i === n - 1) {
+          const progress = 30 + (i + 1) / n * 70;
+          setClashProgress(progress);
+          setClashPairsScanned(pairChecks);
+          setClashStatus(`${t("clash_running")} ${i + 1}/${n}`);
+          await new Promise((resolve) => window.setTimeout(resolve, 0));
+        }
+      }
+      results.sort((x, y) => {
+        if (x.type !== y.type) return x.type === "hard" ? -1 : 1;
+        if (x.type === "hard") return y.overlapVolume - x.overlapVolume;
+        return x.distance - y.distance;
+      });
+      setClashResults((prev) => {
+        const statusByPair = /* @__PURE__ */ new Map();
+        prev.forEach((item) => statusByPair.set(item.pairKey, item.status));
+        return results.map((item) => ({
+          ...item,
+          status: statusByPair.get(item.pairKey) || "new"
+        }));
+      });
+      setClashPairsScanned(pairChecks);
+      setClashProgress(100);
+      setClashStatus(`${t("clash_results")}: ${results.length}`);
+      if (results.length === 0) {
+        sceneMgrRef.current.clearLocateFocus();
+      }
+    } finally {
+      const elapsed = performance.now() - startedAt;
+      const minVisibleMs = 220;
+      if (elapsed < minVisibleMs) {
+        await new Promise((resolve) => window.setTimeout(resolve, minVisibleMs - elapsed));
+      }
+      clashInFlightRef.current = false;
+      setClashRunning(false);
+    }
+  }, [clashClearanceDistance, clashIncludeSameModel, clashMinOverlapVolume, clashSetA, clashSetB, clashTolerance, clashUseNarrowPhase, clashUseTrianglePhase, collectClashCandidates, passesTrianglePhase, sceneMgrRef, t]);
+  const handleCancelClashCheck = useCallback(() => {
+    if (!clashInFlightRef.current) return;
+    clashRunTokenRef.current++;
+    setClashStatus(t("clash_cancelling"));
+  }, [t]);
+  const handleClearClashResults = useCallback(() => {
+    clashRunTokenRef.current++;
+    clashInFlightRef.current = false;
+    setClashRunning(false);
+    setClashProgress(0);
+    setClashStatus("");
+    setClashScannedCount(0);
+    setClashPairsScanned(0);
+    setClashResultFilter("ALL");
+    setClashTypeFilter("ALL");
+    setClashResults([]);
+    sceneMgrRef.current?.clearLocateFocus();
+    sceneMgrRef.current?.highlightObjects(selectedUuids);
+  }, [sceneMgrRef, selectedUuids]);
+  const handleFocusClashResult = useCallback((item) => {
+    const uuids = [item.aUuid, item.bUuid];
+    focusObjectsInView({
+      uuids,
+      focusUuid: item.aUuid,
+      highlightColors: {
+        [item.aUuid]: "#ff4d4f",
+        [item.bUuid]: "#1890ff"
+      }
+    });
+  }, [focusObjectsInView]);
+  const handleUpdateClashResultStatus = useCallback((id, nextStatus) => {
+    setClashResults((prev) => prev.map((item) => item.id === id ? { ...item, status: nextStatus } : item));
+  }, []);
+  const handleMarkFilteredClashStatus = useCallback((nextStatus) => {
+    setClashResults((prev) => prev.map((item) => {
+      const matchedStatus = clashResultFilter === "ALL" || clashResultFilter === "NEW" && item.status === "new" || clashResultFilter === "CONFIRMED" && item.status === "confirmed" || clashResultFilter === "RESOLVED" && item.status === "resolved";
+      const matchedType = clashTypeFilter === "ALL" || clashTypeFilter === "HARD" && item.type === "hard" || clashTypeFilter === "CLEARANCE" && item.type === "clearance";
+      const matched = matchedStatus && matchedType;
+      return matched ? { ...item, status: nextStatus } : item;
+    }));
+  }, [clashResultFilter, clashTypeFilter]);
+  const handleExportClashCsv = useCallback(() => {
+    if (clashResults.length === 0) return;
+    const escapeCsv = (value) => {
+      const text = String(value ?? "");
+      if (text.includes(",") || text.includes('"') || text.includes("\n")) {
+        return `"${text.replace(/"/g, '""')}"`;
+      }
+      return text;
+    };
+    const header = ["pairKey", "type", "severity", "ruleId", "aUuid", "aName", "bUuid", "bName", "status", "overlapVolume", "distance"];
+    const lines = [header.join(",")];
+    clashResults.forEach((item) => {
+      lines.push([
+        escapeCsv(item.pairKey),
+        escapeCsv(item.type),
+        escapeCsv(item.severity),
+        escapeCsv(item.ruleId),
+        escapeCsv(item.aUuid),
+        escapeCsv(item.aName),
+        escapeCsv(item.bUuid),
+        escapeCsv(item.bName),
+        escapeCsv(item.status),
+        escapeCsv(item.overlapVolume.toFixed(6)),
+        escapeCsv(item.distance.toFixed(6))
+      ].join(","));
+    });
+    const csv = "\uFEFF" + lines.join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const now = /* @__PURE__ */ new Date();
+    const pad = (value) => String(value).padStart(2, "0");
+    const fileName = `clash_report_${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.csv`;
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = fileName;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }, [clashResults]);
+  const resetClashState = useCallback(() => {
+    clashRunTokenRef.current++;
+    clashInFlightRef.current = false;
+    setClashResults([]);
+    setClashRunning(false);
+    setClashProgress(0);
+    setClashStatus("");
+    setClashScannedCount(0);
+    setClashPairsScanned(0);
+    setClashResultFilter("ALL");
+    setClashTypeFilter("ALL");
+  }, []);
+  const applyClashModelOptionBounds = useCallback(() => {
+    const validIds = new Set(clashModelOptions.map((item) => item.id));
+    setClashSetA((prev) => prev.filter((id) => validIds.has(id)));
+    setClashSetB((prev) => prev.filter((id) => validIds.has(id)));
+  }, [clashModelOptions]);
+  return {
+    clashResults,
+    setClashResults,
+    clashRunning,
+    clashProgress,
+    clashStatus,
+    clashScannedCount,
+    clashSetA,
+    clashSetB,
+    clashTolerance,
+    clashMinOverlapVolume,
+    clashClearanceDistance,
+    clashUseNarrowPhase,
+    clashUseTrianglePhase,
+    clashIncludeSameModel,
+    clashPairsScanned,
+    clashResultFilter,
+    clashTypeFilter,
+    setClashSetA,
+    setClashSetB,
+    setClashTolerance,
+    setClashMinOverlapVolume,
+    setClashClearanceDistance,
+    setClashUseNarrowPhase,
+    setClashUseTrianglePhase,
+    setClashIncludeSameModel,
+    setClashResultFilter,
+    setClashTypeFilter,
+    handleRunClashCheck,
+    handleCancelClashCheck,
+    handleClearClashResults,
+    handleFocusClashResult,
+    handleUpdateClashResultStatus,
+    handleMarkFilteredClashStatus,
+    handleExportClashCsv,
+    resetClashState,
+    applyClashModelOptionBounds
+  };
+}
+
+function useClashSummary(sceneMgrRef, clashResults) {
+  const annotatedUuidsRef = useRef(/* @__PURE__ */ new Set());
+  const clashSummaryByUuid = useMemo(() => {
+    const summary = /* @__PURE__ */ new Map();
+    const merge = (uuid, status) => {
+      if (!uuid) return;
+      const current = summary.get(uuid) || {
+        total: 0,
+        newCount: 0,
+        confirmedCount: 0,
+        resolvedCount: 0,
+        worstStatus: "resolved"
+      };
+      current.total += 1;
+      if (status === "new") current.newCount += 1;
+      else if (status === "confirmed") current.confirmedCount += 1;
+      else current.resolvedCount += 1;
+      if (current.newCount > 0) current.worstStatus = "new";
+      else if (current.confirmedCount > 0) current.worstStatus = "confirmed";
+      else current.worstStatus = "resolved";
+      summary.set(uuid, current);
+    };
+    clashResults.forEach((item) => {
+      merge(item.aUuid, item.status);
+      merge(item.bUuid, item.status);
+    });
+    const out = {};
+    summary.forEach((value, key) => {
+      out[key] = value;
+    });
+    return out;
+  }, [clashResults]);
+  useEffect(() => {
+    if (!sceneMgrRef.current) return;
+    const mgr = sceneMgrRef.current;
+    const previouslyAnnotated = annotatedUuidsRef.current;
+    previouslyAnnotated.forEach((uuid) => {
+      const obj = mgr.contentGroup.getObjectByProperty("uuid", uuid);
+      if (obj?.userData?.clash) delete obj.userData.clash;
+      const nodes = mgr.getStructureNodes(uuid) || [];
+      nodes.forEach((node) => {
+        if (node?.userData?.clash) delete node.userData.clash;
+      });
+    });
+    const nextAnnotated = /* @__PURE__ */ new Set();
+    Object.entries(clashSummaryByUuid).forEach(([uuid, stat]) => {
+      nextAnnotated.add(uuid);
+      const payload = {
+        total: stat.total,
+        new: stat.newCount,
+        confirmed: stat.confirmedCount,
+        resolved: stat.resolvedCount,
+        status: stat.worstStatus
+      };
+      const obj = mgr.contentGroup.getObjectByProperty("uuid", uuid);
+      if (obj) {
+        if (!obj.userData) obj.userData = {};
+        obj.userData.clash = payload;
+      }
+      const nodes = mgr.getStructureNodes(uuid) || [];
+      nodes.forEach((node) => {
+        if (!node.userData) node.userData = {};
+        node.userData.clash = payload;
+      });
+    });
+    annotatedUuidsRef.current = nextAnnotated;
+  }, [clashSummaryByUuid, sceneMgrRef]);
+  return clashSummaryByUuid;
+}
+
+function useFocusInView({
+  sceneMgrRef,
+  setSelectedUuids,
+  setSelectedProps
+}) {
+  const focusObjectsInView = useCallback(({
+    uuids,
+    focusUuid,
+    highlightColors,
+    updateSelection = true
+  }) => {
+    const sceneManager = sceneMgrRef.current;
+    if (!sceneManager) return false;
+    const normalized = Array.from(new Set((uuids || []).map((uuid) => String(uuid || "").trim()).filter(Boolean)));
+    if (normalized.length === 0) return false;
+    const targetFocus = focusUuid && normalized.includes(focusUuid) ? focusUuid : normalized[0];
+    sceneManager.setLocateFocusContext(normalized, targetFocus, highlightColors);
+    sceneManager.fitViewToObjects(normalized);
+    if (updateSelection) {
+      setSelectedUuids(normalized);
+      setSelectedProps?.(null);
+    }
+    return true;
+  }, [sceneMgrRef, setSelectedProps, setSelectedUuids]);
+  return {
+    focusObjectsInView
+  };
 }
 
 const IS_DEV = typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
@@ -10047,7 +14578,6 @@ const ThreeViewer = ({
   allowDragOpen = true,
   hiddenMenus = [],
   libPath = "./libs",
-  defaultTheme,
   defaultLang,
   showStats: propShowStats,
   showOutline: propShowOutline,
@@ -10060,18 +14590,7 @@ const ThreeViewer = ({
   performancePreset = "quality",
   chunkOptions
 }) => {
-  const sceneBgFollowsTheme = initialSettings?.bgColor === void 0;
-  const [themeMode, setThemeMode] = usePersistentState(
-    "3dbrowser_themeMode",
-    () => defaultTheme || "light",
-    {
-      serializer: (value) => value,
-      parser: (raw) => raw === "dark" || raw === "light" ? raw : "light"
-    }
-  );
-  const theme = useMemo(() => {
-    return themes[themeMode];
-  }, [themeMode]);
+  const theme = themes.light;
   const effectiveChunkOptions = useMemo(() => ({
     chunkReadCacheSize: chunkOptions?.chunkReadCacheSize ?? 128,
     chunkPrefetchWindow: chunkOptions?.chunkPrefetchWindow ?? 0,
@@ -10095,6 +14614,7 @@ const ThreeViewer = ({
       setLang(defaultLang);
     }
   }, [defaultLang, lang, setLang]);
+  const t = useCallback((key) => getTranslation(lang, key), [lang]);
   useEffect(() => {
     const preventDefault = (event) => {
       event.preventDefault();
@@ -10123,10 +14643,7 @@ const ThreeViewer = ({
     setSelectedUuids,
     clearSelection
   } = useSceneSelection();
-  const [locatedUuid, setLocatedUuid] = useState(null);
-  const [locateResultUuids, setLocateResultUuids] = useState([]);
   const [selectedProps, setSelectedProps] = useState(null);
-  const [selectedIfcStorey, setSelectedIfcStorey] = useState("");
   const [status, setStatus] = useState(getTranslation(lang, "ready"));
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -10142,39 +14659,42 @@ const ThreeViewer = ({
     pixelRatio: 1
   });
   const [chunkProgress, setChunkProgress] = useState({ loaded: 0, total: 0 });
-  const [activeTool, setActiveTool] = useState("none");
-  const [explodeEnabled, setExplodeEnabled] = useState(false);
-  const [explodeStrength, setExplodeStrength] = useState(32);
-  const [explodeMode, setExplodeMode] = useState("radial");
+  const [mgrInstance, setMgrInstance] = useState(null);
   const [mousePos, setMousePos] = useState(null);
   const [displayMode, setDisplayMode] = useState("solid");
-  const [viewpoints, setViewpoints] = useState([]);
   const [currentFileSetId, setCurrentFileSetId] = useState("");
-  const [measureType, setMeasureType] = useState("none");
-  const [measureHistory, setMeasureHistory] = useState([]);
-  const [highlightedMeasureId, setHighlightedMeasureId] = useState(null);
-  const [clipEnabled, setClipEnabled] = useState(false);
-  const [clipValues, setClipValues] = useState({ x: [0, 100], y: [0, 100], z: [0, 100] });
-  const [clipActive, setClipActive] = useState({ x: false, y: false, z: false });
-  const [clipHelperVisible, setClipHelperVisible] = usePersistentState(
-    "3dbrowser_clipHelperVisible",
-    initialSettings?.clip?.helperVisible ?? false,
-    {
-      serializer: (value) => String(value),
-      parser: (raw) => raw === "true"
-    }
-  );
-  const [clipHelperOpacity, setClipHelperOpacity] = usePersistentState(
-    "3dbrowser_clipHelperOpacity",
-    initialSettings?.clip?.helperOpacity ?? 0.12,
-    {
-      serializer: (value) => String(value),
-      parser: (raw) => {
-        const parsed = Number(raw);
-        return Number.isFinite(parsed) ? parsed : 0.12;
-      }
-    }
-  );
+  const {
+    activeTool,
+    setActiveTool,
+    explodeEnabled,
+    setExplodeEnabled,
+    explodeStrength,
+    setExplodeStrength,
+    explodeMode,
+    setExplodeMode,
+    resetExplodeState,
+    measureType,
+    setMeasureType,
+    measureHistory,
+    setMeasureHistory,
+    highlightedMeasureId,
+    setHighlightedMeasureId,
+    resetMeasurementState,
+    handleMeasureUpdate,
+    clipEnabled,
+    setClipEnabled,
+    clipValues,
+    setClipValues,
+    clipActive,
+    setClipActive,
+    clipHelperVisible,
+    setClipHelperVisible,
+    clipHelperOpacity,
+    setClipHelperOpacity
+  } = useViewerTools({
+    initialSettings,
+    mgrInstance
+  });
   const [pickEnabled, setPickEnabled] = usePersistentState("3dbrowser_pickEnabled", false, {
     serializer: (value) => String(value),
     parser: (raw) => raw === "true"
@@ -10196,7 +14716,7 @@ const ThreeViewer = ({
       ambientInt: 2,
       dirInt: 1,
       bgColor: theme.canvasBg,
-      viewCubeSize: 100,
+      viewCubeSize: 120,
       colorSpace: "srgb",
       toneMapping: "aces",
       exposure: 1,
@@ -10206,11 +14726,7 @@ const ThreeViewer = ({
       maxPixelRatio: 2,
       targetFps: 50,
       performanceMode: "balanced",
-      sunEnabled: false,
-      sunLatitude: 0,
-      sunLongitude: 0,
-      sunTime: 12,
-      sunShadow: false,
+      backLightInt: 0.5,
       highlightColor: "#ff9f1c",
       highlightShowBox: false,
       clip: {
@@ -10219,72 +14735,34 @@ const ThreeViewer = ({
       }
     };
     const merged = initialSettings ? { ...baseSettings, ...initialSettings } : baseSettings;
-    return sceneBgFollowsTheme ? { ...merged, bgColor: theme.canvasBg } : merged;
+    return merged.bgColor === void 0 ? { ...merged, bgColor: theme.canvasBg } : merged;
   });
   useEffect(() => {
     if (propShowStats !== void 0) setShowStats(propShowStats);
   }, [propShowStats, setShowStats]);
-  useEffect(() => {
-    if (propShowOutline !== void 0) setShowOutline(propShowOutline);
-  }, [propShowOutline, setShowOutline]);
-  useEffect(() => {
-    if (propShowProperties !== void 0) setShowProps(propShowProperties);
-  }, [propShowProperties, setShowProps]);
   const [confirmState, setConfirmState] = useState({ isOpen: false, title: "", message: "", action: () => {
   } });
   const [isAboutOpen, setIsAboutOpen] = useState(false);
-  const [leftWidth, setLeftWidth] = useState(260);
-  const [rightWidth, setRightWidth] = useState(300);
-  const resizingLeft = useRef(false);
-  const resizingRight = useRef(false);
   const canvasRef = useRef(null);
   const viewportRef = useRef(null);
   const sceneMgr = useRef(null);
   const ifcPropertyCacheRef = useRef(/* @__PURE__ */ new Map());
-  const [mgrInstance, setMgrInstance] = useState(null);
-  const pointerDownRef = useRef(null);
-  const mouseMoveRafRef = useRef(null);
-  const pendingMousePointRef = useRef(null);
-  const handleThemeModeChange = useCallback((nextThemeMode) => {
-    setThemeMode(nextThemeMode);
-    const nextTheme = themes[nextThemeMode];
-    setSceneSettings((prevSettings) => {
-      const merged = sceneBgFollowsTheme ? { ...prevSettings, bgColor: nextTheme.canvasBg } : prevSettings;
-      if (sceneMgr.current && sceneBgFollowsTheme) {
-        sceneMgr.current.updateSettings(merged);
-      }
-      return merged;
-    });
-  }, [sceneBgFollowsTheme, setSceneSettings, setThemeMode]);
-  useEffect(() => {
-    if (defaultTheme && defaultTheme !== themeMode) {
-      handleThemeModeChange(defaultTheme);
-    }
-  }, [defaultTheme, themeMode, handleThemeModeChange]);
-  useEffect(() => {
-    if (!sceneBgFollowsTheme) return;
-    setSceneSettings((prevSettings) => {
-      if (prevSettings.bgColor === theme.canvasBg) return prevSettings;
-      const merged = { ...prevSettings, bgColor: theme.canvasBg };
-      if (sceneMgr.current) {
-        sceneMgr.current.updateSettings(merged);
-      }
-      return merged;
-    });
-  }, [sceneBgFollowsTheme, setSceneSettings, theme.canvasBg]);
-  useEffect(() => {
-    const normalizedOpacity = Math.min(0.35, Math.max(0.05, clipHelperOpacity));
-    if (normalizedOpacity !== clipHelperOpacity) {
-      setClipHelperOpacity(normalizedOpacity);
-      return;
-    }
-    if (sceneMgr.current) {
-      sceneMgr.current.setClipHelperOptions({
-        visible: clipHelperVisible,
-        opacity: normalizedOpacity
-      });
-    }
-  }, [clipHelperVisible, clipHelperOpacity, setClipHelperOpacity]);
+  const { focusObjectsInView } = useFocusInView({
+    sceneMgrRef: sceneMgr,
+    setSelectedUuids,
+    setSelectedProps
+  });
+  const {
+    leftWidth,
+    rightWidth,
+    resizingLeft,
+    resizingRight
+  } = useViewerLayout({
+    propShowOutline,
+    propShowProperties,
+    setShowOutline,
+    setShowProps
+  });
   useEffect(() => {
     const manager = sceneMgr.current;
     if (!manager) return;
@@ -10296,6 +14774,63 @@ const ThreeViewer = ({
     });
   }, [effectiveChunkOptions, performancePreset, sceneSettings]);
   const hasModels = treeRoot.length > 0;
+  const clashModelOptions = useMemo(() => {
+    const options = [];
+    const seen = /* @__PURE__ */ new Set();
+    (treeRoot || []).forEach((node) => {
+      const id = String(node?.object?.userData?.originalUuid || node?.uuid || "");
+      if (!id || seen.has(id)) return;
+      seen.add(id);
+      options.push({ id, name: String(node?.name || id) });
+    });
+    return options;
+  }, [treeRoot]);
+  const {
+    clashResults,
+    clashRunning,
+    clashProgress,
+    clashStatus,
+    clashScannedCount,
+    clashSetA,
+    clashSetB,
+    clashTolerance,
+    clashMinOverlapVolume,
+    clashClearanceDistance,
+    clashUseNarrowPhase,
+    clashUseTrianglePhase,
+    clashIncludeSameModel,
+    clashPairsScanned,
+    clashResultFilter,
+    clashTypeFilter,
+    setClashSetA,
+    setClashSetB,
+    setClashTolerance,
+    setClashMinOverlapVolume,
+    setClashClearanceDistance,
+    setClashUseNarrowPhase,
+    setClashUseTrianglePhase,
+    setClashIncludeSameModel,
+    setClashResultFilter,
+    setClashTypeFilter,
+    handleRunClashCheck,
+    handleCancelClashCheck,
+    handleClearClashResults,
+    handleFocusClashResult,
+    handleUpdateClashResultStatus,
+    handleMarkFilteredClashStatus,
+    handleExportClashCsv,
+    resetClashState,
+    applyClashModelOptionBounds
+  } = useClashCheck({
+    sceneMgrRef: sceneMgr,
+    treeRoot,
+    clashModelOptions,
+    selectedUuids,
+    setSelectedUuids,
+    focusObjectsInView,
+    t
+  });
+  const clashSummaryByUuid = useClashSummary(sceneMgr, clashResults);
   const completedFileSetsRef = useRef(/* @__PURE__ */ new Set());
   const currentFileSetIdRef = useRef("");
   useEffect(() => {
@@ -10315,107 +14850,22 @@ const ThreeViewer = ({
   const handleManagerChunkProgress = useCallback((loaded, total) => {
     onManagerChunkProgress(loaded, total);
   }, [onManagerChunkProgress]);
-  const [contextMenu, setContextMenu] = useState({ x: 0, y: 0, visible: false });
-  const [hiddenUuids, setHiddenUuids] = useState(/* @__PURE__ */ new Set());
-  const [isolatedUuids, setIsolatedUuids] = useState(/* @__PURE__ */ new Set());
-  const [contextMenuOpacity, setContextMenuOpacity] = useState(1);
-  const visibilityStackRef = useRef([]);
-  const handleHideSelected = useCallback(() => {
-    if (selectedUuids.length === 0 || !sceneMgr.current) return;
-    const stateToRestore = selectedUuids.map((uuid) => {
-      const obj = sceneMgr.current?.contentGroup.getObjectByProperty("uuid", uuid);
-      return { uuid, visible: obj ? obj.visible : true };
-    });
-    visibilityStackRef.current.push(stateToRestore);
-    const newHiddenUuids = new Set(hiddenUuids);
-    const newIsolatedUuids = new Set(isolatedUuids);
-    selectedUuids.forEach((uuid) => {
-      sceneMgr.current?.setObjectVisibility(uuid, false);
-      newHiddenUuids.add(uuid);
-      newIsolatedUuids.delete(uuid);
-    });
-    setHiddenUuids(newHiddenUuids);
-    setIsolatedUuids(newIsolatedUuids);
-    setSelectedUuids([]);
-    setSelectedProps(null);
-    sceneMgr.current?.highlightObjects([]);
-    updateTree();
-  }, [selectedUuids, hiddenUuids, isolatedUuids]);
-  const handleShowAll = useCallback(() => {
-    if (!sceneMgr.current) return;
-    if (hiddenUuids.size > 0 || isolatedUuids.size > 0) {
-      sceneMgr.current.setAllVisibility(true);
-      setHiddenUuids(/* @__PURE__ */ new Set());
-      setIsolatedUuids(/* @__PURE__ */ new Set());
-      updateTree();
-    }
-    setLocatedUuid(null);
-    sceneMgr.current.clearLocateFocus();
-  }, [hiddenUuids, isolatedUuids]);
-  const t = useCallback((key) => getTranslation(lang, key), [lang]);
+  useSceneStats({
+    mgrInstance,
+    showStats,
+    setStats
+  });
   useEffect(() => {
-    const handleError = (event) => {
-      const message = event.message || "";
-      if (!message && !event.error) return;
-      if (message.includes("ResizeObserver loop completed") || message.includes("ResizeObserver loop limit") || message.includes("texImage3D: FLIP_Y or PREMULTIPLY_ALPHA")) {
-        return;
-      }
-      console.error("Global Error:", event.error || message);
-      setErrorState({
-        isOpen: true,
-        title: t("failed"),
-        message: message || "An unexpected error occurred",
-        detail: event.error?.stack || ""
-      });
-    };
-    const handleRejection = (event) => {
-      if (!event.reason) return;
-      const message = event.reason?.message || String(event.reason);
-      if (message.includes("ResizeObserver loop completed") || message.includes("ResizeObserver loop limit") || message.includes("texImage3D: FLIP_Y or PREMULTIPLY_ALPHA")) {
-        return;
-      }
-      console.error("Unhandled Rejection:", event.reason);
-      setErrorState({
-        isOpen: true,
-        title: t("failed"),
-        message: message || "A promise was rejected without reason",
-        detail: event.reason?.stack || ""
-      });
-    };
-    window.addEventListener("error", handleError);
-    window.addEventListener("unhandledrejection", handleRejection);
-    return () => {
-      window.removeEventListener("error", handleError);
-      window.removeEventListener("unhandledrejection", handleRejection);
-    };
-  }, [lang, t]);
+    applyClashModelOptionBounds();
+  }, [applyClashModelOptionBounds]);
+  const resetLocateStateRef = useRef(() => {
+  });
   useEffect(() => {
     const prevLang = lang === "zh" ? "en" : "zh";
     if (status === getTranslation(prevLang, "ready")) {
       setStatus(getTranslation(lang, "ready"));
     }
   }, [lang]);
-  useEffect(() => {
-    const handleMove = (e) => {
-      if (resizingLeft.current) {
-        setLeftWidth(Math.max(150, Math.min(500, e.clientX)));
-      }
-      if (resizingRight.current) {
-        const newW = window.innerWidth - e.clientX;
-        setRightWidth(Math.max(200, Math.min(600, newW)));
-      }
-    };
-    const handleUp = () => {
-      resizingLeft.current = false;
-      resizingRight.current = false;
-    };
-    window.addEventListener("mousemove", handleMove);
-    window.addEventListener("mouseup", handleUp);
-    return () => {
-      window.removeEventListener("mousemove", handleMove);
-      window.removeEventListener("mouseup", handleUp);
-    };
-  }, []);
   const formatNumber = (num) => {
     if (num >= 1e6) return (num / 1e6).toFixed(2) + "M";
     if (num >= 1e3) return (num / 1e3).toFixed(1) + "K";
@@ -10425,172 +14875,97 @@ const ThreeViewer = ({
     if (mb >= 1024) return (mb / 1024).toFixed(2) + " GB";
     return mb.toFixed(1) + " MB";
   };
-  useEffect(() => {
-    if (!currentFileSetId) {
-      setViewpoints([]);
-      return;
+  function captureViewpointStateSnapshot(options) {
+    const snapshot = {};
+    if (options.visibility) {
+      snapshot.hiddenUuids = Array.from(hiddenUuids);
+      snapshot.isolatedUuids = Array.from(isolatedUuids);
     }
-    try {
-      const key = `viewpoints_${currentFileSetId}`;
-      const saved = localStorage.getItem(key);
-      if (saved) {
-        setViewpoints(JSON.parse(saved));
+    if (options.selection) {
+      snapshot.selectedUuids = [...selectedUuids];
+    }
+    if (options.clip) {
+      snapshot.clip = {
+        enabled: clipEnabled,
+        values: {
+          x: [...clipValues.x],
+          y: [...clipValues.y],
+          z: [...clipValues.z]
+        },
+        active: { ...clipActive },
+        helperVisible: clipHelperVisible,
+        helperOpacity: clipHelperOpacity
+      };
+    }
+    if (options.explode) {
+      snapshot.explode = {
+        enabled: explodeEnabled,
+        strength: explodeStrength,
+        mode: explodeMode
+      };
+    }
+    return snapshot;
+  }
+  async function restoreViewpointStateSnapshot(snapshot) {
+    const manager = sceneMgr.current;
+    if (!manager || !snapshot) return;
+    resetLocateStateRef.current?.();
+    manager.clearLocateFocus();
+    if (snapshot.clip) {
+      setClipEnabled(snapshot.clip.enabled);
+      setClipValues(snapshot.clip.values);
+      setClipActive(snapshot.clip.active);
+      setClipHelperVisible(snapshot.clip.helperVisible);
+      setClipHelperOpacity(snapshot.clip.helperOpacity);
+    }
+    if (snapshot.explode) {
+      setExplodeEnabled(snapshot.explode.enabled);
+      setExplodeStrength(snapshot.explode.strength);
+      setExplodeMode(snapshot.explode.mode);
+    }
+    if (snapshot.hiddenUuids !== void 0 || snapshot.isolatedUuids !== void 0) {
+      manager.setAllVisibility(true);
+      const nextHidden = snapshot.hiddenUuids || [];
+      const nextIsolated = snapshot.isolatedUuids || [];
+      if (nextIsolated.length > 0) {
+        manager.isolateObjects(nextIsolated);
+        setHiddenUuids(/* @__PURE__ */ new Set());
+        setIsolatedUuids(new Set(nextIsolated));
       } else {
-        setViewpoints([]);
+        nextHidden.forEach((uuid) => manager.setObjectVisibility(uuid, false));
+        setHiddenUuids(new Set(nextHidden));
+        setIsolatedUuids(/* @__PURE__ */ new Set());
       }
-    } catch (e) {
-      console.error("Failed to load viewpoints", e);
-      setViewpoints([]);
+      updateTree();
     }
-  }, [currentFileSetId]);
-  const persistViewpoints = useCallback((nextViewpoints) => {
-    if (!currentFileSetId) return;
-    setViewpoints(nextViewpoints);
-    try {
-      localStorage.setItem(`viewpoints_${currentFileSetId}`, JSON.stringify(nextViewpoints));
-    } catch (e) {
-      console.error("Failed to persist viewpoints", e);
-    }
-  }, [currentFileSetId]);
-  const captureViewThumbnail = useCallback(() => {
-    if (!sceneMgr.current) return "";
-    let image = "";
-    try {
-      sceneMgr.current.renderer.render(sceneMgr.current.scene, sceneMgr.current.camera);
-      const srcCanvas = sceneMgr.current.canvas;
-      const srcWidth = srcCanvas.width;
-      const srcHeight = srcCanvas.height;
-      const scale = Math.min(640 / srcWidth, 360 / srcHeight);
-      const dstWidth = Math.round(srcWidth * scale);
-      const dstHeight = Math.round(srcHeight * scale);
-      const tempCanvas = document.createElement("canvas");
-      tempCanvas.width = dstWidth;
-      tempCanvas.height = dstHeight;
-      const ctx = tempCanvas.getContext("2d");
-      if (ctx) {
-        ctx.drawImage(srcCanvas, 0, 0, dstWidth, dstHeight);
-        image = tempCanvas.toDataURL("image/jpeg", 0.92);
-      }
-    } catch (e) {
-      console.error("Failed to capture thumbnail", e);
-    }
-    return image;
-  }, []);
-  const handleSaveViewpoint = useCallback((customName, replaceId) => {
-    if (!sceneMgr.current || !currentFileSetId) {
-      setToast({ message: t("no_models"), type: "info" });
-      return;
-    }
-    const hasModels2 = sceneMgr.current.contentGroup.children.length > 0;
-    if (!hasModels2) {
-      setToast({ message: t("no_models"), type: "info" });
-      return;
-    }
-    const name = customName || `${t("viewpoint_title")} ${viewpoints.length + 1}`;
-    const cameraState = sceneMgr.current.getCameraState();
-    const image = captureViewThumbnail();
-    const nextViewpoints = replaceId ? viewpoints.map((vp) => vp.id === replaceId ? { ...vp, name, cameraState, image } : vp) : [
-      ...viewpoints,
-      {
-        id: Date.now().toString(),
-        name,
-        cameraState,
-        image
-      }
-    ];
-    persistViewpoints(nextViewpoints);
-    setToast({ message: t("success"), type: "success" });
-  }, [captureViewThumbnail, currentFileSetId, persistViewpoints, t, viewpoints]);
-  const handleUpdateViewpointName = useCallback((id, newName) => {
-    const nextViewpoints = viewpoints.map((v) => v.id === id ? { ...v, name: newName } : v);
-    persistViewpoints(nextViewpoints);
-  }, [persistViewpoints, viewpoints]);
-  const handleLoadViewpoint = useCallback((vp) => {
-    if (!sceneMgr.current || !vp.cameraState) return;
-    sceneMgr.current.setCameraState(vp.cameraState);
-    setToast({ message: `${t("viewpoint_loading")}: ${vp.name}`, type: "info" });
-  }, [t]);
-  const handleOverwriteViewpoint = useCallback((id) => {
-    const viewpoint = viewpoints.find((vp) => vp.id === id);
-    if (!viewpoint) return;
-    handleSaveViewpoint(viewpoint.name, id);
-  }, [handleSaveViewpoint, viewpoints]);
-  const handleDeleteViewpoint = useCallback((id) => {
-    const viewpoint = viewpoints.find((vp) => vp.id === id);
-    setConfirmState({
-      isOpen: true,
-      title: t("viewpoint_title"),
-      message: `${t("confirm_delete")} "${viewpoint?.name || "Viewpoint"}"?`,
-      action: () => {
-        const nextViewpoints = viewpoints.filter((v) => v.id !== id);
-        persistViewpoints(nextViewpoints);
-      }
-    });
-  }, [persistViewpoints, t, viewpoints]);
-  useEffect(() => {
-    if (!viewportRef.current || !mgrInstance) return;
-    const observer = new ResizeObserver((entries) => {
-      if (!entries || entries.length === 0) return;
-      const { width, height } = entries[0].contentRect;
-      if (width === 0 || height === 0) return;
-      requestAnimationFrame(() => {
-        if (mgrInstance) {
-          mgrInstance.resize(width, height);
-        }
-      });
-    });
-    observer.observe(viewportRef.current);
-    const handleWindowResize = () => {
-      if (mgrInstance && viewportRef.current) {
-        const rect = viewportRef.current.getBoundingClientRect();
-        mgrInstance.resize(rect.width, rect.height);
-      }
-    };
-    window.addEventListener("resize", handleWindowResize);
-    return () => {
-      observer.disconnect();
-      window.removeEventListener("resize", handleWindowResize);
-    };
-  }, [mgrInstance]);
-  useEffect(() => {
-    const handleDragOver2 = (e) => {
-      if (!allowDragOpen) return;
-      e.preventDefault();
-      e.stopPropagation();
-    };
-    const handleDrop2 = async (e) => {
-      if (!allowDragOpen) return;
-      e.preventDefault();
-      e.stopPropagation();
-      if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
-        const files = Array.from(e.dataTransfer.files);
-        const supportedExtensions = [".lmb", ".glb", ".gltf", ".ifc", ".nbim", ".fbx", ".obj", ".stl", ".ply", ".3ds", ".dae", ".stp", ".step", ".igs", ".iges"];
-        const unsupportedFiles = files.filter((f) => {
-          const ext = "." + f.name.split(".").pop()?.toLowerCase();
-          return !supportedExtensions.includes(ext);
-        });
-        if (unsupportedFiles.length > 0) {
-          setToast({
-            message: `${t("failed")}: 不支持的格式 - ${unsupportedFiles.map((f) => f.name).join(", ")}`,
-            type: "error"
-          });
-        }
-        const supportedFiles = files.filter((f) => {
-          const ext = "." + f.name.split(".").pop()?.toLowerCase();
-          return supportedExtensions.includes(ext);
-        });
-        if (supportedFiles.length > 0) {
-          await processFiles(supportedFiles);
+    if (snapshot.selectedUuids !== void 0) {
+      setSelectedUuids(snapshot.selectedUuids);
+      setSelectedProps(null);
+      manager.highlightObjects(snapshot.selectedUuids);
+      if (snapshot.selectedUuids.length === 1) {
+        const target = manager.contentGroup.getObjectByProperty("uuid", snapshot.selectedUuids[0]);
+        if (target) {
+          await handleSelect(target);
         }
       }
-    };
-    window.addEventListener("dragover", handleDragOver2);
-    window.addEventListener("drop", handleDrop2);
-    return () => {
-      window.removeEventListener("dragover", handleDragOver2);
-      window.removeEventListener("drop", handleDrop2);
-    };
-  }, [lang, allowDragOpen, t]);
+    }
+  }
+  const {
+    viewpoints,
+    handleSaveViewpoint,
+    handleUpdateViewpointName,
+    handleLoadViewpoint,
+    handleOverwriteViewpoint,
+    handleDeleteViewpoint
+  } = useViewpoints({
+    currentFileSetId,
+    sceneMgrRef: sceneMgr,
+    setToast,
+    setConfirmState,
+    t,
+    captureStateSnapshot: captureViewpointStateSnapshot,
+    restoreStateSnapshot: restoreViewpointStateSnapshot
+  });
   useEffect(() => {
     if (mgrInstance) {
       requestAnimationFrame(() => {
@@ -10665,130 +15040,29 @@ const ThreeViewer = ({
       return roots;
     });
   }, []);
-  useCallback((expanded) => {
-    const update = (nodes) => {
-      return nodes.map((n) => ({
-        ...n,
-        expanded,
-        children: n.children && n.children.length > 0 ? update(n.children) : n.children
-      }));
-    };
-    setTreeRoot((prev) => update(prev));
-  }, []);
-  const handleApplyIfcFiltersToViewport = useCallback((filters) => {
-    if (!sceneMgr.current) return;
-    const hasActiveFilters = Object.values(filters).some(Boolean);
-    if (!hasActiveFilters) {
-      handleShowAll();
-      return;
-    }
-    const matches = [];
-    sceneMgr.current.contentGroup.traverse((obj) => {
-      if (!obj.isMesh) return;
-      const meta = obj.userData?.ifcMetadata;
-      if (!meta) return;
-      if (filters.storey && meta.storey !== filters.storey) return;
-      if (filters.elevation && String(meta.elevation) !== filters.elevation) return;
-      if (filters.category && meta.category !== filters.category) return;
-      if (filters.system && !(meta.systems || []).includes(filters.system)) return;
-      if (filters.material && !(meta.materials || []).includes(filters.material)) return;
-      matches.push(obj.uuid);
-    });
-    if (matches.length === 0) {
-      setToast({
-        message: `${t("failed")}: ${t("no_matching_ifc_filter") || "没有匹配当前 IFC 筛选的构件"}`,
-        type: "info"
-      });
-      return;
-    }
-    sceneMgr.current.isolateObjects(matches);
-    setHiddenUuids(/* @__PURE__ */ new Set());
-    setIsolatedUuids(new Set(matches));
-    setSelectedUuids([]);
-    setSelectedProps(null);
-    setSelectedIfcStorey("");
-    updateTree();
-    setToast({
-      message: `${t("ifc_filter_applied") || "已按 IFC 筛选隔离显示"}: ${matches.length}`,
-      type: "success"
-    });
-  }, [handleShowAll, t, updateTree]);
-  const handleApplyStoreyWorkset = useCallback((storeys) => {
-    if (!sceneMgr.current || storeys.length === 0) return;
-    const storeySet = new Set(storeys.filter(Boolean));
-    if (storeySet.size === 0) return;
-    const matches = [];
-    sceneMgr.current.contentGroup.traverse((obj) => {
-      if (!obj.isMesh) return;
-      const storey = obj.userData?.ifcMetadata?.storey;
-      if (storey && storeySet.has(storey)) {
-        matches.push(obj.uuid);
-      }
-    });
-    if (matches.length === 0) {
-      setToast({
-        message: `${t("failed")}: ${t("no_matching_ifc_filter") || "没有匹配当前 IFC 筛选的构件"}`,
-        type: "info"
-      });
-      return;
-    }
-    sceneMgr.current.isolateObjects(matches);
-    setHiddenUuids(/* @__PURE__ */ new Set());
-    setIsolatedUuids(new Set(matches));
-    setSelectedUuids([]);
-    setSelectedProps(null);
-    setSelectedIfcStorey("");
-    updateTree();
-    setToast({
-      message: `${t("ifc_workset_applied") || "已按楼层工作集隔离显示"}: ${storeys.join(" / ")}`,
-      type: "success"
-    });
-  }, [t, updateTree]);
-  const handleToggleVisibility = (uuid, visible) => {
-    if (!sceneMgr.current) return;
-    visibilityStackRef.current.push([{ uuid, visible: !visible }]);
-    sceneMgr.current.setObjectVisibility(uuid, visible);
-    if (visible) {
-      const next = new Set(hiddenUuids);
-      next.delete(uuid);
-      setHiddenUuids(next);
-    } else {
-      const next = new Set(hiddenUuids);
-      next.add(uuid);
-      setHiddenUuids(next);
-    }
-    updateTree();
-  };
-  const handleHideObject = useCallback((uuid) => {
-    if (!sceneMgr.current) return;
-    visibilityStackRef.current.push([{ uuid, visible: true }]);
-    sceneMgr.current.setObjectVisibility(uuid, false);
-    setHiddenUuids((prev) => new Set(prev).add(uuid));
-    setSelectedUuids((prev) => prev.filter((id) => id !== uuid));
-    updateTree();
-  }, [updateTree]);
-  const handleIsolateObject = useCallback((uuid) => {
-    if (!sceneMgr.current) return;
-    sceneMgr.current.isolateObjects([uuid]);
-    setHiddenUuids(/* @__PURE__ */ new Set());
-    setIsolatedUuids(/* @__PURE__ */ new Set([uuid]));
-    setSelectedUuids([uuid]);
-    sceneMgr.current.highlightObjects([uuid]);
-    updateTree();
-  }, [updateTree]);
-  const handleUndoVisibility = useCallback(() => {
-    if (visibilityStackRef.current.length === 0 || !sceneMgr.current) return;
-    const lastAction = visibilityStackRef.current.pop();
-    if (!lastAction) return;
-    const nextHidden = new Set(hiddenUuids);
-    lastAction.forEach((change) => {
-      sceneMgr.current?.setObjectVisibility(change.uuid, change.visible);
-      if (change.visible) nextHidden.delete(change.uuid);
-      else nextHidden.add(change.uuid);
-    });
-    setHiddenUuids(nextHidden);
-    updateTree();
-  }, [hiddenUuids]);
+  const {
+    contextMenu,
+    hiddenUuids,
+    isolatedUuids,
+    setHiddenUuids,
+    setIsolatedUuids,
+    handleContextMenu,
+    closeContextMenu,
+    handleHideSelected,
+    handleShowAll,
+    handleToggleVisibility,
+    handleHideObject,
+    handleIsolateObject,
+    handleIsolateSelection,
+    handleUndoVisibility
+  } = useViewerVisibility({
+    sceneMgrRef: sceneMgr,
+    selectedUuids,
+    setSelectedUuids,
+    setSelectedProps,
+    updateTree,
+    resetLocateState: () => resetLocateStateRef.current()
+  });
   const handleDeleteObject = (uuid) => {
     if (!sceneMgr.current) return;
     const obj = sceneMgr.current.contentGroup.getObjectByProperty("uuid", uuid);
@@ -10825,7 +15099,7 @@ const ThreeViewer = ({
   };
   const handleClearSelection = () => {
     clearSelection();
-    setSelectedIfcStorey("");
+    setSelectedProps(null);
     sceneMgr.current?.highlightObjects([]);
   };
   useEffect(() => {
@@ -10838,17 +15112,11 @@ const ThreeViewer = ({
     setMgrInstance(manager);
     if (onLoad) onLoad(manager);
     manager.updateSettings(sceneSettings);
-    manager.setClipHelperOptions({
-      visible: clipHelperVisible,
-      opacity: clipHelperOpacity
-    });
     requestAnimationFrame(() => {
       manager.resize();
     });
     manager.onChunkProgress = handleManagerChunkProgress;
-    manager.onMeasureUpdate = (records) => {
-      setMeasureHistory(records.map((r) => ({ id: r.id, type: r.type, val: r.val })));
-    };
+    manager.onMeasureUpdate = handleMeasureUpdate;
     manager.onStructureUpdate = () => {
       updateTree();
     };
@@ -10856,20 +15124,6 @@ const ThreeViewer = ({
       manager.dispose();
     };
   }, []);
-  useEffect(() => {
-    if (!mgrInstance || !showStats) return;
-    const updateStats = () => {
-      if (document.visibilityState !== "visible") return;
-      setStats(mgrInstance.getStats());
-    };
-    updateStats();
-    const statsInterval = window.setInterval(updateStats, 1e3);
-    document.addEventListener("visibilitychange", updateStats);
-    return () => {
-      window.clearInterval(statsInterval);
-      document.removeEventListener("visibilitychange", updateStats);
-    };
-  }, [mgrInstance, showStats]);
   useEffect(() => {
     if (!mgrInstance || !initialFiles) return;
     const loadInitial = async () => {
@@ -10879,435 +15133,145 @@ const ThreeViewer = ({
     };
     loadInitial();
   }, [mgrInstance, initialFiles]);
-  useEffect(() => {
-    const mgr = sceneMgr.current;
-    if (!mgr) return;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const clickMoveThreshold = 6;
-    const handleMouseDown = (e) => {
-      pointerDownRef.current = {
-        x: e.clientX,
-        y: e.clientY,
-        moved: false,
-        button: e.button
-      };
-    };
-    const handleClick = (e) => {
-      const pointerState = pointerDownRef.current;
-      if (!pointerState || pointerState.button !== 0 || pointerState.moved) {
-        pointerDownRef.current = null;
-        return;
-      }
-      pointerDownRef.current = null;
-      if (activeTool === "boxSelect") return;
-      if (activeTool === "measure") {
-        if (measureType !== "none") {
-          const intersect = mgr.getRayIntersects(e.clientX, e.clientY);
-          if (intersect) {
-            const modelUuid = intersect.object.uuid;
-            mgr.addMeasurePoint(intersect.point, modelUuid);
-            return;
-          }
-        }
-        const mId = mgr.pickMeasurement(e.clientX, e.clientY);
-        if (mId) {
-          setHighlightedMeasureId(mId);
-          mgr.highlightMeasurement(mId);
-          return;
-        }
-        setHighlightedMeasureId(null);
-        mgr.highlightMeasurement(null);
-        return;
-      }
-      if (pickEnabled) {
-        const result = mgr.pick(e.clientX, e.clientY);
-        handleSelect(result ? result.object : null, result ? result.intersect : null, e.ctrlKey);
-      }
-    };
-    const handleMouseMove = (e) => {
-      if (pointerDownRef.current && !pointerDownRef.current.moved) {
-        const dx = e.clientX - pointerDownRef.current.x;
-        const dy = e.clientY - pointerDownRef.current.y;
-        if (dx * dx + dy * dy > clickMoveThreshold * clickMoveThreshold) {
-          pointerDownRef.current.moved = true;
-        }
-      }
-      if (activeTool === "measure") {
-        mgr.updateMeasureHover(e.clientX, e.clientY);
-        setMousePos(null);
-        return;
-      }
-      if (e.buttons !== 0) {
-        pendingMousePointRef.current = null;
-        if (mouseMoveRafRef.current !== null) {
-          cancelAnimationFrame(mouseMoveRafRef.current);
-          mouseMoveRafRef.current = null;
-        }
-        setMousePos(null);
-        return;
-      }
-      pendingMousePointRef.current = { x: e.clientX, y: e.clientY };
-      if (mouseMoveRafRef.current !== null) return;
-      mouseMoveRafRef.current = requestAnimationFrame(() => {
-        mouseMoveRafRef.current = null;
-        const pending = pendingMousePointRef.current;
-        if (!pending) return;
-        const intersect = mgr.getRayIntersects(pending.x, pending.y);
-        if (intersect) {
-          setMousePos(intersect.point);
-        } else {
-          setMousePos(null);
-        }
-      });
-    };
-    const handleContextMenu = (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      let initialOpacity = 1;
-      if (selectedUuids.length > 0 && mgr) {
-        const obj = mgr.contentGroup.getObjectByProperty("uuid", selectedUuids[0]);
-        if (obj) {
-          let found = false;
-          obj.traverse((child) => {
-            if (!found && child.isMesh && child.material) {
-              const m = Array.isArray(child.material) ? child.material[0] : child.material;
-              if (m.opacity !== void 0) {
-                initialOpacity = m.opacity;
-                found = true;
-              }
-            }
-          });
-        }
-      }
-      setContextMenuOpacity(initialOpacity);
-      setContextMenu({
-        x: e.clientX,
-        y: e.clientY,
-        visible: true
-      });
-    };
-    const handleKeyDown = (e) => {
-      if ((e.key === "z" || e.key === "Z") && (e.ctrlKey || e.metaKey)) {
-        handleUndoVisibility();
-        return;
-      }
-      if (e.key === "Escape") {
-        if (activeTool === "measure" && measureType !== "none") {
-          setMeasureType("none");
-          mgr.startMeasurement("none");
-        }
-        if (activeTool === "boxSelect") {
-          mgr.cancelBoxSelect();
-          setActiveTool("none");
-        }
-        setSelectedUuids([]);
-        setSelectedProps(null);
-        mgr.highlightObjects([]);
-      }
-    };
-    canvas.addEventListener("mousedown", handleMouseDown);
-    canvas.addEventListener("click", handleClick);
-    canvas.addEventListener("mousemove", handleMouseMove);
-    canvas.addEventListener("contextmenu", handleContextMenu);
-    window.addEventListener("keydown", handleKeyDown);
-    return () => {
-      if (mouseMoveRafRef.current !== null) {
-        cancelAnimationFrame(mouseMoveRafRef.current);
-        mouseMoveRafRef.current = null;
-      }
-      pendingMousePointRef.current = null;
-      canvas.removeEventListener("mousedown", handleMouseDown);
-      canvas.removeEventListener("click", handleClick);
-      canvas.removeEventListener("mousemove", handleMouseMove);
-      canvas.removeEventListener("contextmenu", handleContextMenu);
-      window.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [pickEnabled, selectedUuids, activeTool, measureType]);
-  useEffect(() => {
-    const mgr = sceneMgr.current;
-    if (!mgr || activeTool !== "boxSelect") return;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    mgr.controls.mouseButtons.LEFT = void 0;
-    const onPointerDown = (e) => {
-      if (e.button !== 0) return;
-      mgr.startBoxSelect(e.clientX, e.clientY);
-    };
-    const onPointerMove = (e) => {
-      mgr.updateBoxSelect(e.clientX, e.clientY);
-    };
-    const onPointerUp = (e) => {
-      if (e.button !== 0) return;
-      const uuids = mgr.endBoxSelect();
-      if (uuids.length > 0) {
-        const nextUuids = e.shiftKey ? [.../* @__PURE__ */ new Set([...selectedUuids, ...uuids])] : uuids;
-        setSelectedUuids(nextUuids);
-        mgr.highlightObjects(nextUuids);
-      }
-    };
-    canvas.addEventListener("pointerdown", onPointerDown);
-    window.addEventListener("pointermove", onPointerMove);
-    window.addEventListener("pointerup", onPointerUp);
-    return () => {
-      canvas.removeEventListener("pointerdown", onPointerDown);
-      window.removeEventListener("pointermove", onPointerMove);
-      window.removeEventListener("pointerup", onPointerUp);
-      if (mgr.controls) {
-        mgr.controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
-      }
-      mgr.cancelBoxSelect();
-    };
-  }, [activeTool]);
-  useEffect(() => {
-    const mgr = sceneMgr.current;
-    if (!mgr) return;
-    if (activeTool !== "measure") {
-      mgr.clearMeasurementPreview();
-      mgr.highlightMeasurement(null);
-      setHighlightedMeasureId(null);
-      setMeasureType("none");
-    }
-    if (activeTool !== "clip") {
-      mgr.setClippingEnabled(false);
-      setClipEnabled(false);
-    }
-  }, [activeTool]);
   const handleSettingsUpdate = (newSettings) => {
     const merged = {
       ...sceneSettings,
-      ...newSettings,
-      ...sceneBgFollowsTheme && newSettings.bgColor === void 0 ? { bgColor: theme.canvasBg } : {}
+      ...newSettings
     };
     setSceneSettings(merged);
     if (sceneMgr.current) {
       sceneMgr.current.updateSettings(merged);
     }
   };
-  useEffect(() => {
-    if (activeTool === "clip" && sceneMgr.current) {
-      sceneMgr.current.setClippingEnabled(clipEnabled);
-      if (clipEnabled) {
-        let box = sceneMgr.current.computeTotalBounds(true);
-        if (box.isEmpty()) {
-          box = sceneMgr.current.computeTotalBounds(false);
+  const {
+    locatedUuid,
+    locateResultUuids,
+    resetLocateState,
+    handleSelect,
+    handleLocateObject,
+    handleLocateResultsChange,
+    handleClearLocate
+  } = useViewerSelection({
+    sceneMgrRef: sceneMgr,
+    selectedUuids,
+    setSelectedUuids,
+    setSelectedProps,
+    setHiddenUuids,
+    setIsolatedUuids,
+    updateTree,
+    propOnSelect,
+    ifcPropertyCacheRef,
+    clashSummaryByUuid,
+    focusObjectsInView,
+    t,
+    isDev: IS_DEV
+  });
+  resetLocateStateRef.current = resetLocateState;
+  const {
+    searchConditions,
+    setSearchConditions,
+    searchResults,
+    searching,
+    searchProgress,
+    searchStatus,
+    handleRunPropertySearch,
+    handleApplySearchResultHighlight,
+    handleClearSearchResult,
+    handleCancelSearch
+  } = usePropertySearch({
+    sceneMgrRef: sceneMgr,
+    selectedUuids,
+    setSelectedUuids,
+    onSelectObject: handleSelect,
+    focusObjectsInView,
+    t,
+    setToast
+  });
+  const modeTrayItems = useMemo(() => {
+    const items = [];
+    if (measureType !== "none") {
+      items.push({
+        key: "measure",
+        label: t("mode_measure"),
+        onClear: () => {
+          setMeasureType("none");
+          setActiveTool("none");
+          sceneMgr.current?.clearMeasurementPreview();
         }
-        if (!box.isEmpty()) {
-          sceneMgr.current.updateClippingPlanes(box, clipValues, clipActive);
+      });
+    }
+    if (clipEnabled) {
+      items.push({
+        key: "clip",
+        label: t("mode_clip"),
+        onClear: () => {
+          setClipEnabled(false);
+          setActiveTool("none");
         }
-      }
+      });
     }
-  }, [clipEnabled, clipValues, clipActive, activeTool]);
-  useEffect(() => {
-    if (sceneMgr.current) {
-      sceneMgr.current.startMeasurement(measureType);
+    if (searchResults.length > 0) {
+      items.push({
+        key: "search",
+        label: `${t("mode_search")} ${searchResults.length}`,
+        onClear: handleClearSearchResult
+      });
     }
-  }, [measureType]);
-  useEffect(() => {
+    if (hiddenUuids.size > 0) {
+      items.push({
+        key: "hidden",
+        label: `${t("mode_hidden")} ${hiddenUuids.size}`,
+        onClear: handleShowAll
+      });
+    }
+    if (isolatedUuids.size > 0) {
+      items.push({
+        key: "isolated",
+        label: `${t("mode_isolated")} ${isolatedUuids.size}`,
+        onClear: handleShowAll
+      });
+    }
+    if (activeTool === "boxSelect") {
+      items.push({
+        key: "boxSelect",
+        label: t("mode_box_select"),
+        onClear: () => setActiveTool("none")
+      });
+    }
+    if (clashResults.length > 0) {
+      items.push({
+        key: "clash",
+        label: `${t("mode_clash")} ${clashResults.length}`,
+        onClear: handleClearClashResults
+      });
+    }
+    return items;
+  }, [
+    activeTool,
+    clashResults.length,
+    clipEnabled,
+    handleClearClashResults,
+    handleClearSearchResult,
+    handleShowAll,
+    hiddenUuids.size,
+    isolatedUuids.size,
+    measureType,
+    searchResults.length,
+    t
+  ]);
+  const handleIsolateClashByStatus = useCallback((status2) => {
     if (!sceneMgr.current) return;
-    sceneMgr.current.setExplodeEnabled(explodeEnabled);
-  }, [explodeEnabled]);
-  useEffect(() => {
-    if (!sceneMgr.current) return;
-    sceneMgr.current.setExplodeStrength(explodeStrength);
-  }, [explodeStrength]);
-  useEffect(() => {
-    if (!sceneMgr.current) return;
-    sceneMgr.current.setExplodeMode(explodeMode);
-  }, [explodeMode]);
-  const handleSelect = async (obj, _intersect, isMultiSelect = false) => {
-    if (!sceneMgr.current) return;
-    if (!obj) {
-      setSelectedUuids([]);
-      setSelectedProps(null);
-      setSelectedIfcStorey("");
-      sceneMgr.current.highlightObjects([]);
-      return;
-    }
-    const rawUuid = obj.uuid || obj.id;
-    const uuid = sceneMgr.current ? sceneMgr.current.resolveSelectionUuid(rawUuid) : rawUuid;
-    if (!uuid) return;
-    const nextUuids = isMultiSelect ? selectedUuids.includes(uuid) ? selectedUuids.filter((id) => id !== uuid) : [...selectedUuids, uuid] : [uuid];
-    setSelectedUuids(nextUuids);
-    sceneMgr.current.highlightObjects(nextUuids);
-    const focusUuid = nextUuids.length > 0 ? nextUuids[nextUuids.length - 1] : null;
-    if (!focusUuid) {
-      setSelectedProps(null);
-      return;
-    }
-    if (propOnSelect) propOnSelect(focusUuid, obj);
-    let realObj = focusUuid === uuid && obj instanceof THREE.Object3D ? obj : sceneMgr.current.contentGroup.getObjectByProperty("uuid", focusUuid);
-    if (!realObj) {
-      const nodes = sceneMgr.current.getStructureNodes(focusUuid);
-      if (nodes && nodes.length > 0) realObj = nodes[0];
-    }
-    if (!realObj && sceneMgr.current) ;
-    const target = realObj || obj;
-    const targetStorey = target?.userData?.ifcMetadata?.storey || (target instanceof THREE.Object3D ? (() => {
-      let cursor = target;
-      while (cursor) {
-        const storey = cursor.userData?.ifcMetadata?.storey;
-        if (storey) return storey;
-        cursor = cursor.parent;
-      }
-      return "";
-    })() : "");
-    setSelectedIfcStorey(targetStorey || "");
-    const targetElevation = typeof target?.userData?.ifcMetadata?.elevation === "number" ? target.userData.ifcMetadata.elevation : target instanceof THREE.Object3D ? (() => {
-      let cursor = target;
-      while (cursor) {
-        const elevation = cursor.userData?.ifcMetadata?.elevation;
-        if (typeof elevation === "number" && Number.isFinite(elevation)) return elevation;
-        cursor = cursor.parent;
-      }
-      return void 0;
-    })() : void 0;
-    const basicProps = {};
-    const geoProps = {};
-    let ifcGroups = null;
-    const wrappedId = sceneMgr.current?.getBimIdByUuid(focusUuid) || focusUuid;
-    basicProps[t("prop_id")] = wrappedId;
-    basicProps[t("prop_type")] = target.type || (target.children ? "Group" : "Mesh");
-    if (typeof targetElevation === "number" && Number.isFinite(targetElevation)) {
-      basicProps[t("prop_storey_elevation") || "楼层标高"] = String(targetElevation);
-    }
-    if (target.getWorldPosition) {
-      const worldPos = new THREE.Vector3();
-      target.getWorldPosition(worldPos);
-      geoProps[t("prop_pos")] = `${worldPos.x.toFixed(2)}, ${worldPos.y.toFixed(2)}, ${worldPos.z.toFixed(2)}`;
-    }
-    if (target.isMesh || target.type === "Mesh") {
-      if (target instanceof THREE.Mesh) {
-        const box = new THREE.Box3().setFromObject(target);
-        const size = new THREE.Vector3();
-        box.getSize(size);
-        geoProps[t("prop_dim")] = `${size.x.toFixed(2)} x ${size.y.toFixed(2)} x ${size.z.toFixed(2)}`;
-        if (target.geometry) {
-          geoProps[t("prop_vert")] = (target.geometry.attributes.position?.count || 0).toLocaleString();
-          if (target.geometry.index) {
-            geoProps[t("prop_tri")] = (target.geometry.index.count / 3).toLocaleString();
-          } else {
-            geoProps[t("prop_tri")] = ((target.geometry.attributes.position?.count || 0) / 3).toLocaleString();
-          }
-        }
-      } else if (target.userData?.boundingBox) {
-        const size = new THREE.Vector3();
-        target.userData.boundingBox.getSize(size);
-        geoProps[t("prop_dim")] = `${size.x.toFixed(2)} x ${size.y.toFixed(2)} x ${size.z.toFixed(2)}`;
-      }
-      if (target.isInstancedMesh) {
-        geoProps[t("prop_inst")] = target.count.toLocaleString();
-      }
-      const geometryData = sceneMgr.current.getObjectGeometryData(focusUuid);
-      if (geometryData.area > 0) {
-        geoProps[t("prop_area")] = geometryData.area.toFixed(3);
-      }
-      if (geometryData.volume > 0) {
-        geoProps[t("prop_volume")] = geometryData.volume.toFixed(3);
-      }
-    } else if (target.userData?.boundingBox) {
-      const size = new THREE.Vector3();
-      target.userData.boundingBox.getSize(size);
-      geoProps[t("prop_dim")] = `${size.x.toFixed(2)} x ${size.y.toFixed(2)} x ${size.z.toFixed(2)}`;
-    }
-    const resolveIfcContext = (candidate) => {
-      let cursor = candidate instanceof THREE.Object3D ? candidate : null;
-      let expressID = candidate?.userData?.expressID;
-      while (cursor) {
-        if (cursor.userData?.expressID !== void 0 && expressID === void 0) {
-          expressID = cursor.userData.expressID;
-        }
-        if (cursor.userData?.ifcManager && cursor.userData?.modelID !== void 0) {
-          return {
-            ifcRoot: cursor,
-            expressID
-          };
-        }
-        cursor = cursor.parent;
-      }
-      return null;
-    };
-    const ifcContext = resolveIfcContext(target);
-    if (ifcContext?.ifcRoot && ifcContext.expressID !== void 0) {
-      try {
-        const cacheKey = `${ifcContext.ifcRoot.userData.modelID}:${ifcContext.expressID}`;
-        ifcGroups = ifcPropertyCacheRef.current.get(cacheKey) || null;
-        if (!ifcGroups) {
-          const ifcMgr = ifcContext.ifcRoot.userData.ifcManager;
-          const ifcProps = await ifcMgr.getItemProperties(ifcContext.ifcRoot.userData.modelID, ifcContext.expressID);
-          ifcGroups = ifcProps?.rawGroups || ifcProps?.groups || ifcProps?.normalizedGroups || null;
-          if (ifcGroups) {
-            ifcPropertyCacheRef.current.set(cacheKey, ifcGroups);
-          }
-        }
-      } catch (e) {
-        console.error("IFC Props Error", e);
-      }
-    }
-    const nbimProps = sceneMgr.current.getNbimProperties(focusUuid);
-    const nbimIfcGroups = sceneMgr.current.getNbimIfcPropertyGroups(focusUuid, "raw");
-    if (IS_DEV && nbimProps && Object.keys(nbimProps).length > 0) {
-      console.group(`NBIM 选中属性: ${focusUuid}`);
-      console.log(nbimProps);
-      console.log(JSON.stringify(nbimProps, null, 2));
-      console.groupEnd();
-    }
-    if (IS_DEV && nbimIfcGroups) {
-      console.group(`NBIM IFC 组属性: ${focusUuid}`);
-      console.log(nbimIfcGroups);
-      console.log(JSON.stringify(nbimIfcGroups, null, 2));
-      console.groupEnd();
-    }
-    const mergedIfcGroups = ifcGroups || nbimIfcGroups || null;
-    const selectedGroups = buildSelectedPropertyGroups({
-      basicLabel: t("pg_basic"),
-      geoLabel: t("pg_geo"),
-      basicProps,
-      geoProps,
-      ifcProps: mergedIfcGroups,
-      nbimProps
-    });
-    setSelectedProps(selectedGroups);
-  };
-  const handleLocateObject = useCallback((obj) => {
-    if (!sceneMgr.current || !obj) return;
-    const uuid = obj.uuid || obj.id;
-    if (!uuid) return;
-    setLocatedUuid(uuid);
+    const uuids = Array.from(new Set(
+      clashResults.filter((item) => item.status === status2).flatMap((item) => [item.aUuid, item.bUuid]).filter(Boolean)
+    ));
+    if (uuids.length === 0) return;
     sceneMgr.current.clearLocateFocus();
-    sceneMgr.current.isolateObjects([uuid]);
+    sceneMgr.current.isolateObjects(uuids);
     setHiddenUuids(/* @__PURE__ */ new Set());
-    setIsolatedUuids(/* @__PURE__ */ new Set([uuid]));
+    setIsolatedUuids(new Set(uuids));
     updateTree();
-    sceneMgr.current.fitViewToObject(uuid);
-    void handleSelect(obj);
-  }, [handleSelect, updateTree]);
-  const handleLocateResultsChange = useCallback((uuids) => {
-    setLocateResultUuids((prev) => {
-      if (prev.length === uuids.length && prev.every((uuid, index) => uuid === uuids[index])) {
-        return prev;
-      }
-      return uuids;
-    });
-    if (!sceneMgr.current) return;
-    if (uuids.length === 0) {
-      sceneMgr.current.clearLocateFocus();
-      sceneMgr.current.setAllVisibility(true);
-      setHiddenUuids(/* @__PURE__ */ new Set());
-      setIsolatedUuids(/* @__PURE__ */ new Set());
-      updateTree();
-    }
-  }, [updateTree]);
-  const handleClearLocate = useCallback(() => {
-    setLocatedUuid(null);
-    setLocateResultUuids([]);
-    sceneMgr.current?.clearLocateFocus();
-    sceneMgr.current?.setAllVisibility(true);
-    setHiddenUuids(/* @__PURE__ */ new Set());
-    setIsolatedUuids(/* @__PURE__ */ new Set());
-    sceneMgr.current?.highlightObjects(selectedUuids);
-    updateTree();
-  }, [selectedUuids, updateTree]);
+    sceneMgr.current.fitViewToObjects(uuids);
+  }, [clashResults, updateTree]);
   const { processFiles, loadItemsIntoScene } = useFileLoadingFlow({
     managerRef: sceneMgr,
     sceneSettings,
@@ -11320,250 +15284,83 @@ const ThreeViewer = ({
     setToast,
     updateTree
   });
-  const handleOpenFiles = async (e) => {
-    if (!e.target.files?.length) return;
-    await processFiles(Array.from(e.target.files));
-    e.target.value = "";
-  };
-  const handleBatchConvert = async (e) => {
-    if (!e.target.files?.length || !sceneMgr.current) return;
-    const files = Array.from(e.target.files);
-    e.target.value = "";
-    const invalid = files.filter((f) => f.name.toLowerCase().endsWith(".nbim"));
-    if (invalid.length > 0) {
-      setToast({ message: t("unsupported_format"), type: "info" });
-      return;
-    }
-    sceneMgr.current.setChunkLoadingEnabled?.(false);
-    sceneMgr.current.setContentVisible?.(false);
-    setLoading(true);
-    setStatus(t("processing") + "...");
-    setProgress(0);
-    setActiveTool("none");
-    try {
-      await sceneMgr.current.clear();
-      setSelectedUuids([]);
-      setSelectedProps(null);
-      setMeasureHistory([]);
-      updateTree();
-      await loadItemsIntoScene(files);
-      updateTree();
-      setStatus(t("processing") + "...");
-      await sceneMgr.current.exportNbim();
-      setStatus(t("success"));
-      setToast({ message: t("success"), type: "success" });
-    } catch (err) {
-      console.error("[ThreeViewer] handleBatchConvert error:", err);
-      setStatus(t("failed"));
-      setToast({ message: `${t("failed")}: ${err.message}`, type: "error" });
-    } finally {
-      try {
-        await sceneMgr.current?.clear();
-        updateTree();
-      } catch {
-      }
-      sceneMgr.current.setChunkLoadingEnabled?.(true);
-      sceneMgr.current.setContentVisible?.(true);
-      setLoading(false);
-    }
-  };
-  const handleOpenUrl = async () => {
-    const url = window.prompt(t("menu_open_url"), "http://");
-    if (!url || !url.startsWith("http")) return;
-    if (IS_DEV) console.log("[ThreeViewer] handleOpenUrl called with:", url);
-    setLoading(true);
-    setStatus(t("processing") + "...");
-    try {
-      await processFiles([url]);
-    } catch (err) {
-      console.error("[ThreeViewer] handleOpenUrl error:", err);
-      setStatus(t("failed"));
-      setToast({ message: `${t("failed")}: ${err.message}`, type: "error" });
-    } finally {
-      setLoading(false);
-    }
-  };
-  const handleDragOver = (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-  };
-  const handleDrop = async (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      const files = Array.from(e.dataTransfer.files);
-      const supportedExtensions = [".lmb", ".glb", ".gltf", ".ifc", ".nbim", ".fbx", ".obj", ".stl", ".ply", ".3mf", ".stp", ".step", ".igs", ".iges"];
-      const validFiles = files.filter((file) => {
-        const ext = file.name.substring(file.name.lastIndexOf(".")).toLowerCase();
-        return supportedExtensions.includes(ext);
-      });
-      if (validFiles.length < files.length) {
-        setToast({ message: t("unsupported_format"), type: "info" });
-      }
-      if (validFiles.length > 0) {
-        await processFiles(validFiles);
-      }
-    }
-  };
-  const stripFileExtension = (name) => name.replace(/\.[^./\\]+$/, "");
-  const sanitizeFileStem = (name) => {
-    const sanitized = name.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, " ").trim();
-    return sanitized || "model";
-  };
-  const getExportModelNames = useCallback(() => {
-    if (!sceneMgr.current) return [];
-    const content = sceneMgr.current.contentGroup;
-    const names = [];
-    content.children.forEach((child) => {
-      if (child.userData?.isOptimizedGroup) return;
-      if (child.name.startsWith("optimized_")) return;
-      const rawName = (typeof child.userData?.modelName === "string" ? child.userData.modelName : "") || (child.children?.[0]?.name || "") || child.name;
-      const baseName = sanitizeFileStem(stripFileExtension(rawName));
-      names.push(baseName);
-    });
-    return Array.from(new Set(names));
-  }, []);
-  const getDefaultExportFileName = useCallback((format) => {
-    const modelNames = getExportModelNames();
-    if (modelNames.length === 1) {
-      return modelNames[0];
-    }
-    const now = /* @__PURE__ */ new Date();
-    const pad = (v) => String(v).padStart(2, "0");
-    const suffix = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-    return `${t("export_batch_name") || "批量导出"}_${suffix}`;
-  }, [getExportModelNames, t]);
-  const resolveExportFilename = (format, requestedName) => {
-    const fallback = getDefaultExportFileName(format);
-    const stem = sanitizeFileStem(stripFileExtension((requestedName || "").trim()) || fallback);
-    return `${stem}.${format}`;
-  };
-  const handleExport = async (format, requestedName) => {
-    if (!sceneMgr.current) return;
-    const content = sceneMgr.current.contentGroup;
-    const resolvedFileName = resolveExportFilename(format, requestedName);
-    const resolvedStem = stripFileExtension(resolvedFileName);
-    if (format === "nbim") {
-      if (content.children.length === 0) {
-        setToast({ message: t("no_models"), type: "info" });
-        return;
-      }
-      setLoading(true);
-      setStatus(t("processing") + "...");
-      setActiveTool("none");
-      setTimeout(async () => {
-        try {
-          await sceneMgr.current?.exportNbim(resolvedStem);
-          setToast({ message: t("success"), type: "success" });
-        } catch (e) {
-          console.error(e);
-          setToast({ message: t("failed") + ": " + e.message, type: "error" });
-        } finally {
-          setLoading(false);
-        }
-      }, 100);
-      return;
-    }
-    const modelsToExport = content.children.filter((c) => !c.userData.isOptimizedGroup);
-    if (modelsToExport.length === 0) {
-      setToast({ message: t("no_models"), type: "info" });
-      return;
-    }
-    const exportGroup = new THREE.Group();
-    modelsToExport.forEach((m) => exportGroup.add(m.clone()));
-    setLoading(true);
-    setProgress(0);
-    setStatus(t("processing") + "...");
-    setActiveTool("none");
-    setTimeout(async () => {
-      try {
-        let blob = null;
-        const filename = resolvedFileName;
-        if (format === "glb") {
-          blob = await exportGLB(exportGroup);
-        } else if (format === "lmb") {
-          blob = await exportLMB(exportGroup, (msg) => setStatus(cleanLoadingStatus(msg)));
-        }
-        if (blob) {
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement("a");
-          a.href = url;
-          a.download = filename;
-          a.click();
-          URL.revokeObjectURL(url);
-          setToast({ message: t("success"), type: "success" });
-        }
-      } catch (e) {
-        console.error(e);
-        setToast({ message: t("failed") + ": " + e.message, type: "error" });
-      } finally {
-        setLoading(false);
-        setProgress(0);
-      }
-    }, 100);
-  };
+  useViewportLifecycle({
+    allowDragOpen,
+    mgrInstance,
+    viewportRef,
+    t,
+    processFiles,
+    setToast,
+    setErrorState
+  });
+  const {
+    getDefaultExportFileName,
+    handleExport,
+    handleClear,
+    handleScreenshot
+  } = useViewerActions({
+    sceneMgrRef: sceneMgr,
+    t,
+    setLoading,
+    setProgress,
+    setStatus,
+    setToast,
+    setActiveTool,
+    setConfirmState,
+    setSelectedUuids,
+    setSelectedProps,
+    setChunkProgress,
+    resetLocateState,
+    clearSearchResult: handleClearSearchResult,
+    resetClashState,
+    resetMeasurementState,
+    resetExplodeState,
+    updateTree,
+    ifcPropertyCacheRef,
+    completedFileSetsRef
+  });
+  const {
+    handleOpenFiles,
+    handleBatchConvert,
+    handleOpenUrl,
+    handleDragOver,
+    handleDrop
+  } = useViewerFileActions({
+    sceneMgrRef: sceneMgr,
+    t,
+    processFiles,
+    loadItemsIntoScene,
+    setLoading,
+    setStatus,
+    setProgress,
+    setToast,
+    setActiveTool,
+    setSelectedUuids,
+    setSelectedProps,
+    resetMeasurementState,
+    updateTree,
+    isDev: IS_DEV
+  });
+  useViewerCanvasInteractions({
+    sceneMgrRef: sceneMgr,
+    canvasRef,
+    activeTool,
+    setActiveTool,
+    measureType,
+    setMeasureType,
+    pickEnabled,
+    selectedUuids,
+    setSelectedUuids,
+    setSelectedProps,
+    setMousePos,
+    setHighlightedMeasureId,
+    handleSelect,
+    handleContextMenu,
+    handleUndoVisibility,
+    clearSelectionState: handleClearSelection
+  });
   const handleView = (v) => {
     sceneMgr.current?.setView(v);
-  };
-  const handleClear = async () => {
-    if (!sceneMgr.current) return;
-    setConfirmState({
-      isOpen: true,
-      title: t("op_clear"),
-      message: t("confirm_clear"),
-      action: async () => {
-        setLoading(true);
-        setProgress(0);
-        setStatus(t("op_clear") + "...");
-        try {
-          await sceneMgr.current?.clear();
-          setSelectedUuids([]);
-          setLocatedUuid(null);
-          setSelectedProps(null);
-          setSelectedIfcStorey("");
-          ifcPropertyCacheRef.current.clear();
-          setMeasureHistory([]);
-          setChunkProgress({ loaded: 0, total: 0 });
-          completedFileSetsRef.current.clear();
-          setExplodeEnabled(false);
-          setExplodeStrength(32);
-          setExplodeMode("radial");
-          updateTree();
-          setStatus(t("ready"));
-        } catch (error) {
-          console.error("清空场景失败:", error);
-        } finally {
-          setLoading(false);
-        }
-      }
-    });
-  };
-  const handleScreenshot = (mode = "scene") => {
-    if (!sceneMgr.current) return;
-    try {
-      const renderer = sceneMgr.current.renderer;
-      const scene = sceneMgr.current.scene;
-      const previousBackground = scene.background;
-      if (mode === "transparent") {
-        scene.background = null;
-        renderer.setClearAlpha(0);
-      } else {
-        renderer.setClearAlpha(1);
-      }
-      renderer.render(scene, sceneMgr.current.camera);
-      const dataUrl = sceneMgr.current.canvas.toDataURL("image/png");
-      const a = document.createElement("a");
-      a.href = dataUrl;
-      a.download = mode === "transparent" ? "screenshot-transparent.png" : "screenshot.png";
-      a.click();
-      scene.background = previousBackground;
-      renderer.setClearAlpha(1);
-      renderer.render(scene, sceneMgr.current.camera);
-      setToast({ message: t("success"), type: "success" });
-    } catch (e) {
-      console.error(e);
-      setToast({ message: t("failed"), type: "error" });
-    }
   };
   const handleDisplayModeChange = (mode) => {
     if (!sceneMgr.current) return;
@@ -11589,20 +15386,7 @@ const ThreeViewer = ({
   return /* @__PURE__ */ jsx(ErrorBoundary, { t, theme, children: /* @__PURE__ */ jsxs(
     "div",
     {
-      className: `ui-container ${themeMode} font-medium`,
-      style: {
-        display: "flex",
-        flexDirection: "column",
-        height: "100%",
-        width: "100%",
-        backgroundColor: "var(--bg-primary)",
-        color: "var(--text-primary)",
-        fontSize: "var(--font-size-base)",
-        fontFamily: "inherit",
-        userSelect: "none",
-        overflow: "hidden",
-        position: "relative"
-      },
+      className: `ui-container ui-app-shell font-medium`,
       onDragOver: handleDragOver,
       onDrop: handleDrop,
       children: [
@@ -11610,8 +15394,6 @@ const ThreeViewer = ({
           Toolbar,
           {
             t,
-            themeType: themeMode,
-            setThemeType: setThemeMode,
             handleOpenFiles,
             handleBatchConvert,
             handleOpenUrl,
@@ -11637,11 +15419,8 @@ const ThreeViewer = ({
             hasModels
           }
         ),
-        /* @__PURE__ */ jsxs("div", { style: { flex: 1, display: "flex", position: "relative", overflow: "hidden" }, children: [
-          showOutline && /* @__PURE__ */ jsxs("div", { className: "ui-sidebar", style: {
-            width: `${leftWidth}px`,
-            borderRight: "1px solid var(--border-color)"
-          }, children: [
+        /* @__PURE__ */ jsxs("div", { className: "ui-main-layout", children: [
+          showOutline && /* @__PURE__ */ jsxs("div", { className: "ui-sidebar ui-sidebar-left", style: { width: `${leftWidth}px` }, children: [
             /* @__PURE__ */ jsxs("div", { className: "ui-sidebar-header", children: [
               /* @__PURE__ */ jsx("span", { children: t("interface_outline") }),
               /* @__PURE__ */ jsx(
@@ -11653,7 +15432,7 @@ const ThreeViewer = ({
                 }
               )
             ] }),
-            /* @__PURE__ */ jsx("div", { style: { flex: 1, overflow: "hidden" }, children: /* @__PURE__ */ jsx(
+            /* @__PURE__ */ jsx("div", { className: "ui-sidebar-content", children: /* @__PURE__ */ jsx(
               SceneTree,
               {
                 t,
@@ -11661,7 +15440,6 @@ const ThreeViewer = ({
                 setTreeRoot,
                 selectedUuid,
                 locatedUuid,
-                selectedStorey: selectedIfcStorey,
                 onSelect: (_uuid, obj) => handleSelect(obj),
                 onToggleVisibility: handleToggleVisibility,
                 onDelete: (obj) => {
@@ -11671,30 +15449,23 @@ const ThreeViewer = ({
                 onHide: handleHideObject,
                 onIsolate: handleIsolateObject,
                 onShowAll: handleShowAll,
-                onApplyIfcFiltersToViewport: handleApplyIfcFiltersToViewport,
-                onApplyStoreyWorkset: handleApplyStoreyWorkset,
                 onLocate: handleLocateObject,
                 onClearLocate: handleClearLocate,
                 onLocateResultsChange: handleLocateResultsChange,
-                locateResultUuids
+                locateResultUuids,
+                clashSummaryByUuid
               }
             ) }),
             /* @__PURE__ */ jsx(
               "div",
               {
-                className: "ui-sidebar-resize",
-                style: { right: -2 },
+                className: "ui-sidebar-resize ui-sidebar-resize-left",
                 onMouseDown: () => resizingLeft.current = true
               }
             )
           ] }),
-          /* @__PURE__ */ jsxs("div", { ref: viewportRef, style: {
-            flex: 1,
-            position: "relative",
-            backgroundColor: theme.canvasBg,
-            overflow: "hidden"
-          }, children: [
-            /* @__PURE__ */ jsx("canvas", { ref: canvasRef, style: { width: "100%", height: "100%", outline: "none" } }),
+          /* @__PURE__ */ jsxs("div", { ref: viewportRef, className: "ui-viewport-shell", style: { backgroundColor: theme.canvasBg }, children: [
+            /* @__PURE__ */ jsx("canvas", { ref: canvasRef, className: "ui-viewport-canvas" }),
             /* @__PURE__ */ jsx(ViewCube, { sceneMgr: mgrInstance, theme, lang }),
             contextMenu.visible && /* @__PURE__ */ jsx(
               ContextMenu,
@@ -11703,42 +15474,32 @@ const ThreeViewer = ({
                 y: contextMenu.y,
                 items: [
                   {
-                    label: t("hide_selected") || "隐藏选中",
+                    label: t("hide_selected"),
                     onClick: handleHideSelected,
                     disabled: selectedUuids.length === 0
                   },
                   {
-                    label: t("isolate_selection") || "隔离选中",
-                    onClick: () => {
-                      if (selectedUuids.length > 0 && sceneMgr.current) {
-                        const newIsolated = selectedUuids.filter((id) => !isolatedUuids.has(id));
-                        if (newIsolated.length > 0) {
-                          sceneMgr.current.isolateObjects(selectedUuids);
-                          setIsolatedUuids(/* @__PURE__ */ new Set([...isolatedUuids, ...newIsolated]));
-                        }
-                      }
-                    },
+                    label: t("isolate_selection"),
+                    onClick: handleIsolateSelection,
                     disabled: selectedUuids.length === 0
                   },
                   {
-                    label: t("clear_selection") || "清空选择",
+                    label: t("clear_selection"),
                     onClick: handleClearSelection,
                     disabled: selectedUuids.length === 0
                   },
                   {
-                    label: t("show_all") || "显示全部",
+                    label: t("show_all"),
                     onClick: handleShowAll
                   }
                 ],
-                onClose: () => setContextMenu((prev) => ({ ...prev, visible: false })),
+                onClose: closeContextMenu,
                 theme
               }
             ),
             toast && /* @__PURE__ */ jsxs("div", { className: "ui-toast", children: [
-              /* @__PURE__ */ jsx("div", { className: "ui-toast-dot", style: {
-                backgroundColor: toast.type === "error" ? "var(--error)" : toast.type === "success" ? "var(--success)" : "var(--info)"
-              } }),
-              /* @__PURE__ */ jsx("span", { style: { fontWeight: 500 }, children: toast.message }),
+              /* @__PURE__ */ jsx("div", { className: `ui-toast-dot ${toast.type === "error" ? "ui-toast-dot-error" : toast.type === "success" ? "ui-toast-dot-success" : "ui-toast-dot-info"}` }),
+              /* @__PURE__ */ jsx("span", { className: "ui-toast-message", children: toast.message }),
               /* @__PURE__ */ jsx(
                 "button",
                 {
@@ -11773,9 +15534,7 @@ const ThreeViewer = ({
                 },
                 onClear: () => {
                   sceneMgr.current?.clearAllMeasurements();
-                  setMeasureHistory([]);
-                  setHighlightedMeasureId(null);
-                  setMeasureType("none");
+                  resetMeasurementState();
                 },
                 onClose: () => setActiveTool("none"),
                 theme
@@ -11831,8 +15590,6 @@ const ThreeViewer = ({
                 onUpdate: handleSettingsUpdate,
                 currentLang: lang,
                 setLang,
-                themeMode,
-                setThemeMode: handleThemeModeChange,
                 showStats,
                 setShowStats,
                 theme
@@ -11852,13 +15609,69 @@ const ThreeViewer = ({
                 theme
               }
             ),
-            activeTool === "sun" && /* @__PURE__ */ jsx(
-              SunPanel,
+            activeTool === "search" && /* @__PURE__ */ jsx(
+              SearchPanel,
               {
                 t,
-                settings: sceneSettings,
-                onUpdate: handleSettingsUpdate,
                 onClose: () => setActiveTool("none"),
+                conditions: searchConditions,
+                results: searchResults,
+                searching,
+                searchProgress,
+                searchStatus,
+                onConditionsChange: setSearchConditions,
+                onSearch: () => void handleRunPropertySearch(),
+                onCancelSearch: handleCancelSearch,
+                onApplyResultHighlight: handleApplySearchResultHighlight,
+                onClearResult: handleClearSearchResult,
+                theme
+              }
+            ),
+            activeTool === "clash" && /* @__PURE__ */ jsx(
+              ClashPanel,
+              {
+                t,
+                onClose: () => setActiveTool("none"),
+                running: clashRunning,
+                progress: clashProgress,
+                status: clashStatus,
+                scannedCount: clashScannedCount,
+                pairsScanned: clashPairsScanned,
+                results: clashResults,
+                resultFilter: clashResultFilter,
+                modelOptions: clashModelOptions,
+                setA: clashSetA,
+                setB: clashSetB,
+                tolerance: clashTolerance,
+                minOverlapVolume: clashMinOverlapVolume,
+                clearanceDistance: clashClearanceDistance,
+                useNarrowPhase: clashUseNarrowPhase,
+                useTrianglePhase: clashUseTrianglePhase,
+                includeSameModel: clashIncludeSameModel,
+                onSetAChange: setClashSetA,
+                onSetBChange: setClashSetB,
+                onToleranceChange: setClashTolerance,
+                onMinOverlapVolumeChange: setClashMinOverlapVolume,
+                onClearanceDistanceChange: setClashClearanceDistance,
+                onUseNarrowPhaseChange: setClashUseNarrowPhase,
+                onUseTrianglePhaseChange: setClashUseTrianglePhase,
+                onIncludeSameModelChange: setClashIncludeSameModel,
+                onRun: () => void handleRunClashCheck(),
+                onCancel: handleCancelClashCheck,
+                onClear: handleClearClashResults,
+                onExportCsv: handleExportClashCsv,
+                onIsolateByStatus: handleIsolateClashByStatus,
+                onRestoreVisibility: handleShowAll,
+                onResultFilterChange: setClashResultFilter,
+                typeFilter: clashTypeFilter,
+                onTypeFilterChange: setClashTypeFilter,
+                onUpdateResultStatus: handleUpdateClashResultStatus,
+                onMarkFilteredStatus: handleMarkFilteredClashStatus,
+                onSetASelectAll: () => setClashSetA(clashModelOptions.map((item) => item.id)),
+                onSetAClear: () => setClashSetA([]),
+                onSetBSelectAll: () => setClashSetB(clashModelOptions.map((item) => item.id)),
+                onSetBClear: () => setClashSetB([]),
+                onFocusResult: handleFocusClashResult,
                 theme
               }
             ),
@@ -11874,19 +15687,14 @@ const ThreeViewer = ({
                 onStrengthChange: setExplodeStrength,
                 onModeChange: setExplodeMode,
                 onReset: () => {
-                  setExplodeEnabled(false);
-                  setExplodeStrength(32);
-                  setExplodeMode("radial");
+                  resetExplodeState();
                   sceneMgr.current?.resetExplode();
                 },
                 theme
               }
             )
           ] }),
-          showProps && /* @__PURE__ */ jsxs("div", { className: "ui-sidebar", style: {
-            width: `${rightWidth}px`,
-            borderLeft: `1px solid ${theme.border}`
-          }, children: [
+          showProps && /* @__PURE__ */ jsxs("div", { className: "ui-sidebar ui-sidebar-right", style: { width: `${rightWidth}px` }, children: [
             /* @__PURE__ */ jsxs("div", { className: "ui-sidebar-header", children: [
               /* @__PURE__ */ jsx("span", { children: t("interface_props") }),
               /* @__PURE__ */ jsx(
@@ -11898,13 +15706,12 @@ const ThreeViewer = ({
                 }
               )
             ] }),
-            /* @__PURE__ */ jsx("div", { style: { flex: 1, overflow: "hidden" }, children: /* @__PURE__ */ jsx(PropertiesPanel, { t, selectedProps, theme }) }),
+            /* @__PURE__ */ jsx("div", { className: "ui-sidebar-content", children: /* @__PURE__ */ jsx(PropertiesPanel, { t, selectedProps, theme }) }),
             /* @__PURE__ */ jsx(
               "div",
               {
                 onMouseDown: () => resizingRight.current = true,
-                className: "ui-sidebar-resize",
-                style: { left: -2 }
+                className: "ui-sidebar-resize ui-sidebar-resize-right"
               }
             )
           ] })
@@ -11916,20 +15723,20 @@ const ThreeViewer = ({
               progress,
               "%"
             ] }),
-            selectedUuid && selectedUuids.length > 1 && /* @__PURE__ */ jsxs("span", { style: { opacity: 0.8, paddingLeft: "8px", borderLeft: `1px solid ${theme.border}` }, children: [
-              t("selected_count") || "已选择",
+            selectedUuid && selectedUuids.length > 1 && /* @__PURE__ */ jsxs("span", { className: "ui-statusbar-meta", children: [
+              t("selected_count"),
               ": ",
               selectedUuids.length
             ] }),
             chunkProgress.total > 0 && chunkProgress.loaded < chunkProgress.total && /* @__PURE__ */ jsxs("div", { className: "ui-chunk-progress", children: [
               /* @__PURE__ */ jsxs("span", { children: [
-                t("chunk_loading") || "分片加载",
+                t("chunk_loading"),
                 ": ",
                 chunkProgress.loaded,
                 "/",
                 chunkProgress.total
               ] }),
-              /* @__PURE__ */ jsx("div", { className: "ui-progress-bar", style: { width: "80px" }, children: /* @__PURE__ */ jsx(
+              /* @__PURE__ */ jsx("div", { className: "ui-progress-bar ui-progress-bar-compact", children: /* @__PURE__ */ jsx(
                 "div",
                 {
                   className: "ui-progress-fill",
@@ -11937,10 +15744,13 @@ const ThreeViewer = ({
                 }
               ) })
             ] }),
-            (hiddenUuids.size > 0 || isolatedUuids.size > 0) && /* @__PURE__ */ jsx("button", { className: "ui-statusbar-tag", onClick: handleShowAll, children: hiddenUuids.size > 0 ? `${t("hide_selected") || "隐藏选中"} ${hiddenUuids.size}` : `${t("isolate_selection") || "隔离选中"} ${isolatedUuids.size}` })
+            modeTrayItems.length > 0 && /* @__PURE__ */ jsx("div", { className: "ui-mode-tray", children: modeTrayItems.map((item) => /* @__PURE__ */ jsxs("div", { className: "ui-mode-pill", children: [
+              /* @__PURE__ */ jsx("span", { children: item.label }),
+              /* @__PURE__ */ jsx("button", { onClick: item.onClear, children: t("mode_clear") })
+            ] }, item.key)) })
           ] }),
           /* @__PURE__ */ jsxs("div", { className: "ui-statusbar-right", children: [
-            mousePos && /* @__PURE__ */ jsxs("div", { style: { opacity: 0.85 }, children: [
+            mousePos && /* @__PURE__ */ jsxs("div", { className: "ui-statusbar-coords", children: [
               mousePos.x.toFixed(2),
               ", ",
               mousePos.y.toFixed(2),
@@ -11953,11 +15763,11 @@ const ThreeViewer = ({
               /* @__PURE__ */ jsx("span", { children: t("tips_zoom") })
             ] }),
             showStats && /* @__PURE__ */ jsxs("div", { className: "ui-stats-group", children: [
-              /* @__PURE__ */ jsxs("div", { className: "ui-stats-item", title: "Original Meshes", children: [
+              /* @__PURE__ */ jsxs("div", { className: "ui-stats-item", title: t("stats_original_meshes"), children: [
                 /* @__PURE__ */ jsx(IconBox, { width: 14, height: 14 }),
                 /* @__PURE__ */ jsx("span", { children: formatNumber(stats.meshes) })
               ] }),
-              /* @__PURE__ */ jsxs("div", { className: "ui-stats-item", title: "Triangles", children: [
+              /* @__PURE__ */ jsxs("div", { className: "ui-stats-item", title: t("stats_triangles"), children: [
                 /* @__PURE__ */ jsx(IconGrid, { width: 14, height: 14 }),
                 /* @__PURE__ */ jsx("span", { children: formatNumber(stats.faces) })
               ] }),
@@ -11965,27 +15775,18 @@ const ThreeViewer = ({
                 /* @__PURE__ */ jsx(IconActivity, { width: 14, height: 14 }),
                 /* @__PURE__ */ jsx("span", { children: formatMemory(stats.memory) })
               ] }),
-              stats.chunksTotal > 0 && /* @__PURE__ */ jsxs("div", { style: { opacity: 0.75, fontVariantNumeric: "tabular-nums" }, title: "Chunks", children: [
+              stats.chunksTotal > 0 && /* @__PURE__ */ jsxs("div", { className: "ui-statusbar-metric", title: t("stats_chunks"), children: [
                 "CH ",
                 stats.chunksLoaded,
                 "/",
                 stats.chunksTotal
               ] }),
-              /* @__PURE__ */ jsxs("div", { style: { opacity: 0.75, fontVariantNumeric: "tabular-nums" }, title: "Pixel Ratio", children: [
+              /* @__PURE__ */ jsxs("div", { className: "ui-statusbar-metric", title: t("stats_pixel_ratio"), children: [
                 "DPR ",
                 stats.pixelRatio
               ] })
             ] }),
-            /* @__PURE__ */ jsx("div", { className: "ui-divider-vertical ui-divider-vertical-compact", style: { height: "12px" } }),
-            /* @__PURE__ */ jsx(
-              "button",
-              {
-                className: "ui-statusbar-btn ui-statusbar-btn-compact",
-                onClick: () => handleThemeModeChange(themeMode === "dark" ? "light" : "dark"),
-                title: themeMode === "dark" ? t("theme_light") : t("theme_dark"),
-                children: themeMode === "dark" ? /* @__PURE__ */ jsx(IconSun, { width: 16, height: 16 }) : /* @__PURE__ */ jsx(IconMoon, { width: 16, height: 16 })
-              }
-            ),
+            /* @__PURE__ */ jsx("div", { className: "ui-divider-vertical ui-divider-vertical-compact ui-divider-vertical-short" }),
             /* @__PURE__ */ jsx(
               "button",
               {
@@ -11994,8 +15795,8 @@ const ThreeViewer = ({
                 children: lang === "zh" ? "EN" : "中文"
               }
             ),
-            /* @__PURE__ */ jsx("div", { className: "ui-divider-vertical ui-divider-vertical-compact", style: { height: "12px" } }),
-            /* @__PURE__ */ jsx("div", { className: "ui-statusbar-tag ui-statusbar-tag-compact ui-statusbar-brand", children: /* @__PURE__ */ jsx("span", { style: { fontWeight: "600", letterSpacing: "0.5px" }, children: "3D BROWSER" }) })
+            /* @__PURE__ */ jsx("div", { className: "ui-divider-vertical ui-divider-vertical-compact ui-divider-vertical-short" }),
+            /* @__PURE__ */ jsx("div", { className: "ui-statusbar-tag ui-statusbar-tag-compact ui-statusbar-brand", children: /* @__PURE__ */ jsx("span", { className: "ui-statusbar-brand-label", children: "3D BROWSER" }) })
           ] })
         ] }),
         /* @__PURE__ */ jsx(
@@ -12022,29 +15823,26 @@ const ThreeViewer = ({
             theme
           }
         ),
-        errorState.isOpen && /* @__PURE__ */ jsx("div", { className: "ui-error-overlay", children: /* @__PURE__ */ jsxs("div", { className: "ui-error-content", style: { width: "450px" }, children: [
-          /* @__PURE__ */ jsxs("div", { className: "ui-error-header", style: { backgroundColor: "var(--error)", color: "white" }, children: [
+        errorState.isOpen && /* @__PURE__ */ jsx("div", { className: "ui-error-overlay", children: /* @__PURE__ */ jsxs("div", { className: "ui-error-content ui-error-content-wide", children: [
+          /* @__PURE__ */ jsxs("div", { className: "ui-error-header ui-error-header-danger", children: [
             /* @__PURE__ */ jsx("span", { children: errorState.title }),
             /* @__PURE__ */ jsx(
               "div",
               {
                 onClick: () => setErrorState((prev) => ({ ...prev, isOpen: false })),
-                style: { cursor: "pointer", display: "flex", padding: 2, borderRadius: "50%" },
-                onMouseEnter: (e) => e.currentTarget.style.backgroundColor = "rgba(255,255,255,0.2)",
-                onMouseLeave: (e) => e.currentTarget.style.backgroundColor = "transparent",
+                className: "ui-error-close",
                 children: /* @__PURE__ */ jsx(IconClose, { width: 18, height: 18 })
               }
             )
           ] }),
-          /* @__PURE__ */ jsxs("div", { style: { padding: "24px", display: "flex", flexDirection: "column", gap: "16px" }, children: [
-            /* @__PURE__ */ jsx("div", { style: { fontWeight: "600", fontSize: "15px", color: theme.text }, children: errorState.message }),
-            /* @__PURE__ */ jsx("div", { style: { display: "flex", justifyContent: "flex-end", marginTop: "8px" }, children: /* @__PURE__ */ jsx(
+          /* @__PURE__ */ jsxs("div", { className: "ui-error-body", children: [
+            /* @__PURE__ */ jsx("div", { className: "ui-error-message", children: errorState.message }),
+            /* @__PURE__ */ jsx("div", { className: "ui-error-actions", children: /* @__PURE__ */ jsx(
               "button",
               {
-                className: "ui-btn ui-btn-primary",
-                style: { padding: "8px 24px" },
+                className: "ui-btn ui-btn-primary ui-btn-modal-confirm",
                 onClick: () => setErrorState((prev) => ({ ...prev, isOpen: false })),
-                children: t("confirm") || "确定"
+                children: t("confirm")
               }
             ) })
           ] })

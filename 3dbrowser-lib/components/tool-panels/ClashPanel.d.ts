@@ -1,0 +1,68 @@
+import React from "react";
+export interface ClashResultItem {
+    id: string;
+    pairKey: string;
+    groupKey: string;
+    ruleId: string;
+    aUuid: string;
+    bUuid: string;
+    aName: string;
+    bName: string;
+    overlapVolume: number;
+    distance: number;
+    severity: "high" | "medium" | "low";
+    type: "hard" | "clearance";
+    status: "new" | "confirmed" | "resolved";
+}
+type ClashFilter = "ALL" | "NEW" | "CONFIRMED" | "RESOLVED";
+type ClashTypeFilter = "ALL" | "HARD" | "CLEARANCE";
+interface ClashPanelProps {
+    t: (key: string) => string;
+    onClose: () => void;
+    running: boolean;
+    progress: number;
+    status: string;
+    scannedCount: number;
+    pairsScanned: number;
+    results: ClashResultItem[];
+    resultFilter: ClashFilter;
+    modelOptions: Array<{
+        id: string;
+        name: string;
+    }>;
+    setA: string[];
+    setB: string[];
+    tolerance: number;
+    minOverlapVolume: number;
+    clearanceDistance: number;
+    useNarrowPhase: boolean;
+    useTrianglePhase: boolean;
+    includeSameModel: boolean;
+    onSetAChange: (next: string[]) => void;
+    onSetBChange: (next: string[]) => void;
+    onToleranceChange: (next: number) => void;
+    onMinOverlapVolumeChange: (next: number) => void;
+    onClearanceDistanceChange: (next: number) => void;
+    onUseNarrowPhaseChange: (next: boolean) => void;
+    onUseTrianglePhaseChange: (next: boolean) => void;
+    onIncludeSameModelChange: (next: boolean) => void;
+    onRun: () => void;
+    onCancel: () => void;
+    onClear: () => void;
+    onExportCsv: () => void;
+    onIsolateByStatus: (status: "new" | "confirmed") => void;
+    onRestoreVisibility: () => void;
+    onResultFilterChange: (next: ClashFilter) => void;
+    typeFilter: ClashTypeFilter;
+    onTypeFilterChange: (next: ClashTypeFilter) => void;
+    onUpdateResultStatus: (id: string, status: ClashResultItem["status"]) => void;
+    onMarkFilteredStatus: (status: ClashResultItem["status"]) => void;
+    onSetASelectAll: () => void;
+    onSetAClear: () => void;
+    onSetBSelectAll: () => void;
+    onSetBClear: () => void;
+    onFocusResult: (item: ClashResultItem) => void;
+    theme?: any;
+}
+export declare const ClashPanel: React.FC<ClashPanelProps>;
+export {};
