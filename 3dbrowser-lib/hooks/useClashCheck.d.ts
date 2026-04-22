@@ -49,6 +49,7 @@ export declare function useClashCheck({ sceneMgrRef, treeRoot, clashModelOptions
     clashClearanceDistance: number;
     clashUseNarrowPhase: boolean;
     clashUseTrianglePhase: boolean;
+    clashPruning: boolean;
     clashIncludeSameModel: boolean;
     clashPairsScanned: number;
     clashResultFilter: ClashFilter;

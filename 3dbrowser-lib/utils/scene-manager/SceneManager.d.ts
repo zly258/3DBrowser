@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { type RenderTarget } from "./renderTargets";
 import { type SceneVisibilityBatchOptions, type SceneVisibilityChange } from "./visibility";
 import { type PerformancePreset, type SceneChunkOptions, type SceneManagerOptions } from "../scene-core/types";
 import { type MeasurementRecord, type MeasureType, type SceneManagerStats, type SceneSettings, type StructureTreeNode } from "./types";
@@ -168,9 +169,15 @@ export declare class SceneManager {
     /** 按需调度一帧：合并多次调用，在相机静止且无后台任务时不常驻 requestAnimationFrame */
     requestRender(): void;
     private markSceneDirty;
+    invalidateRender(options?: {
+        needsRender?: boolean;
+        needsBoundsUpdate?: boolean;
+        needsCulling?: boolean;
+        invalidateInteractables?: boolean;
+    }): void;
     updateSettings(newSettings: Partial<SceneSettings>): void;
     createCircleTexture(): any;
-    animate(): void;
+    animate: () => void;
     private updateAdaptiveQuality;
     private updateInteractionPerformance;
     private initHardwareProfile;
@@ -307,6 +314,19 @@ export declare class SceneManager {
     setLocateFocusContext(uuids: string[], focusUuid?: string | null, highlightColors?: Record<string, string>): void;
     setLocateFocus(uuid: string | null): void;
     highlightObjects(uuids: string[]): void;
+    /**
+     * 通用多构件聚焦高亮入口：
+     * - 高亮 uuids 中的所有物体（橙色），其余设为半透明灰色
+     * - 可选 fitView 将镜头飞到这批物体
+     * - 可选 highlightColors 支持按 UUID 指定不同颜色（碰撞场景 A/B 色对）
+     * - 传空数组等同于 clearLocateFocus()
+     */
+    focusHighlightObjects(uuids: string[], options?: {
+        fitView?: boolean;
+        focusUuid?: string | null;
+        highlightColors?: Record<string, string>;
+    }): void;
+    collectRenderableTargets(uuids?: string[]): RenderTarget[];
     pick(clientX: number, clientY: number): {
         object: THREE.Object3D;
         intersect: THREE.Intersection;

@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import type { StructureTreeNode } from "./types";
-export declare function sanitizeDisplayLabel(...candidates: Array<string | null | undefined>): string;
+export declare function sanitizeDisplayLabel(...candidates: Array<string | null | undefined | number>): string;
 export declare function countStructureRenderableNodes(node: StructureTreeNode | undefined): number;
 export declare function buildExportStructureTree(structureRoot: StructureTreeNode): any;
 export declare function encodeNbimManifest(manifest: {

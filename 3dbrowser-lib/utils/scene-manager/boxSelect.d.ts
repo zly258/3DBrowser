@@ -8,6 +8,7 @@ interface BoxSelectState {
 }
 interface BoxSelectResult {
     state: BoxSelectState;
+    needsRender: boolean;
 }
 export declare function createInitialBoxSelectState(): BoxSelectState;
 export declare function applyStartBoxSelect(prevState: BoxSelectState, clientX: number, clientY: number): BoxSelectResult;
@@ -16,5 +17,6 @@ export declare function applyCancelBoxSelect(prevState: BoxSelectState): BoxSele
 export declare function applyEndBoxSelect(prevState: BoxSelectState, canvas: HTMLCanvasElement, selectByScreenRect: (x1: number, y1: number, x2: number, y2: number) => string[]): {
     state: BoxSelectState;
     selected: string[];
+    needsRender: boolean;
 };
 export {};

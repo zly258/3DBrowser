@@ -27,7 +27,7 @@ export declare function useViewerSelection({ sceneMgrRef, selectedUuids, setSele
     locatedUuid: string;
     locateResultUuids: string[];
     resetLocateState: () => void;
-    handleSelect: (obj: any, _intersect?: THREE.Intersection | null, isMultiSelect?: boolean) => Promise<void>;
+    handleSelect: (obj: any, _intersect?: THREE.Intersection | null, isMultiSelect?: boolean, skipHighlight?: boolean) => Promise<void>;
     handleLocateObject: (obj: any) => boolean;
     handleLocateResultsChange: (uuids: string[]) => void;
     handleClearLocate: () => void;

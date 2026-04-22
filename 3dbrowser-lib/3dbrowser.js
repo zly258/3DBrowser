@@ -1,6325 +1,9 @@
-import { jsx, jsxs, Fragment } from 'react/jsx-runtime';
-import React, { useState, useEffect, useRef, useCallback, useMemo, Component } from 'react';
-import * as THREE from 'three';
-import { Vector3, Matrix3, MathUtils, Box3, Matrix4, Ray } from 'three';
-import { O as OrbitControls } from './loaders-TXHpcosE.js';
-import { c as createBatchedMeshFromItemsAsync, a as calculateGeometryMemory, b as buildOctree, d as collectLeafNodes, e as collectItemsBatched, f as collectItems, g as exportGLB, h as exportLMB } from './utils-DN_d7V9M.js';
-
-function deriveInitialRuntimeFromHardware(cpuCount, preset) {
-  const normalizedCpu = Math.max(2, cpuCount);
-  const presetFactor = preset === "smooth" ? 0.85 : preset === "quality" ? 1.15 : 1;
-  const maxConcurrentChunkLoads = Math.max(20, Math.min(128, Math.floor(normalizedCpu * 10 * presetFactor)));
-  const maxChunkLoadsPerFrame = Math.max(8, Math.min(48, Math.floor(normalizedCpu * 3 * presetFactor)));
-  return {
-    maxConcurrentChunkLoads,
-    maxChunkLoadsPerFrame
-  };
-}
-
-const isDevHost = typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
-function debugLog(scope, ...args) {
-  if (!isDevHost) return;
-  console.log(`[${scope}]`, ...args);
-}
-function debugWarn(scope, ...args) {
-  if (!isDevHost) return;
-  console.warn(`[${scope}]`, ...args);
-}
-
-function stableExplodeDirection(seed, target) {
-  let hash = 2166136261;
-  for (let i = 0; i < seed.length; i++) {
-    hash ^= seed.charCodeAt(i);
-    hash = Math.imul(hash, 16777619);
-  }
-  const angle = (hash >>> 0) / 4294967295 * Math.PI * 2;
-  const z = (hash >>> 9 & 1023) / 1023 * 2 - 1;
-  const r = Math.sqrt(Math.max(0, 1 - z * z));
-  target.set(Math.cos(angle) * r, Math.sin(angle) * r, z).normalize();
-  return target;
-}
-
-async function readNbimHeader(file) {
-  const headerBuffer = await file.slice(0, 1024).arrayBuffer();
-  const dv = new DataView(headerBuffer);
-  return {
-    magic: dv.getUint32(0, true),
-    version: dv.getUint32(4, true),
-    manifestOffset: dv.getUint32(8, true),
-    manifestLength: dv.getUint32(12, true)
-  };
-}
-async function readNbimManifest(file, header) {
-  const manifestBlob = file.slice(header.manifestOffset, header.manifestOffset + header.manifestLength);
-  const manifestText = await manifestBlob.text();
-  return JSON.parse(manifestText);
-}
-
-function ensureRectElement(state) {
-  if (state.rectElement) return state.rectElement;
-  const rectElement = document.createElement("div");
-  rectElement.style.cssText = `
-        position: fixed; border: 1px dashed #00aaff;
-        background: rgba(0, 170, 255, 0.08); pointer-events: none; z-index: 1000;
-    `;
-  document.body.appendChild(rectElement);
-  state.rectElement = rectElement;
-  return rectElement;
-}
-function updateRectElement(state) {
-  const rectElement = ensureRectElement(state);
-  rectElement.style.left = `${Math.min(state.startX, state.endX)}px`;
-  rectElement.style.top = `${Math.min(state.startY, state.endY)}px`;
-  rectElement.style.width = `${Math.abs(state.endX - state.startX)}px`;
-  rectElement.style.height = `${Math.abs(state.endY - state.startY)}px`;
-}
-function createInitialBoxSelectState() {
-  return {
-    active: false,
-    startX: 0,
-    startY: 0,
-    endX: 0,
-    endY: 0,
-    rectElement: null
-  };
-}
-function applyStartBoxSelect(prevState, clientX, clientY) {
-  const state = {
-    ...prevState,
-    active: true,
-    startX: clientX,
-    startY: clientY,
-    endX: clientX,
-    endY: clientY
-  };
-  updateRectElement(state);
-  return { state };
-}
-function applyUpdateBoxSelect(prevState, clientX, clientY) {
-  if (!prevState.active) {
-    return { state: prevState };
-  }
-  const state = {
-    ...prevState,
-    endX: clientX,
-    endY: clientY
-  };
-  updateRectElement(state);
-  return { state };
-}
-function applyCancelBoxSelect(prevState) {
-  if (prevState.rectElement) {
-    prevState.rectElement.remove();
-  }
-  return {
-    state: {
-      ...prevState,
-      active: false,
-      rectElement: null
-    }
-  };
-}
-function applyEndBoxSelect(prevState, canvas, selectByScreenRect) {
-  if (!prevState.active) {
-    return {
-      state: prevState,
-      selected: []
-    };
-  }
-  const { state } = applyCancelBoxSelect(prevState);
-  const { startX, startY, endX, endY } = prevState;
-  const dx = Math.abs(endX - startX);
-  const dy = Math.abs(endY - startY);
-  if (dx < 5 || dy < 5) {
-    return { state, selected: [] };
-  }
-  const rect = canvas.getBoundingClientRect();
-  const x1 = (Math.min(startX, endX) - rect.left) / rect.width * 2 - 1;
-  const y1 = -(Math.max(startY, endY) - rect.top) / rect.height * 2 + 1;
-  const x2 = (Math.max(startX, endX) - rect.left) / rect.width * 2 - 1;
-  const y2 = -(Math.min(startY, endY) - rect.top) / rect.height * 2 + 1;
-  return {
-    state,
-    selected: selectByScreenRect(x1, y1, x2, y2)
-  };
-}
-
-function getChunkReadCacheKey(chunk) {
-  return `${chunk.nbimFileId || "local"}:${chunk.byteOffset || 0}:${chunk.byteLength || 0}`;
-}
-function hasValidChunkBinaryRange(chunk) {
-  return Number.isFinite(chunk?.byteOffset) && Number.isFinite(chunk?.byteLength) && chunk.byteLength > 0;
-}
-function touchChunkReadCache(cacheOrder, cacheKey) {
-  const nextOrder = cacheOrder.filter((key) => key !== cacheKey);
-  nextOrder.push(cacheKey);
-  return nextOrder;
-}
-function putChunkReadCache(options) {
-  const {
-    chunkReadCache,
-    chunkReadCacheOrder,
-    cacheKey,
-    buffer,
-    chunkReadCacheSize
-  } = options;
-  chunkReadCache.set(cacheKey, buffer);
-  let nextOrder = touchChunkReadCache(chunkReadCacheOrder, cacheKey);
-  while (nextOrder.length > chunkReadCacheSize) {
-    const evictKey = nextOrder.shift();
-    if (!evictKey) continue;
-    chunkReadCache.delete(evictKey);
-  }
-  return nextOrder;
-}
-async function readChunkBuffer(options) {
-  const {
-    chunk,
-    nbimFiles,
-    chunkReadCache,
-    chunkReadCacheOrder,
-    chunkReadCacheSize
-  } = options;
-  const cacheKey = getChunkReadCacheKey(chunk);
-  const cached = chunkReadCache.get(cacheKey);
-  if (cached) {
-    return {
-      buffer: cached.slice(0),
-      chunkReadCacheOrder: touchChunkReadCache(chunkReadCacheOrder, cacheKey)
-    };
-  }
-  const file = nbimFiles.get(chunk.nbimFileId);
-  if (!file) {
-    throw new Error(`NBIM file not found for chunk: ${chunk.id}`);
-  }
-  const buffer = await file.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength).arrayBuffer();
-  return {
-    buffer,
-    chunkReadCacheOrder: putChunkReadCache({
-      chunkReadCache,
-      chunkReadCacheOrder,
-      cacheKey,
-      buffer: buffer.slice(0),
-      chunkReadCacheSize
-    })
-  };
-}
-function enqueueChunkPrefetch(options) {
-  const {
-    chunkIds,
-    chunkPrefetchWindow,
-    prefetchQueue,
-    prefetchQueueSet,
-    prefetchInFlight
-  } = options;
-  if (chunkPrefetchWindow <= 0) {
-    return prefetchQueue;
-  }
-  const nextQueue = [...prefetchQueue];
-  for (const chunkId of chunkIds) {
-    if (prefetchQueueSet.has(chunkId)) continue;
-    if (prefetchInFlight.has(chunkId)) continue;
-    nextQueue.push(chunkId);
-    prefetchQueueSet.add(chunkId);
-  }
-  return nextQueue;
-}
-function collectPrefetchCandidates(options) {
-  const {
-    visibleChunks,
-    chunkPrefetchWindow,
-    prefetchPaused,
-    isCameraMoving,
-    prefetchRoundRobinCursor,
-    chunks,
-    processingChunks,
-    chunkReadCache,
-    getChunkIndex
-  } = options;
-  if (chunkPrefetchWindow <= 0 || prefetchPaused || isCameraMoving || visibleChunks.length === 0) {
-    return {
-      chunkIds: [],
-      prefetchRoundRobinCursor
-    };
-  }
-  const toPrefetch = [];
-  for (let index = 0; index < visibleChunks.length && toPrefetch.length < chunkPrefetchWindow; index++) {
-    const pivot = visibleChunks[(prefetchRoundRobinCursor + index) % visibleChunks.length];
-    const pivotIndex = getChunkIndex(pivot.id);
-    if (pivotIndex < 0) continue;
-    const nextChunk = chunks[pivotIndex + 1];
-    if (!nextChunk || nextChunk.loaded || processingChunks.has(nextChunk.id)) continue;
-    if (!nextChunk.nbimFileId || !hasValidChunkBinaryRange(nextChunk)) continue;
-    const cacheKey = getChunkReadCacheKey(nextChunk);
-    if (chunkReadCache.has(cacheKey)) continue;
-    toPrefetch.push(nextChunk.id);
-  }
-  return {
-    chunkIds: toPrefetch,
-    prefetchRoundRobinCursor: prefetchRoundRobinCursor + 1
-  };
-}
-
-function applyUnloadChunk(options) {
-  const { chunk, unregisterOptimizedMeshMapping, cacheChunkMesh, ensureChunkGhost } = options;
-  if (!chunk.loaded || !chunk.mesh) {
-    return {
-      changed: false,
-      chunkLoadedCountDelta: 0
-    };
-  }
-  const mesh = chunk.mesh;
-  unregisterOptimizedMeshMapping(mesh);
-  if (mesh.parent) {
-    mesh.parent.remove(mesh);
-  }
-  cacheChunkMesh(chunk, mesh);
-  ensureChunkGhost(chunk);
-  chunk.mesh = null;
-  chunk.loaded = false;
-  return {
-    changed: true,
-    chunkLoadedCountDelta: -1
-  };
-}
-async function resolveChunkMeshForLoad(options) {
-  const {
-    chunk,
-    sharedMaterial,
-    takeCachedChunkMesh,
-    yieldToMainThread,
-    nbimFiles,
-    hasValidChunkBinaryRange,
-    readChunkBuffer,
-    nbimMeta,
-    runWorkerTask,
-    reconstructBatchedMesh,
-    isCameraMoving,
-    chunkPrefetchWindow,
-    getChunkIndex,
-    chunks,
-    processingChunks
-  } = options;
-  const cachedMesh = takeCachedChunkMesh(chunk.id);
-  if (cachedMesh) {
-    return { mesh: cachedMesh, prefetchCandidates: [] };
-  }
-  if (chunk.node) {
-    const mesh = await createBatchedMeshFromItemsAsync(chunk.node.items, sharedMaterial, {
-      batchSize: 1200,
-      yieldControl: () => yieldToMainThread()
-    });
-    return { mesh, prefetchCandidates: [] };
-  }
-  if (chunk.nbimFileId && nbimFiles.has(chunk.nbimFileId) && hasValidChunkBinaryRange(chunk)) {
-    const buffer = await readChunkBuffer(chunk);
-    const meta = nbimMeta.get(chunk.nbimFileId);
-    const version = meta?.version ?? 8;
-    if (version !== 8) {
-      throw new Error(`Unsupported NBIM version: ${version}. Only V8 is supported.`);
-    }
-    const workerResult = await runWorkerTask({
-      buffer,
-      version,
-      originalUuid: chunk.originalUuid,
-      bimIdTable: meta?.bimIdTable
-    }, [buffer]);
-    const mesh = reconstructBatchedMesh(workerResult, sharedMaterial);
-    const prefetchCandidates = [];
-    if (!isCameraMoving && chunkPrefetchWindow > 0) {
-      const chunkIndex = getChunkIndex(chunk.id);
-      if (chunkIndex >= 0) {
-        for (let i = 1; i <= chunkPrefetchWindow; i++) {
-          const next = chunks[chunkIndex + i];
-          if (!next) break;
-          if (next.loaded || processingChunks.has(next.id)) continue;
-          if (!next.nbimFileId || !hasValidChunkBinaryRange(next)) continue;
-          prefetchCandidates.push(next.id);
-        }
-      }
-    }
-    return { mesh, prefetchCandidates };
-  }
-  return { mesh: null, prefetchCandidates: [] };
-}
-function attachLoadedChunkMesh(options) {
-  const {
-    chunk,
-    mesh,
-    cancelledChunkIds,
-    chunkIdSet,
-    disposeChunkMesh,
-    globalOffset,
-    contentGroup,
-    registerOptimizedMeshMapping
-  } = options;
-  if (cancelledChunkIds.has(chunk.id) || !chunkIdSet.has(chunk.id)) {
-    disposeChunkMesh(mesh);
-    return { attached: false };
-  }
-  mesh.name = chunk.id;
-  mesh.userData.chunkId = chunk.id;
-  mesh.userData.originalUuid = chunk.originalUuid;
-  if (chunk.nbimFileId) {
-    mesh.position.sub(globalOffset);
-    mesh.updateMatrixWorld(true);
-  }
-  let optimizedGroup = contentGroup.getObjectByName(chunk.groupName);
-  if (!optimizedGroup) {
-    optimizedGroup = new THREE.Group();
-    optimizedGroup.name = chunk.groupName;
-    optimizedGroup.userData.isOptimizedGroup = true;
-    optimizedGroup.userData.originalUuid = chunk.originalUuid;
-    contentGroup.add(optimizedGroup);
-  }
-  optimizedGroup.add(mesh);
-  chunk.mesh = mesh;
-  registerOptimizedMeshMapping(mesh);
-  return { attached: true };
-}
-function finalizeLoadedChunk(options) {
-  const {
-    chunk,
-    loadedNow,
-    now,
-    chunkLoadedCount,
-    chunkWarmupActive,
-    initialChunkLoadTarget,
-    deactivateFastPreviewForModel
-  } = options;
-  let nextChunkLoadedCount = chunkLoadedCount;
-  let nextChunkWarmupActive = chunkWarmupActive;
-  let progressChanged = false;
-  if (loadedNow && !chunk.loaded) {
-    chunk.loaded = true;
-    nextChunkLoadedCount++;
-    chunk.lastVisibleAt = now;
-    chunk.lastFocusAt = now;
-    if (chunk.originalUuid) {
-      deactivateFastPreviewForModel(chunk.originalUuid);
-    }
-    if (nextChunkWarmupActive && nextChunkLoadedCount >= initialChunkLoadTarget) {
-      nextChunkWarmupActive = false;
-    }
-    progressChanged = true;
-  }
-  return {
-    nextChunkLoadedCount,
-    nextChunkWarmupActive,
-    progressChanged
-  };
-}
-function cleanupChunkGhost(options) {
-  const { chunkId, ghostGroup, releaseGhostLine } = options;
-  const ghost = ghostGroup.getObjectByName(`ghost_${chunkId}`);
-  if (!ghost) {
-    return { changed: false };
-  }
-  ghostGroup.remove(ghost);
-  releaseGhostLine(ghost);
-  return { changed: true };
-}
-
-function selectChunksToUnload(options) {
-  const {
-    isCameraMoving,
-    loadedChunks,
-    maxLoadedChunks,
-    cameraPos,
-    now,
-    chunkResidencyMs
-  } = options;
-  if (isCameraMoving || loadedChunks.length <= maxLoadedChunks) {
-    return [];
-  }
-  const sortedChunks = [...loadedChunks].sort(
-    (a, b) => b.center.distanceToSquared(cameraPos) - a.center.distanceToSquared(cameraPos)
-  );
-  const targetUnload = sortedChunks.length - maxLoadedChunks;
-  const unloadTargets = [];
-  for (const chunk of sortedChunks) {
-    if (unloadTargets.length >= targetUnload) {
-      break;
-    }
-    const lastTouchedAt = Math.max(chunk.lastVisibleAt || 0, chunk.lastFocusAt || 0);
-    if (now - lastTouchedAt < chunkResidencyMs) {
-      continue;
-    }
-    if (!chunk.mesh || !chunk.mesh.visible) {
-      unloadTargets.push(chunk);
-    }
-  }
-  return unloadTargets;
-}
-function planChunkLoads(options) {
-  const {
-    toLoad,
-    now,
-    chunkLoadResumeAt,
-    maxConcurrentChunkLoads,
-    processingChunkCount,
-    chunkWarmupActive,
-    chunkLoadedCount,
-    initialChunkLoadTarget,
-    warmupChunkBoost,
-    getChunkFrameBudget,
-    phase,
-    profile
-  } = options;
-  if (toLoad.length === 0 || now < chunkLoadResumeAt) {
-    return [];
-  }
-  const sortedChunks = [...toLoad].sort((a, b) => b.priority - a.priority);
-  const available = maxConcurrentChunkLoads - processingChunkCount;
-  if (available <= 0) {
-    return [];
-  }
-  const warmupExtra = chunkWarmupActive && chunkLoadedCount < initialChunkLoadTarget ? warmupChunkBoost : 0;
-  const frameBudget = getChunkFrameBudget(phase, profile, warmupExtra);
-  const count = Math.min(available, frameBudget, sortedChunks.length);
-  return sortedChunks.slice(0, count);
-}
-
-function reconstructBatchedMeshFromWorkerData(options) {
-  const { data, material, resolveUuidByBimId } = options;
-  const { geometries: geoData, instances: instData, originalUuid } = data;
-  const hasAnyIndex = geoData.some((geometry) => geometry.index && geometry.index.length > 0);
-  const geometries = geoData.map((geometryData) => {
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute("position", new THREE.BufferAttribute(geometryData.position, 3));
-    geometry.setAttribute("normal", new THREE.BufferAttribute(geometryData.normal, 3));
-    if (geometryData.index && geometryData.index.length > 0) {
-      geometry.setIndex(new THREE.BufferAttribute(geometryData.index, 1));
-    } else if (hasAnyIndex) {
-      const count = geometryData.position.length / 3;
-      const index = new Uint32Array(count);
-      for (let i = 0; i < count; i++) {
-        index[i] = i;
-      }
-      geometry.setIndex(new THREE.BufferAttribute(index, 1));
-    }
-    return geometry;
-  });
-  let totalVerts = 0;
-  let totalIndices = 0;
-  geometries.forEach((geometry) => {
-    totalVerts += geometry.attributes.position.count;
-    if (geometry.index) {
-      totalIndices += geometry.index.count;
-    }
-  });
-  const batchedMesh = new THREE.BatchedMesh(instData.length, totalVerts, totalIndices, material);
-  batchedMesh.frustumCulled = false;
-  batchedMesh.perInstanceFrustumCulling = false;
-  const geometryIds = geometries.map((geometry) => batchedMesh.addGeometry(geometry));
-  const matrix = new THREE.Matrix4();
-  const color = new THREE.Color();
-  const batchIdToUuid = /* @__PURE__ */ new Map();
-  const batchIdToBimId = /* @__PURE__ */ new Map();
-  const batchIdToColor = /* @__PURE__ */ new Map();
-  const batchIdToGeometry = /* @__PURE__ */ new Map();
-  instData.forEach((instance) => {
-    color.setHex(instance.color);
-    matrix.fromArray(instance.matrix);
-    const instanceId = batchedMesh.addInstance(geometryIds[instance.geoIdx]);
-    batchedMesh.setMatrixAt(instanceId, matrix);
-    batchedMesh.setColorAt(instanceId, color);
-    const geometry = geometries[instance.geoIdx];
-    if (!geometry.boundingBox) {
-      geometry.computeBoundingBox();
-    }
-    if (geometry.boundingBox && batchedMesh.setBoundingBoxAt) {
-      batchedMesh.setBoundingBoxAt(instanceId, geometry.boundingBox);
-    }
-    const bimId = instance.bimId;
-    batchIdToUuid.set(instanceId, resolveUuidByBimId(originalUuid, bimId));
-    batchIdToBimId.set(instanceId, bimId);
-    batchIdToColor.set(instanceId, instance.color);
-    batchIdToGeometry.set(instanceId, geometry);
-  });
-  batchedMesh.userData.batchIdToUuid = batchIdToUuid;
-  batchedMesh.userData.batchIdToBimId = batchIdToBimId;
-  batchedMesh.userData.batchIdToColor = batchIdToColor;
-  batchedMesh.userData.batchIdToGeometry = batchIdToGeometry;
-  batchedMesh.computeBoundingBox();
-  batchedMesh.computeBoundingSphere();
-  return batchedMesh;
-}
-
-async function processChunkPrefetchQueue(options) {
-  const {
-    prefetchPaused,
-    isCameraMoving,
-    prefetchQueue,
-    prefetchQueueSet,
-    prefetchInFlight,
-    maxWorkers,
-    getChunkById,
-    chunkReadCache,
-    readChunkBuffer,
-    processQueue
-  } = options;
-  if (prefetchPaused || isCameraMoving || prefetchQueue.length === 0) {
-    return;
-  }
-  const maxParallel = Math.max(1, Math.min(4, Math.floor(maxWorkers / 2)));
-  while (!prefetchPaused && !isCameraMoving && prefetchQueue.length > 0 && prefetchInFlight.size < maxParallel) {
-    const chunkId = prefetchQueue.shift();
-    if (!chunkId) break;
-    prefetchQueueSet.delete(chunkId);
-    const chunk = getChunkById(chunkId);
-    if (!chunk || !chunk.nbimFileId || !hasValidChunkBinaryRange(chunk)) {
-      continue;
-    }
-    const cacheKey = getChunkReadCacheKey(chunk);
-    if (chunkReadCache.has(cacheKey)) {
-      continue;
-    }
-    prefetchInFlight.add(chunkId);
-    void readChunkBuffer(chunk).catch((error) => {
-      debugWarn("SceneManager/prefetch", `prefetch failed for ${chunkId}`, error);
-    }).finally(() => {
-      prefetchInFlight.delete(chunkId);
-      if (prefetchQueue.length > 0) {
-        void processQueue();
-      }
-    });
-  }
-}
-
-function disposeChunkMeshResource(options) {
-  const { mesh, sharedMaterial } = options;
-  if (mesh.geometry) {
-    mesh.geometry.dispose();
-  }
-  if (mesh.material && mesh.material !== sharedMaterial) {
-    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-    materials.forEach((material) => material.dispose && material.dispose());
-  }
-}
-function touchChunkMeshCacheOrder(chunkCacheOrder, chunkId) {
-  return [...chunkCacheOrder.filter((id) => id !== chunkId), chunkId];
-}
-function cacheChunkMeshEntry(options) {
-  const {
-    chunk,
-    mesh,
-    chunkMeshCache,
-    chunkCacheOrder,
-    maxCachedChunks,
-    disposeChunkMesh
-  } = options;
-  if (chunkMeshCache.has(chunk.id)) {
-    const oldMesh = chunkMeshCache.get(chunk.id);
-    if (oldMesh !== mesh) {
-      disposeChunkMesh(oldMesh);
-    }
-  }
-  chunkMeshCache.set(chunk.id, mesh);
-  let nextChunkCacheOrder = touchChunkMeshCacheOrder(chunkCacheOrder, chunk.id);
-  while (nextChunkCacheOrder.length > maxCachedChunks) {
-    const evictId = nextChunkCacheOrder.shift();
-    if (!evictId) break;
-    const cached = chunkMeshCache.get(evictId);
-    if (!cached) continue;
-    chunkMeshCache.delete(evictId);
-    disposeChunkMesh(cached);
-  }
-  return {
-    chunkMeshCache,
-    chunkCacheOrder: nextChunkCacheOrder
-  };
-}
-function takeCachedChunkMeshEntry(options) {
-  const { chunkId, chunkMeshCache, chunkCacheOrder } = options;
-  const mesh = chunkMeshCache.get(chunkId) || null;
-  if (!mesh) {
-    return {
-      mesh: null,
-      chunkCacheOrder
-    };
-  }
-  chunkMeshCache.delete(chunkId);
-  return {
-    mesh,
-    chunkCacheOrder: chunkCacheOrder.filter((id) => id !== chunkId)
-  };
-}
-function clearChunkMeshCacheEntries(options) {
-  const { chunkMeshCache, chunkCacheOrder, disposeChunkMesh, filter } = options;
-  for (const [chunkId, mesh] of chunkMeshCache.entries()) {
-    if (filter && !filter(chunkId, mesh)) continue;
-    disposeChunkMesh(mesh);
-    chunkMeshCache.delete(chunkId);
-  }
-  return chunkCacheOrder.filter((chunkId) => chunkMeshCache.has(chunkId));
-}
-function unregisterOptimizedMeshResourceMapping(options) {
-  const { mesh, optimizedMapping } = options;
-  const batchIdToUuid = mesh.userData.batchIdToUuid;
-  if (!batchIdToUuid) return;
-  for (const [batchId, originalUuid] of batchIdToUuid.entries()) {
-    const mapping = optimizedMapping.get(originalUuid);
-    if (!mapping) continue;
-    const index = mapping.findIndex((item) => item.mesh === mesh && item.instanceId === batchId);
-    if (index !== -1) {
-      mapping.splice(index, 1);
-    }
-    if (mapping.length === 0) {
-      optimizedMapping.delete(originalUuid);
-    }
-  }
-}
-function registerOptimizedMeshResourceMapping(options) {
-  const { mesh, optimizedMapping } = options;
-  const batchIdToUuid = mesh.userData.batchIdToUuid;
-  const batchIdToColor = mesh.userData.batchIdToColor;
-  const batchIdToGeometry = mesh.userData.batchIdToGeometry;
-  if (!batchIdToUuid) return;
-  for (const [batchId, originalUuid] of batchIdToUuid.entries()) {
-    if (!optimizedMapping.has(originalUuid)) {
-      optimizedMapping.set(originalUuid, []);
-    }
-    const originalColor = batchIdToColor?.get(batchId) ?? 16777215;
-    const geometry = batchIdToGeometry?.get(batchId);
-    optimizedMapping.get(originalUuid).push({
-      mesh,
-      instanceId: batchId,
-      originalColor,
-      geometry
-    });
-  }
-}
-function acquireGhostLineResource(options) {
-  const { ghostMeshPool, ghostEdgesGeometry, ghostMaterial } = options;
-  const reused = ghostMeshPool.pop();
-  if (reused) {
-    reused.visible = true;
-    return reused;
-  }
-  return new THREE.LineSegments(ghostEdgesGeometry, ghostMaterial);
-}
-function releaseGhostLineResource(options) {
-  const { line, ghostMeshPool } = options;
-  line.visible = false;
-  line.name = "";
-  line.scale.set(1, 1, 1);
-  line.position.set(0, 0, 0);
-  if (line.material instanceof THREE.LineBasicMaterial) {
-    line.material.opacity = 0.3;
-  }
-  ghostMeshPool.push(line);
-}
-function createGhostLineResource(options) {
-  const { name, bounds, acquireGhostLine } = options;
-  const size = new THREE.Vector3();
-  const center = new THREE.Vector3();
-  bounds.getSize(size);
-  bounds.getCenter(center);
-  const edges = acquireGhostLine();
-  edges.name = name;
-  edges.scale.copy(size);
-  edges.position.copy(center);
-  return edges;
-}
-function ensureChunkGhostResource(options) {
-  const { chunk, ghostGroup, createGhostLine } = options;
-  if (ghostGroup.getObjectByName(`ghost_${chunk.id}`)) {
-    return;
-  }
-  const edges = createGhostLine(`ghost_${chunk.id}`, chunk.bounds);
-  ghostGroup.add(edges);
-}
-
-function queueChunkWorkerTask(options) {
-  const { workerQueue, data, transferables, processQueue } = options;
-  return new Promise((resolve, reject) => {
-    workerQueue.push({ resolve, reject, data, transferables });
-    processQueue();
-  });
-}
-function processChunkWorkerQueue(options) {
-  const {
-    activeWorkerCount,
-    maxWorkers,
-    workerQueue,
-    workers,
-    createWorker,
-    getActiveWorkerCount,
-    onActiveWorkerCountChange,
-    processQueue
-  } = options;
-  if (activeWorkerCount >= maxWorkers || workerQueue.length === 0) {
-    return;
-  }
-  const task = workerQueue.shift();
-  onActiveWorkerCountChange(activeWorkerCount + 1);
-  const worker = workers.pop() ?? createWorker();
-  const onMessage = (event) => {
-    worker.removeEventListener("message", onMessage);
-    worker.removeEventListener("error", onError);
-    workers.push(worker);
-    onActiveWorkerCountChange(Math.max(0, getActiveWorkerCount() - 1));
-    if (event.data.type === "success") {
-      task.resolve(event.data.result);
-    } else {
-      task.reject(new Error(event.data.error));
-    }
-    processQueue();
-  };
-  const onError = (event) => {
-    worker.removeEventListener("message", onMessage);
-    worker.removeEventListener("error", onError);
-    onActiveWorkerCountChange(Math.max(0, getActiveWorkerCount() - 1));
-    task.reject(new Error(event.message));
-    processQueue();
-  };
-  worker.addEventListener("message", onMessage);
-  worker.addEventListener("error", onError);
-  worker.postMessage(task.data, task.transferables);
-}
-function disposeChunkWorkerPool(options) {
-  const { workers, workerQueue, rejectReason } = options;
-  for (const worker of workers) {
-    try {
-      worker.terminate();
-    } catch (error) {
-      console.warn("Worker terminate failed:", error);
-    }
-  }
-  if (workerQueue.length > 0) {
-    const pending = workerQueue.splice(0, workerQueue.length);
-    pending.forEach((task) => task.reject(new Error(rejectReason)));
-  }
-}
-
-function ensureChunkSpatialState(options) {
-  const { chunk, padding, tempSize } = options;
-  if (!chunk.paddedBounds || chunk._padding !== padding) {
-    const size = chunk.bounds.getSize(tempSize);
-    const paddedBounds = chunk.bounds.clone();
-    paddedBounds.expandByVector(size.multiplyScalar(padding));
-    chunk.paddedBounds = paddedBounds;
-    chunk._padding = padding;
-  }
-  if (!chunk.center) {
-    chunk.center = chunk.bounds.getCenter(new THREE.Vector3());
-  }
-}
-function evaluateChunkVisibility(options) {
-  const {
-    chunk,
-    chunkIndex,
-    totalChunks,
-    now,
-    phase,
-    profile,
-    performanceMode,
-    isBoxClipped,
-    maxRenderDistance,
-    cameraPos,
-    cameraForward,
-    projScreenMatrix,
-    toChunkDirection,
-    tempCenterNdc,
-    viewHeight,
-    canvasHeight,
-    sampleUnloadedWhileMoving,
-    movingSampleStride,
-    movingSampleSeed,
-    resolveShouldRefreshPeripheral,
-    chunkWarmupActive,
-    chunkLoadedCount,
-    initialChunkLoadTarget,
-    chunkLoadResumeAt,
-    chunkMeshCached
-  } = options;
-  toChunkDirection.copy(chunk.center).sub(cameraPos);
-  const dist = toChunkDirection.length();
-  const inRange = dist < maxRenderDistance;
-  if (sampleUnloadedWhileMoving && !chunk.loaded && chunkIndex % movingSampleStride !== movingSampleSeed) {
-    return {
-      shouldSkipSample: true,
-      shouldBeVisible: false,
-      effectiveVisible: false,
-      isPeripheralWhileMoving: false,
-      shouldRefreshPeripheral: true,
-      centerPriorityWindow: false,
-      isPeripheralCandidate: false,
-      priority: null,
-      dist,
-      centrality: 0,
-      forwardness: 0,
-      pixelSize: 0
-    };
-  }
-  const boxSize = chunk.bounds.getSize(new THREE.Vector3()).length();
-  const pixelSize = boxSize / viewHeight * canvasHeight;
-  const centerNdc = tempCenterNdc.copy(chunk.center).applyMatrix4(projScreenMatrix);
-  const ndcDistance = Math.sqrt(centerNdc.x * centerNdc.x + centerNdc.y * centerNdc.y);
-  const centrality = 1 - Math.min(1, ndcDistance);
-  const forwardness = dist > 1e-5 ? Math.max(0, cameraForward.dot(toChunkDirection.divideScalar(dist))) : 1;
-  const isTooSmall = pixelSize < 4;
-  const shouldHidePeripheralWhileMoving = phase === "moving" && centrality < profile.movingFocusCentralityThreshold && pixelSize < profile.movingFocusPixelThreshold;
-  const shouldBeVisible = options.inFrustum && !isBoxClipped && inRange && !isTooSmall && !shouldHidePeripheralWhileMoving;
-  const lastTouchedAt = Math.max(chunk.lastVisibleAt || 0, chunk.lastFocusAt || 0);
-  const shouldKeepVisibleWhileMoving = phase === "moving" && options.inFrustum && !isBoxClipped && inRange && !isTooSmall && now - lastTouchedAt < profile.chunkVisibilityHoldMs;
-  const isPeripheralWhileMoving = centrality < profile.movingCoreCentralityThreshold && pixelSize < profile.movingCorePixelThreshold && forwardness < profile.movingCoreForwardThreshold;
-  const shouldRefreshPeripheral = resolveShouldRefreshPeripheral(isPeripheralWhileMoving);
-  const effectiveVisible = phase === "moving" && isPeripheralWhileMoving && !shouldRefreshPeripheral ? chunk.lastEffectiveVisible ?? chunk.mesh?.visible ?? false : shouldBeVisible || shouldKeepVisibleWhileMoving;
-  const centerPriorityWindow = chunkWarmupActive || now < chunkLoadResumeAt + profile.centerPriorityWindowMs;
-  const isPeripheralCandidate = centrality < profile.centerPriorityThreshold && forwardness < profile.forwardPriorityThreshold && pixelSize < 96;
-  let priority = null;
-  if (!chunk.loaded && shouldBeVisible) {
-    const viewportBoost = centrality > 0.8 ? 4.5 : centrality > 0.62 ? 2.8 : 1;
-    const sizeScore = Math.min(8, pixelSize / 120);
-    const distanceScore = 1e3 / (dist + 1);
-    const forwardScore = forwardness * 550;
-    const cacheBoost = chunkMeshCached ? 420 : 0;
-    const warmupBoost = chunkWarmupActive && chunkLoadedCount < initialChunkLoadTarget ? centrality > 0.65 ? 1500 : centrality > 0.45 ? 500 : 0 : 0;
-    const movingPriorityBoost = phase === "moving" ? centrality > 0.65 || forwardness > 0.7 ? 900 : centrality > 0.4 ? 250 : -250 : 0;
-    const shouldSkipForPriority = phase === "moving" && centrality < 0.08 && pixelSize < 18 || phase === "moving" && isPeripheralWhileMoving && !shouldRefreshPeripheral || phase !== "moving" && centerPriorityWindow && isPeripheralCandidate || phase === "moving" && performanceMode === "smooth" && centrality < 0.3 && pixelSize < 54 && forwardness < 0.62;
-    if (!shouldSkipForPriority) {
-      priority = movingPriorityBoost + cacheBoost + warmupBoost + forwardScore + viewportBoost * 1e3 + sizeScore * 120 + distanceScore + centrality * 300;
-    }
-  }
-  return {
-    shouldSkipSample: false,
-    shouldBeVisible,
-    effectiveVisible,
-    isPeripheralWhileMoving,
-    shouldRefreshPeripheral,
-    centerPriorityWindow,
-    isPeripheralCandidate,
-    priority,
-    dist,
-    centrality,
-    forwardness,
-    pixelSize
-  };
-}
-
-function reportChunkProgressIfNeeded(options) {
-  const { now, total, loaded, lastReportedProgress, lastChunkProgressReportAt } = options;
-  const changed = loaded !== lastReportedProgress.loaded || total !== lastReportedProgress.total;
-  const shouldFlush = total === 0 || total > 0 && loaded >= total;
-  const intervalReached = now - lastChunkProgressReportAt >= 48;
-  return {
-    shouldNotify: changed && (intervalReached || shouldFlush),
-    nextProgress: { loaded, total },
-    nextReportedAt: shouldFlush || intervalReached ? now : lastChunkProgressReportAt
-  };
-}
-function selectChunkRuntimeProfile(options) {
-  const { chunkCount, compact, balanced, massive } = options;
-  if (chunkCount > 2e3) return massive;
-  if (chunkCount > 600) return balanced;
-  return compact;
-}
-function computeChunkFrameBudget(options) {
-  const {
-    forceMaxChunkLoadSpeed,
-    maxChunkLoadsPerFrame,
-    performanceMode,
-    chunkCount,
-    phase,
-    profile,
-    warmupExtra
-  } = options;
-  if (forceMaxChunkLoadSpeed) {
-    return maxChunkLoadsPerFrame + warmupExtra;
-  }
-  const isHugeScene = chunkCount > 2e3;
-  const isLargeScene = chunkCount > 600;
-  if (phase === "moving") {
-    const baseMovingBudget = Math.max(
-      profile.movingLoadBudgetMin,
-      Math.min(profile.movingLoadBudgetMax, Math.floor(maxChunkLoadsPerFrame / 4))
-    );
-    if (performanceMode === "smooth") {
-      if (isHugeScene) return Math.max(1, Math.floor(baseMovingBudget * 0.35));
-      if (isLargeScene) return Math.max(1, Math.floor(baseMovingBudget * 0.5));
-      return Math.max(1, Math.floor(baseMovingBudget * 0.7));
-    }
-    if (isHugeScene) return Math.max(1, Math.floor(baseMovingBudget * 0.55));
-    if (isLargeScene) return Math.max(1, Math.floor(baseMovingBudget * 0.75));
-    return baseMovingBudget;
-  }
-  if (phase === "recovery") {
-    const recoveryBudget = Math.max(
-      profile.recoveryLoadBudgetMin,
-      Math.min(
-        profile.recoveryLoadBudgetMax,
-        Math.floor(maxChunkLoadsPerFrame * profile.recoveryLoadBudgetRatio)
-      )
-    );
-    const recoveryBoost = performanceMode === "smooth" ? Math.max(2, Math.floor(recoveryBudget * 0.6)) : 0;
-    return recoveryBudget + recoveryBoost + warmupExtra;
-  }
-  return maxChunkLoadsPerFrame + warmupExtra;
-}
-function isMovingPeripheralChunk(options) {
-  const { centrality, pixelSize, forwardness, profile } = options;
-  return centrality < profile.movingCoreCentralityThreshold && pixelSize < profile.movingCorePixelThreshold && forwardness < profile.movingCoreForwardThreshold;
-}
-function updatePeripheralRefreshWindow(options) {
-  const {
-    now,
-    isCameraMoving,
-    chunkIndex,
-    totalChunks,
-    profile,
-    movingPeripheralCursor,
-    movingPeripheralLastRefreshAt
-  } = options;
-  if (!isCameraMoving || totalChunks === 0) {
-    return {
-      shouldRefresh: true,
-      movingPeripheralCursor,
-      movingPeripheralLastRefreshAt
-    };
-  }
-  let nextCursor = movingPeripheralCursor;
-  let nextLastRefreshAt = movingPeripheralLastRefreshAt;
-  if (now - nextLastRefreshAt >= profile.movingPeripheralRefreshMs) {
-    const batchSize2 = Math.min(
-      totalChunks,
-      Math.max(profile.movingPeripheralMinBatchSize, Math.ceil(totalChunks * profile.movingPeripheralBatchRatio))
-    );
-    nextCursor = (nextCursor + batchSize2) % totalChunks;
-    nextLastRefreshAt = now;
-  }
-  const batchSize = Math.min(
-    totalChunks,
-    Math.max(profile.movingPeripheralMinBatchSize, Math.ceil(totalChunks * profile.movingPeripheralBatchRatio))
-  );
-  const start = nextCursor;
-  const end = start + batchSize;
-  const shouldRefresh = end <= totalChunks ? chunkIndex >= start && chunkIndex < end : chunkIndex >= start || chunkIndex < end % totalChunks;
-  return {
-    shouldRefresh,
-    movingPeripheralCursor: nextCursor,
-    movingPeripheralLastRefreshAt: nextLastRefreshAt
-  };
-}
-
-const CLIP_HELPER_COLORS = [16711680, 16711680, 65280, 65280, 255, 255];
-function clonePlanes(planes) {
-  return planes.map((plane) => plane.clone());
-}
-function updatePlaneHelper(helper, normal, position, width, height, isEnabled, clipHelperVisible) {
-  if (!helper) return;
-  const helperVisible = isEnabled && clipHelperVisible;
-  helper.visible = helperVisible;
-  helper.scale.set(Math.max(width, 1e-3), Math.max(height, 1e-3), 1);
-  helper.position.copy(position);
-  helper.lookAt(position.clone().add(normal));
-  helper.children.forEach((child) => {
-    child.visible = helperVisible;
-  });
-}
-function applySetupClipping(context) {
-  const clippingPlanes = [
-    new THREE.Plane(new THREE.Vector3(1, 0, 0), 0),
-    new THREE.Plane(new THREE.Vector3(-1, 0, 0), 0),
-    new THREE.Plane(new THREE.Vector3(0, 1, 0), 0),
-    new THREE.Plane(new THREE.Vector3(0, -1, 0), 0),
-    new THREE.Plane(new THREE.Vector3(0, 0, 1), 0),
-    new THREE.Plane(new THREE.Vector3(0, 0, -1), 0)
-  ];
-  context.renderer.clippingPlanes = [];
-  context.clipHelpersGroup.clear();
-  const clipPlaneHelpers = CLIP_HELPER_COLORS.map((color) => {
-    const geometry = new THREE.PlaneGeometry(1, 1);
-    const material = new THREE.MeshBasicMaterial({
-      color,
-      transparent: true,
-      opacity: context.state.clipHelperOpacity,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-      polygonOffset: true,
-      polygonOffsetFactor: -4,
-      polygonOffsetUnits: -4,
-      clippingPlanes: []
-    });
-    const mesh = new THREE.Mesh(geometry, material);
-    mesh.visible = false;
-    mesh.renderOrder = 9999;
-    const edges = new THREE.EdgesGeometry(geometry);
-    const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({
-      color,
-      transparent: true,
-      opacity: Math.min(1, context.state.clipHelperOpacity + 0.08),
-      depthWrite: false
-    }));
-    line.visible = false;
-    line.renderOrder = 1e4;
-    mesh.add(line);
-    context.clipHelpersGroup.add(mesh);
-    return mesh;
-  });
-  return {
-    state: {
-      ...context.state,
-      clippingPlanes,
-      clipPlaneHelpers
-    },
-    needsRender: false
-  };
-}
-function applySetClipHelperOptions(context, options) {
-  const state = {
-    ...context.state,
-    clippingPlanes: clonePlanes(context.state.clippingPlanes),
-    clipPlaneHelpers: [...context.state.clipPlaneHelpers],
-    clipHelperVisible: typeof options.visible === "boolean" ? options.visible : context.state.clipHelperVisible,
-    clipHelperOpacity: typeof options.opacity === "number" && !Number.isNaN(options.opacity) ? THREE.MathUtils.clamp(options.opacity, 0.05, 0.35) : context.state.clipHelperOpacity
-  };
-  state.clipPlaneHelpers.forEach((helper) => {
-    const surfaceMaterial = helper.material;
-    surfaceMaterial.opacity = state.clipHelperOpacity;
-    surfaceMaterial.needsUpdate = true;
-    helper.children.forEach((child) => {
-      const lineMaterial = child.material;
-      if (!lineMaterial) return;
-      lineMaterial.opacity = Math.min(1, state.clipHelperOpacity + 0.08);
-      lineMaterial.needsUpdate = true;
-    });
-  });
-  state.clipPlaneHelpers.forEach((helper, index) => {
-    const plane = context.state.clippingPlanes[index];
-    const isPlaneActive = !!plane && Number.isFinite(plane.constant) && plane.constant !== Infinity;
-    const helperVisible = state.clipHelperVisible && context.renderer.clippingPlanes.length > 0 && isPlaneActive;
-    helper.visible = helperVisible;
-    helper.children.forEach((child) => {
-      child.visible = helperVisible;
-    });
-  });
-  return { state, needsRender: true };
-}
-function applyUpdateClippingPlanes(context, bounds, values, active) {
-  if (bounds.isEmpty()) {
-    return { state: context.state, needsRender: false };
-  }
-  const clippingPlanes = clonePlanes(context.state.clippingPlanes);
-  const clipPlaneHelpers = [...context.state.clipPlaneHelpers];
-  const state = { ...context.state, clippingPlanes, clipPlaneHelpers };
-  const { min, max } = bounds;
-  const size = max.clone().sub(min);
-  const xMin = min.x + values.x[0] / 100 * size.x;
-  const xMax = min.x + values.x[1] / 100 * size.x;
-  const yMin = min.y + values.y[0] / 100 * size.y;
-  const yMax = min.y + values.y[1] / 100 * size.y;
-  const zMin = min.z + values.z[0] / 100 * size.z;
-  const zMax = min.z + values.z[1] / 100 * size.z;
-  const isEnabled = context.renderer.clippingPlanes.length > 0;
-  const clippedBoxMin = new THREE.Vector3(
-    active.x ? xMin : min.x,
-    active.y ? yMin : min.y,
-    active.z ? zMin : min.z
-  );
-  const clippedBoxMax = new THREE.Vector3(
-    active.x ? xMax : max.x,
-    active.y ? yMax : max.y,
-    active.z ? zMax : max.z
-  );
-  const clippedCenter = clippedBoxMin.clone().add(clippedBoxMax).multiplyScalar(0.5);
-  const clippedSize = clippedBoxMax.clone().sub(clippedBoxMin);
-  const epsilon = 5e-4;
-  if (active.x) {
-    clippingPlanes[0].constant = -xMin;
-    clippingPlanes[1].constant = xMax;
-    updatePlaneHelper(
-      clipPlaneHelpers[0],
-      new THREE.Vector3(1, 0, 0),
-      new THREE.Vector3(xMin + epsilon, clippedCenter.y, clippedCenter.z),
-      clippedSize.z,
-      clippedSize.y,
-      isEnabled,
-      state.clipHelperVisible
-    );
-    updatePlaneHelper(
-      clipPlaneHelpers[1],
-      new THREE.Vector3(-1, 0, 0),
-      new THREE.Vector3(xMax - epsilon, clippedCenter.y, clippedCenter.z),
-      clippedSize.z,
-      clippedSize.y,
-      isEnabled,
-      state.clipHelperVisible
-    );
-  } else {
-    clippingPlanes[0].constant = Infinity;
-    clippingPlanes[1].constant = Infinity;
-    if (clipPlaneHelpers[0]) clipPlaneHelpers[0].visible = false;
-    if (clipPlaneHelpers[1]) clipPlaneHelpers[1].visible = false;
-  }
-  if (active.y) {
-    clippingPlanes[2].constant = -yMin;
-    clippingPlanes[3].constant = yMax;
-    updatePlaneHelper(
-      clipPlaneHelpers[2],
-      new THREE.Vector3(0, 1, 0),
-      new THREE.Vector3(clippedCenter.x, yMin + epsilon, clippedCenter.z),
-      clippedSize.x,
-      clippedSize.z,
-      isEnabled,
-      state.clipHelperVisible
-    );
-    updatePlaneHelper(
-      clipPlaneHelpers[3],
-      new THREE.Vector3(0, -1, 0),
-      new THREE.Vector3(clippedCenter.x, yMax - epsilon, clippedCenter.z),
-      clippedSize.x,
-      clippedSize.z,
-      isEnabled,
-      state.clipHelperVisible
-    );
-  } else {
-    clippingPlanes[2].constant = Infinity;
-    clippingPlanes[3].constant = Infinity;
-    if (clipPlaneHelpers[2]) clipPlaneHelpers[2].visible = false;
-    if (clipPlaneHelpers[3]) clipPlaneHelpers[3].visible = false;
-  }
-  if (active.z) {
-    clippingPlanes[4].constant = -zMin;
-    clippingPlanes[5].constant = zMax;
-    updatePlaneHelper(
-      clipPlaneHelpers[4],
-      new THREE.Vector3(0, 0, 1),
-      new THREE.Vector3(clippedCenter.x, clippedCenter.y, zMin + epsilon),
-      clippedSize.x,
-      clippedSize.y,
-      isEnabled,
-      state.clipHelperVisible
-    );
-    updatePlaneHelper(
-      clipPlaneHelpers[5],
-      new THREE.Vector3(0, 0, -1),
-      new THREE.Vector3(clippedCenter.x, clippedCenter.y, zMax - epsilon),
-      clippedSize.x,
-      clippedSize.y,
-      isEnabled,
-      state.clipHelperVisible
-    );
-  } else {
-    clippingPlanes[4].constant = Infinity;
-    clippingPlanes[5].constant = Infinity;
-    if (clipPlaneHelpers[4]) clipPlaneHelpers[4].visible = false;
-    if (clipPlaneHelpers[5]) clipPlaneHelpers[5].visible = false;
-  }
-  return { state, needsRender: true };
-}
-function isBoxClippedByPlanes(planes, box) {
-  for (const plane of planes) {
-    if (plane.constant === Infinity) continue;
-    const planeNormal = plane.normal;
-    const maxPoint = new THREE.Vector3(
-      planeNormal.x > 0 ? box.max.x : box.min.x,
-      planeNormal.y > 0 ? box.max.y : box.min.y,
-      planeNormal.z > 0 ? box.max.z : box.min.z
-    );
-    if (plane.distanceToPoint(maxPoint) < 0) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function disposeGeometryAndMaterial(object) {
-  object.geometry?.dispose?.();
-  const materials = object.material ? Array.isArray(object.material) ? object.material : [object.material] : [];
-  materials.forEach((material) => material?.dispose?.());
-}
-function disposeSceneManagerResources(context) {
-  context.cancelDeferredStructureBuild();
-  context.clearLocateFocus();
-  if (context.animationFrameId !== null) {
-    cancelAnimationFrame(context.animationFrameId);
-  }
-  context.onAnimationFrameDisposed();
-  if (context.logicTimer) {
-    clearInterval(context.logicTimer);
-  }
-  disposeChunkWorkerPool({
-    workers: context.workers,
-    workerQueue: context.workerQueue,
-    rejectReason: "SceneManager disposed"
-  });
-  context.onWorkersDisposed();
-  context.onQueuesReset();
-  context.onStateCachesReset();
-  context.clearChunkCache();
-  while (context.ghostGroup.children.length > 0) {
-    const ghost = context.ghostGroup.children[0];
-    context.ghostGroup.remove(ghost);
-    context.releaseGhostLine(ghost);
-  }
-  context.controls.dispose();
-  disposeGeometryAndMaterial(context.selectionBox);
-  disposeGeometryAndMaterial(context.highlightMesh);
-  disposeGeometryAndMaterial(context.tempMarker);
-  context.dotTexture.dispose();
-  context.sharedMaterial.dispose();
-  context.ghostEdgesGeometry.dispose();
-  context.ghostMaterial.dispose();
-  context.renderer.dispose();
-}
-
-function resolveWorldMatrix(mesh, instanceId) {
-  const matrix = new THREE.Matrix4();
-  if (instanceId !== void 0 && mesh.isInstancedMesh) {
-    mesh.getMatrixAt(instanceId, matrix);
-    return matrix;
-  }
-  return matrix.copy(mesh.matrixWorld);
-}
-function computeGeometryVolume(geometry, mesh, instanceId) {
-  const position = geometry.attributes.position;
-  const index = geometry.index;
-  const worldMatrix = resolveWorldMatrix(mesh, instanceId);
-  const vertexA = new THREE.Vector3();
-  const vertexB = new THREE.Vector3();
-  const vertexC = new THREE.Vector3();
-  const cross = new THREE.Vector3();
-  let volume = 0;
-  if (index) {
-    for (let i = 0; i < index.count; i += 3) {
-      vertexA.fromBufferAttribute(position, index.getX(i)).applyMatrix4(worldMatrix);
-      vertexB.fromBufferAttribute(position, index.getX(i + 1)).applyMatrix4(worldMatrix);
-      vertexC.fromBufferAttribute(position, index.getX(i + 2)).applyMatrix4(worldMatrix);
-      volume += vertexA.dot(cross.crossVectors(vertexB, vertexC)) / 6;
-    }
-  } else {
-    for (let i = 0; i < position.count; i += 3) {
-      vertexA.fromBufferAttribute(position, i).applyMatrix4(worldMatrix);
-      vertexB.fromBufferAttribute(position, i + 1).applyMatrix4(worldMatrix);
-      vertexC.fromBufferAttribute(position, i + 2).applyMatrix4(worldMatrix);
-      volume += vertexA.dot(cross.crossVectors(vertexB, vertexC)) / 6;
-    }
-  }
-  return Math.abs(volume);
-}
-function computeGeometryArea(geometry, mesh, instanceId) {
-  const position = geometry.attributes.position;
-  const index = geometry.index;
-  const worldMatrix = resolveWorldMatrix(mesh, instanceId);
-  const vertexA = new THREE.Vector3();
-  const vertexB = new THREE.Vector3();
-  const vertexC = new THREE.Vector3();
-  const edgeAB = new THREE.Vector3();
-  const edgeAC = new THREE.Vector3();
-  let area = 0;
-  if (index) {
-    for (let i = 0; i < index.count; i += 3) {
-      vertexA.fromBufferAttribute(position, index.getX(i)).applyMatrix4(worldMatrix);
-      vertexB.fromBufferAttribute(position, index.getX(i + 1)).applyMatrix4(worldMatrix);
-      vertexC.fromBufferAttribute(position, index.getX(i + 2)).applyMatrix4(worldMatrix);
-      area += edgeAB.subVectors(vertexB, vertexA).cross(edgeAC.subVectors(vertexC, vertexA)).length() / 2;
-    }
-  } else {
-    for (let i = 0; i < position.count; i += 3) {
-      vertexA.fromBufferAttribute(position, i).applyMatrix4(worldMatrix);
-      vertexB.fromBufferAttribute(position, i + 1).applyMatrix4(worldMatrix);
-      vertexC.fromBufferAttribute(position, i + 2).applyMatrix4(worldMatrix);
-      area += edgeAB.subVectors(vertexB, vertexA).cross(edgeAC.subVectors(vertexC, vertexA)).length() / 2;
-    }
-  }
-  return area;
-}
-function getObjectGeometryDataFromScene(options) {
-  const { uuid, optimizedMapping, contentGroup } = options;
-  let area = 0;
-  let volume = 0;
-  const mappings = optimizedMapping.get(uuid);
-  if (mappings && mappings.length > 0) {
-    mappings.forEach((mapping) => {
-      if (!mapping.geometry) return;
-      area += computeGeometryArea(mapping.geometry, mapping.mesh, mapping.instanceId);
-      volume += computeGeometryVolume(mapping.geometry, mapping.mesh, mapping.instanceId);
-    });
-    return { area, volume };
-  }
-  const object = contentGroup.getObjectByProperty("uuid", uuid);
-  if (object && object.isMesh) {
-    const mesh = object;
-    if (mesh.geometry) {
-      area = computeGeometryArea(mesh.geometry, mesh);
-      volume = computeGeometryVolume(mesh.geometry, mesh);
-    }
-  }
-  return { area, volume };
-}
-
-function stripFileExtension(name) {
-  return name.replace(/\.[^./\\]+$/, "");
-}
-function sanitizeFileStem(name) {
-  const sanitized = name.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, " ").trim();
-  return sanitized || "model";
-}
-
-const INVALID_DISPLAY_LABELS = /* @__PURE__ */ new Set(["", "n/a", "na", "undefined", "null", "-", "--"]);
-function sanitizeDisplayLabel(...candidates) {
-  for (const candidate of candidates) {
-    if (typeof candidate !== "string") continue;
-    const trimmed = candidate.trim();
-    if (INVALID_DISPLAY_LABELS.has(trimmed.toLowerCase())) continue;
-    return trimmed;
-  }
-  return "";
-}
-function countStructureRenderableNodes(node) {
-  if (!node) return 0;
-  let count = node.type === "Mesh" ? 1 : 0;
-  if (node.children) {
-    for (const child of node.children) {
-      count += countStructureRenderableNodes(child);
-    }
-  }
-  return count;
-}
-function sanitizeStructureUserData(userData) {
-  if (!userData || typeof userData !== "object") return void 0;
-  const sanitized = {};
-  if (userData.originalUuid !== void 0) sanitized.originalUuid = String(userData.originalUuid);
-  if (userData.expressID !== void 0) sanitized.expressID = userData.expressID;
-  if (userData.modelID !== void 0) sanitized.modelID = userData.modelID;
-  return Object.keys(sanitized).length > 0 ? sanitized : void 0;
-}
-function buildExportStructureTree(structureRoot) {
-  const usedIds = /* @__PURE__ */ new Set();
-  const assignId = (rawName, fallback) => {
-    const base = rawName && rawName.trim() ? rawName.trim() : fallback;
-    if (!usedIds.has(base)) {
-      usedIds.add(base);
-      return base;
-    }
-    let suffix = 2;
-    while (usedIds.has(`${base}_${suffix}`)) suffix++;
-    const resolvedId = `${base}_${suffix}`;
-    usedIds.add(resolvedId);
-    return resolvedId;
-  };
-  const rootId = assignId(structureRoot?.name, structureRoot?.id ?? "Root");
-  const rootCopy = {
-    id: rootId,
-    name: structureRoot?.name,
-    type: structureRoot?.type,
-    visible: structureRoot?.visible !== false,
-    children: []
-  };
-  if (structureRoot?.bimId !== void 0) rootCopy.bimId = structureRoot.bimId;
-  if (structureRoot?.chunkId !== void 0) rootCopy.chunkId = structureRoot.chunkId;
-  const rootUserData = sanitizeStructureUserData(structureRoot?.userData);
-  if (rootUserData) rootCopy.userData = rootUserData;
-  const stack = [{ src: structureRoot, dst: rootCopy }];
-  while (stack.length > 0) {
-    const { src, dst } = stack.pop();
-    const children = Array.isArray(src?.children) ? src.children : [];
-    for (const child of children) {
-      const childId = assignId(child?.name, child?.id ?? "Node");
-      const childCopy = {
-        id: childId,
-        name: child?.name,
-        type: child?.type,
-        visible: child?.visible !== false,
-        children: []
-      };
-      if (child?.bimId !== void 0) childCopy.bimId = child.bimId;
-      if (child?.chunkId !== void 0) childCopy.chunkId = child.chunkId;
-      const childUserData = sanitizeStructureUserData(child?.userData);
-      if (childUserData) childCopy.userData = childUserData;
-      dst.children.push(childCopy);
-      stack.push({ src: child, dst: childCopy });
-    }
-  }
-  return rootCopy;
-}
-function encodeNbimManifest(manifest, structureRoot) {
-  let manifestString;
-  try {
-    manifestString = JSON.stringify(manifest);
-  } catch {
-    manifestString = JSON.stringify({
-      globalBounds: manifest.globalBounds,
-      chunks: manifest.chunks,
-      structureTree: {
-        id: structureRoot.id,
-        name: structureRoot.name,
-        type: structureRoot.type,
-        children: structureRoot.children ? [] : []
-      },
-      bimIdTable: manifest.bimIdTable,
-      bimProperties: {}
-    });
-  }
-  return new TextEncoder().encode(manifestString);
-}
-function deriveDefaultNbimStem(contentGroup) {
-  const names = [];
-  contentGroup.children.forEach((child) => {
-    if (child.userData?.isOptimizedGroup) return;
-    if (child.name.startsWith("optimized_")) return;
-    const rawName = (typeof child.userData?.modelName === "string" ? child.userData.modelName : "") || (child.children?.[0]?.name || "") || child.name;
-    const baseName = sanitizeFileStem(stripFileExtension(rawName));
-    names.push(baseName);
-  });
-  const uniqueNames = Array.from(new Set(names));
-  if (uniqueNames.length === 1) return uniqueNames[0];
-  const now = /* @__PURE__ */ new Date();
-  const pad = (value) => String(value).padStart(2, "0");
-  const suffix = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-  return `批量导出_${suffix}`;
-}
-function groupNbimPropertiesByOwner(manifestBimProperties, rootId) {
-  const propertyKeys = Object.keys(manifestBimProperties);
-  const ownerSet = /* @__PURE__ */ new Set();
-  propertyKeys.forEach((key) => {
-    const separatorIndex = key.indexOf("::");
-    if (separatorIndex > 0) ownerSet.add(key.slice(0, separatorIndex));
-  });
-  const defaultOwner = ownerSet.size === 1 ? [...ownerSet][0] : rootId;
-  const grouped = /* @__PURE__ */ new Map();
-  if (ownerSet.size >= 1) {
-    if (ownerSet.size === 1) {
-      grouped.set(defaultOwner, manifestBimProperties);
-    } else {
-      propertyKeys.forEach((key) => {
-        const separatorIndex = key.indexOf("::");
-        const owner = separatorIndex > 0 ? key.slice(0, separatorIndex) : rootId;
-        if (!grouped.has(owner)) grouped.set(owner, {});
-        grouped.get(owner)[key] = manifestBimProperties[key];
-      });
-    }
-  } else {
-    grouped.set(rootId, manifestBimProperties);
-  }
-  return {
-    defaultOwner,
-    grouped
-  };
-}
-function createNbimContainerGroup(options) {
-  const { fileName, modelRootName, rootId } = options;
-  const fileGroup = new THREE.Group();
-  fileGroup.name = `file_${rootId}`;
-  fileGroup.userData.originalUuid = rootId;
-  const fileBaseName = sanitizeFileStem(stripFileExtension(fileName));
-  fileGroup.userData.modelName = sanitizeFileStem(
-    sanitizeDisplayLabel(modelRootName && modelRootName !== "Root" ? modelRootName : "", fileBaseName, rootId) || fileBaseName
-  );
-  return fileGroup;
-}
-function collectIfcModelReferences(contentGroup) {
-  const ifcApiByModel = /* @__PURE__ */ new Map();
-  const ifcManagerByModel = /* @__PURE__ */ new Map();
-  contentGroup.traverse((object) => {
-    if (object.userData?.ifcAPI && object.userData?.modelID !== void 0 && object.userData?.originalUuid) {
-      ifcApiByModel.set(String(object.userData.originalUuid), {
-        ifcApi: object.userData.ifcAPI,
-        modelID: object.userData.modelID
-      });
-    }
-    if (object.userData?.ifcManager && object.userData?.modelID !== void 0 && object.userData?.originalUuid) {
-      ifcManagerByModel.set(String(object.userData.originalUuid), {
-        ifcManager: object.userData.ifcManager,
-        modelID: object.userData.modelID
-      });
-    }
-  });
-  return {
-    ifcApiByModel,
-    ifcManagerByModel
-  };
-}
-async function collectNbimBimProperties(options) {
-  const { structureRoot, ifcApiByModel, ifcManagerByModel } = options;
-  const bimProperties = {};
-  const stack = [structureRoot];
-  while (stack.length > 0) {
-    const node = stack.pop();
-    const originalUuid = node.userData?.originalUuid ? String(node.userData.originalUuid) : "";
-    if (node.bimId) {
-      const key = `${originalUuid}::${node.bimId}`;
-      if (!bimProperties[key]) {
-        bimProperties[key] = { uuid: node.id, name: node.name };
-        const expressID = node.userData?.expressID;
-        if (expressID !== void 0 && ifcApiByModel.has(originalUuid)) {
-          try {
-            const { ifcApi, modelID } = ifcApiByModel.get(originalUuid);
-            const entity = ifcApi.GetLine(modelID, Number(expressID));
-            if (entity) {
-              bimProperties[key].ifcType = entity.is_a || "";
-              bimProperties[key].globalId = entity.GlobalId?.value || "";
-              bimProperties[key].ifcName = entity.Name?.value || "";
-            }
-          } catch {
-          }
-        }
-        if (expressID !== void 0 && ifcManagerByModel.has(originalUuid)) {
-          try {
-            const { ifcManager, modelID } = ifcManagerByModel.get(originalUuid);
-            const fullProps = await ifcManager.getItemProperties(modelID, Number(expressID));
-            const rawGroups = fullProps?.rawGroups || fullProps?.groups || null;
-            const normalizedGroups = fullProps?.normalizedGroups || null;
-            if (rawGroups && Object.keys(rawGroups).length > 0) {
-              bimProperties[key].ifcRawGroups = rawGroups;
-            }
-            if (normalizedGroups && Object.keys(normalizedGroups).length > 0) {
-              bimProperties[key].ifcNormalizedGroups = normalizedGroups;
-            }
-          } catch {
-          }
-        }
-      }
-    }
-    if (node.children && node.children.length > 0) {
-      for (let index = node.children.length - 1; index >= 0; index--) {
-        stack.push(node.children[index]);
-      }
-    }
-  }
-  return bimProperties;
-}
-function decodeChunkBinaryV8(buffer, bimIdTable) {
-  const dataView = new DataView(buffer);
-  let offset = 0;
-  const geometryCount = dataView.getUint32(offset, true);
-  offset += 4;
-  const geometries = [];
-  for (let i = 0; i < geometryCount; i++) {
-    const vertexCount = dataView.getUint32(offset, true);
-    offset += 4;
-    const indexCount = dataView.getUint32(offset, true);
-    offset += 4;
-    const positions = new Float32Array(buffer, offset, vertexCount * 3);
-    offset += vertexCount * 12;
-    const normals = new Float32Array(buffer, offset, vertexCount * 3);
-    offset += vertexCount * 12;
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(positions), 3));
-    geometry.setAttribute("normal", new THREE.BufferAttribute(new Float32Array(normals), 3));
-    if (indexCount > 0) {
-      const indices = new Uint32Array(buffer, offset, indexCount);
-      offset += indexCount * 4;
-      geometry.setIndex(new THREE.BufferAttribute(new Uint32Array(indices), 1));
-    }
-    geometries.push(geometry);
-  }
-  const instanceCount = dataView.getUint32(offset, true);
-  offset += 4;
-  const matrix = new THREE.Matrix4();
-  const instances = [];
-  for (let i = 0; i < instanceCount; i++) {
-    const bimIdIndex = dataView.getUint32(offset, true);
-    offset += 4;
-    const typeIndex = dataView.getUint32(offset, true);
-    offset += 4;
-    const color = dataView.getUint32(offset, true);
-    offset += 4;
-    for (let elementIndex = 0; elementIndex < 16; elementIndex++) {
-      matrix.elements[elementIndex] = dataView.getFloat32(offset, true);
-      offset += 4;
-    }
-    const geometryIndex = dataView.getUint32(offset, true);
-    offset += 4;
-    instances.push({
-      bimId: bimIdTable[bimIdIndex] ?? String(bimIdIndex),
-      typeIndex,
-      color,
-      matrix: matrix.clone(),
-      geometry: geometries[geometryIndex]
-    });
-  }
-  return instances;
-}
-async function prepareNbimExportChunks(options) {
-  const {
-    chunks,
-    nbimFiles,
-    nbimMeta,
-    bimIdToIndex,
-    hasValidChunkBinaryRange,
-    generateChunkBinaryV8
-  } = options;
-  const chunkBlobs = [];
-  const exportChunks = chunks.map((chunk) => ({
-    id: chunk.id,
-    bounds: {
-      min: { x: chunk.bounds.min.x, y: chunk.bounds.min.y, z: chunk.bounds.min.z },
-      max: { x: chunk.bounds.max.x, y: chunk.bounds.max.y, z: chunk.bounds.max.z }
-    },
-    originalUuid: chunk.originalUuid ? String(chunk.originalUuid) : void 0,
-    byteOffset: 0,
-    byteLength: 0
-  }));
-  let currentOffset = 1024;
-  for (let index = 0; index < chunks.length; index++) {
-    const chunk = chunks[index];
-    const exportChunk = exportChunks[index];
-    let buffer = null;
-    if (chunk.node) {
-      buffer = generateChunkBinaryV8(chunk.node.items, bimIdToIndex);
-    } else if (chunk.nbimFileId && nbimFiles.has(chunk.nbimFileId) && hasValidChunkBinaryRange(chunk)) {
-      const file = nbimFiles.get(chunk.nbimFileId);
-      const raw = await file.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength).arrayBuffer();
-      const meta = nbimMeta.get(chunk.nbimFileId);
-      const version = meta?.version ?? 8;
-      if (version !== 8) {
-        throw new Error(`Unsupported NBIM version: ${version}. Only V8 is supported.`);
-      }
-      const instances = decodeChunkBinaryV8(raw, meta?.bimIdTable || []);
-      const items = instances.map((instance) => ({
-        uuid: "",
-        bimId: instance.bimId,
-        typeIndex: instance.typeIndex,
-        color: instance.color,
-        matrix: instance.matrix,
-        geometry: instance.geometry
-      }));
-      buffer = generateChunkBinaryV8(items, bimIdToIndex);
-    }
-    if (!buffer) {
-      continue;
-    }
-    const uint8 = new Uint8Array(buffer);
-    chunkBlobs.push(uint8);
-    exportChunk.byteOffset = currentOffset;
-    exportChunk.byteLength = uint8.byteLength;
-    currentOffset += uint8.byteLength;
-  }
-  return {
-    chunkBlobs,
-    exportChunks,
-    currentOffset
-  };
-}
-
-function applyNbimGlobalBounds(options) {
-  const { globalBounds, precomputedBounds, sceneBounds, globalOffset } = options;
-  if (!globalBounds) {
-    return {
-      precomputedBounds,
-      sceneBounds,
-      globalOffset,
-      initializedOffset: false
-    };
-  }
-  const newBounds = new THREE.Box3(
-    new THREE.Vector3(globalBounds.min.x, globalBounds.min.y, globalBounds.min.z),
-    new THREE.Vector3(globalBounds.max.x, globalBounds.max.y, globalBounds.max.z)
-  );
-  let initializedOffset = false;
-  const nextGlobalOffset = globalOffset.clone();
-  if (nextGlobalOffset.length() === 0) {
-    newBounds.getCenter(nextGlobalOffset);
-    initializedOffset = true;
-  }
-  const nextPrecomputedBounds = precomputedBounds.clone();
-  if (nextPrecomputedBounds.isEmpty()) {
-    nextPrecomputedBounds.copy(newBounds);
-  } else {
-    nextPrecomputedBounds.union(newBounds);
-  }
-  return {
-    precomputedBounds: nextPrecomputedBounds,
-    sceneBounds: nextPrecomputedBounds.clone(),
-    globalOffset: nextGlobalOffset,
-    initializedOffset
-  };
-}
-function appendNbimStructure(options) {
-  const { structureRoot, modelRoot } = options;
-  if (!structureRoot.children) structureRoot.children = [];
-  if (!modelRoot) return structureRoot;
-  if (modelRoot.children && modelRoot.name === "Root") {
-    structureRoot.children.push(...modelRoot.children);
-  } else {
-    structureRoot.children.push(modelRoot);
-  }
-  return structureRoot;
-}
-function buildNbimQuickStats(options) {
-  const { manifestStats, modelRoot, chunks } = options;
-  return manifestStats || {
-    meshes: countStructureRenderableNodes(modelRoot),
-    faces: 0,
-    memory: parseFloat(((chunks || []).reduce((sum, chunk) => sum + (chunk.byteLength || 0), 0) / (1024 * 1024)).toFixed(2))
-  };
-}
-function populateNbimNodeMappings(options) {
-  const { modelRoot, defaultOwner, nodeMap, bimIdToNodeIds } = options;
-  if (!modelRoot) return;
-  const traverse = (node) => {
-    if (!node.userData) node.userData = {};
-    const nodeOriginalUuid = node.userData?.originalUuid ? String(node.userData.originalUuid) : defaultOwner;
-    node.userData.originalUuid = nodeOriginalUuid;
-    if (!nodeMap.has(node.id)) nodeMap.set(node.id, []);
-    nodeMap.get(node.id).push(node);
-    if (node.bimId) {
-      const key = `${nodeOriginalUuid}::${node.bimId}`;
-      if (!bimIdToNodeIds.has(key)) bimIdToNodeIds.set(key, []);
-      bimIdToNodeIds.get(key).push(node.id);
-    }
-    if (node.children) node.children.forEach(traverse);
-  };
-  traverse(modelRoot);
-}
-async function registerNbimChunks(options) {
-  const {
-    chunkEntries,
-    globalOffset,
-    chunkPadding,
-    rootId,
-    fileId,
-    immediateGhostLimit,
-    registrationBatchSize,
-    onProgress,
-    registerChunk,
-    createGhostLine,
-    addGhostLine,
-    yieldToMainThread
-  } = options;
-  if (chunkEntries.length === 0) {
-    throw new Error("NBIM 文件没有可渲染分块，可能格式有问题");
-  }
-  const chunkOffset = globalOffset.lengthSq() > 0 ? globalOffset.clone().negate() : null;
-  const deferredGhostSpecs = [];
-  for (let index = 0; index < chunkEntries.length; index++) {
-    const chunkEntry = chunkEntries[index];
-    if (!chunkEntry?.bounds || typeof chunkEntry.byteOffset !== "number" || typeof chunkEntry.byteLength !== "number") {
-      throw new Error("NBIM 分块数据不完整，可能格式有问题");
-    }
-    const bounds = new THREE.Box3(
-      new THREE.Vector3(chunkEntry.bounds.min.x, chunkEntry.bounds.min.y, chunkEntry.bounds.min.z),
-      new THREE.Vector3(chunkEntry.bounds.max.x, chunkEntry.bounds.max.y, chunkEntry.bounds.max.z)
-    );
-    if (chunkOffset) {
-      bounds.translate(chunkOffset);
-    }
-    const chunkId = chunkEntry.id;
-    const center = bounds.getCenter(new THREE.Vector3());
-    const paddedBounds = bounds.clone();
-    const padSize = bounds.getSize(new THREE.Vector3()).multiplyScalar(chunkPadding);
-    paddedBounds.expandByVector(padSize);
-    registerChunk({
-      id: chunkId,
-      bounds,
-      paddedBounds,
-      _padding: chunkPadding,
-      center,
-      loaded: false,
-      byteOffset: chunkEntry.byteOffset,
-      byteLength: chunkEntry.byteLength,
-      nbimFileId: fileId,
-      groupName: `optimized_${rootId}`,
-      originalUuid: chunkEntry.originalUuid ? String(chunkEntry.originalUuid) : rootId
-    });
-    if (index < immediateGhostLimit) {
-      addGhostLine(createGhostLine(`ghost_${chunkId}`, bounds));
-    } else {
-      deferredGhostSpecs.push({ chunkId, bounds });
-    }
-    if ((index + 1) % registrationBatchSize === 0) {
-      if (onProgress) {
-        const ratio = Math.max(0, Math.min(1, (index + 1) / chunkEntries.length));
-        onProgress(30 + Math.round(ratio * 40), "正在初始化分块...");
-      }
-      await yieldToMainThread();
-    }
-  }
-  return {
-    deferredGhostSpecs
-  };
-}
-function finalizeNbimLoad(options) {
-  const { chunkCount, hasManifestStats, hasManifestChunks } = options;
-  return {
-    chunkWarmupActive: true,
-    initialChunkLoadTarget: chunkCount > 200 ? 44 : chunkCount > 80 ? 30 : 16,
-    shouldEstimateStats: !hasManifestStats && hasManifestChunks
-  };
-}
-
-function getHighlightColor(settings) {
-  return new THREE.Color(settings.highlightColor || "#ff9f1c");
-}
-function restoreHighlightedInstanceColors(context, uuids) {
-  for (const id of uuids) {
-    const mappings = context.optimizedMapping.get(id);
-    if (!mappings) continue;
-    mappings.forEach((mapping) => {
-      mapping.mesh.setColorAt(mapping.instanceId, new THREE.Color(mapping.originalColor));
-      if (mapping.mesh.instanceColor) {
-        mapping.mesh.instanceColor.needsUpdate = true;
-      }
-    });
-  }
-}
-function applyHighlightedInstanceColors(context, uuids) {
-  const highlightColor = getHighlightColor(context.settings);
-  for (const id of uuids) {
-    const mappings = context.optimizedMapping.get(id);
-    if (!mappings) continue;
-    mappings.forEach((mapping) => {
-      mapping.mesh.setColorAt(mapping.instanceId, highlightColor);
-      if (mapping.mesh.instanceColor) {
-        mapping.mesh.instanceColor.needsUpdate = true;
-      }
-    });
-  }
-}
-function updateSelectionHelpers(context, target) {
-  context.selectionBox.visible = false;
-  context.highlightMesh.visible = false;
-  if (target.size === 0) {
-    return;
-  }
-  const union = new THREE.Box3();
-  const tmpBox = new THREE.Box3();
-  const tmpMatrix = new THREE.Matrix4();
-  const addObjectBounds = (id) => {
-    const mappings = context.optimizedMapping.get(id);
-    if (mappings && mappings.length > 0) {
-      const mapping = mappings[0];
-      if (mapping.geometry) {
-        if (!mapping.geometry.boundingBox) mapping.geometry.computeBoundingBox();
-        tmpBox.copy(mapping.geometry.boundingBox);
-        mapping.mesh.getMatrixAt(mapping.instanceId, tmpMatrix);
-        tmpMatrix.premultiply(mapping.mesh.matrixWorld);
-        tmpBox.applyMatrix4(tmpMatrix);
-        union.union(tmpBox);
-      }
-      return;
-    }
-    const object = context.contentGroup.getObjectByProperty("uuid", id);
-    if (!object) return;
-    object.updateMatrixWorld(true);
-    if (object.userData.boundingBox) {
-      tmpBox.copy(object.userData.boundingBox).applyMatrix4(object.matrixWorld);
-    } else {
-      tmpBox.setFromObject(object);
-    }
-    union.union(tmpBox);
-  };
-  for (const id of target) addObjectBounds(id);
-  if (!union.isEmpty()) {
-    context.selectionBox.box.copy(union);
-    const locatingFocus = !!(context.state.locateFocusUuid && target.has(context.state.locateFocusUuid));
-    if (locatingFocus) {
-      const pad = Math.max(union.getSize(new THREE.Vector3()).length() * 0.048, 0.22);
-      context.selectionBox.box.expandByScalar(pad);
-    }
-    context.selectionBox.visible = locatingFocus || !!context.settings.highlightShowBox;
-  }
-  const focusId = context.state.lastSelectedUuid;
-  if (!focusId) return;
-  const focusMappings = context.optimizedMapping.get(focusId);
-  if (focusMappings && focusMappings.length > 0) {
-    context.highlightMesh.visible = false;
-    return;
-  }
-  const focusObject = context.contentGroup.getObjectByProperty("uuid", focusId);
-  if (!focusObject || !focusObject.isMesh) return;
-  focusObject.updateMatrixWorld(true);
-  context.highlightMesh.geometry = focusObject.geometry;
-  const worldPosition = new THREE.Vector3();
-  const worldQuaternion = new THREE.Quaternion();
-  const worldScale = new THREE.Vector3();
-  focusObject.matrixWorld.decompose(worldPosition, worldQuaternion, worldScale);
-  worldScale.multiplyScalar(1.035);
-  context.highlightMesh.position.copy(worldPosition);
-  context.highlightMesh.quaternion.copy(worldQuaternion);
-  context.highlightMesh.scale.copy(worldScale);
-  context.highlightMesh.visible = true;
-}
-function hasSameLocateResultSet(currentSet, uuids) {
-  if (currentSet.size !== uuids.length) return false;
-  for (const uuid of uuids) {
-    if (!currentSet.has(uuid)) return false;
-  }
-  return true;
-}
-function expandLocateTargets(contentMap, ids) {
-  const expanded = /* @__PURE__ */ new Set();
-  const queue = [...ids];
-  const visited = /* @__PURE__ */ new Set();
-  while (queue.length > 0) {
-    const current = queue.shift();
-    if (!current || visited.has(current)) continue;
-    visited.add(current);
-    expanded.add(current);
-    const nodes = contentMap.get(current);
-    if (!nodes || nodes.length === 0) continue;
-    for (const node of nodes) {
-      if (!node.children || node.children.length === 0) continue;
-      for (const child of node.children) {
-        if (!visited.has(child.id)) queue.push(child.id);
-      }
-    }
-  }
-  return expanded;
-}
-function applyHighlightObjects(context, uuids) {
-  context.clearClashPairHighlight();
-  const target = new Set(uuids.filter(Boolean));
-  const preserveLocateTint = context.state.locateResultSet.size > 0;
-  if (!preserveLocateTint) {
-    restoreHighlightedInstanceColors(context, [...context.state.highlightedUuids].filter((id) => !target.has(id)));
-    applyHighlightedInstanceColors(context, [...target].filter((id) => !context.state.highlightedUuids.has(id)));
-  }
-  context.state.highlightedUuids = target;
-  context.state.lastSelectedUuid = uuids.length > 0 ? uuids[uuids.length - 1] : null;
-  updateSelectionHelpers(context, target);
-  return { needsRender: true };
-}
-function applyClearLocateFocus(context) {
-  context.clearClashPairHighlight();
-  context.locateObjectMaterialCache.forEach((material, uuid) => {
-    const object = context.contentGroup.getObjectByProperty("uuid", uuid);
-    if (!object || !object.isMesh && !object.isBatchedMesh) return;
-    object.material = material;
-  });
-  context.locateObjectMaterialCache.clear();
-  context.locateMaterialCache.clear();
-  context.locateDimmedInstances.forEach(({ mesh, instanceId, originalColor }) => {
-    mesh.setColorAt(instanceId, new THREE.Color(originalColor));
-    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-  });
-  context.locateDimmedInstances.clear();
-  context.state.locateResultSet.clear();
-  context.state.locateFocusUuid = null;
-  context.state.highlightedUuids = /* @__PURE__ */ new Set();
-  context.state.lastSelectedUuid = null;
-  context.selectionBox.visible = false;
-  context.highlightMesh.visible = false;
-  return { needsRender: true };
-}
-function applySetLocateResultSet(context, uuids, focusUuid = null, options) {
-  context.clearClashPairHighlight();
-  const normalized = Array.from(new Set(uuids.filter(Boolean)));
-  if (normalized.length === 0) {
-    return applyClearLocateFocus(context);
-  }
-  const selectedSet = new Set(normalized);
-  const expandedTargets = expandLocateTargets(context.nodeMap, normalized);
-  const expandedList = Array.from(expandedTargets);
-  const rootColorByExpandedId = /* @__PURE__ */ new Map();
-  const colorEntries = options?.highlightColors || {};
-  normalized.forEach((rootId) => {
-    const colorHex = colorEntries[rootId];
-    if (!colorHex) return;
-    const rootColor = new THREE.Color(colorHex);
-    const expandedFromRoot = expandLocateTargets(context.nodeMap, [rootId]);
-    expandedFromRoot.forEach((id) => rootColorByExpandedId.set(id, rootColor));
-  });
-  if (hasSameLocateResultSet(context.state.locateResultSet, expandedList)) {
-    const nextFocus = focusUuid && context.state.locateResultSet.has(focusUuid) ? focusUuid : expandedList[0];
-    context.state.locateFocusUuid = nextFocus;
-    return applyHighlightObjects(context, nextFocus ? [nextFocus] : []);
-  }
-  applyClearLocateFocus(context);
-  context.state.locateResultSet = expandedTargets;
-  context.state.locateFocusUuid = focusUuid && expandedTargets.has(focusUuid) ? focusUuid : expandedList[0];
-  const focusKey = context.state.locateFocusUuid;
-  const dimmedColor = new THREE.Color("#b7bec9");
-  const accentColor = getHighlightColor(context.settings);
-  context.contentGroup.traverse((child) => {
-    const mesh = child;
-    if (!mesh.isMesh || !mesh.material) return;
-    if (!context.locateObjectMaterialCache.has(child.uuid)) {
-      context.locateObjectMaterialCache.set(child.uuid, mesh.material);
-    }
-    const sourceMaterials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-    const isMatched = expandedTargets.has(child.uuid);
-    const isFocus = isMatched && focusKey !== null && child.uuid === focusKey;
-    const matchedColor = rootColorByExpandedId.get(child.uuid) || accentColor;
-    const nextMaterials = sourceMaterials.map((material) => {
-      if (!material) return material;
-      const cloned = material.clone();
-      if ("transparent" in cloned) cloned.transparent = false;
-      if ("opacity" in cloned) cloned.opacity = 1;
-      if ("depthWrite" in cloned) cloned.depthWrite = true;
-      if ("color" in cloned && cloned.color) {
-        const baseColor = cloned.color.clone();
-        if (isMatched) {
-          cloned.color.copy(baseColor.lerp(matchedColor, isFocus ? 0.93 : 0.76));
-        } else {
-          cloned.transparent = true;
-          cloned.opacity = 0.18;
-          cloned.depthWrite = false;
-          cloned.color.copy(baseColor.lerp(dimmedColor, 0.84));
-        }
-      }
-      if ("emissive" in cloned && cloned.emissive) {
-        if (isMatched) cloned.emissive.copy(matchedColor.clone().multiplyScalar(isFocus ? 0.4 : 0.12));
-        else cloned.emissive.set(0);
-      }
-      if ("roughness" in cloned && !isMatched) cloned.roughness = Math.max(0.9, cloned.roughness ?? 0.9);
-      if ("metalness" in cloned && !isMatched) cloned.metalness = Math.min(0.02, cloned.metalness ?? 0.02);
-      cloned.needsUpdate = true;
-      return cloned;
-    });
-    mesh.material = Array.isArray(mesh.material) ? nextMaterials : nextMaterials[0];
-  });
-  context.contentGroup.traverse((child) => {
-    const batched = child;
-    if (!batched.isBatchedMesh || !batched.material) return;
-    if (!context.locateObjectMaterialCache.has(child.uuid)) {
-      context.locateObjectMaterialCache.set(child.uuid, batched.material);
-    }
-    const owner = batched.userData?.originalUuid ? String(batched.userData.originalUuid) : "";
-    const batchIdToUuid = batched.userData?.batchIdToUuid;
-    let hasMatchedInstance = false;
-    let hasFocusInstance = false;
-    let instanceMatchColor = owner ? rootColorByExpandedId.get(owner) || null : null;
-    if (batchIdToUuid && batchIdToUuid.size > 0) {
-      for (const instanceUuid of batchIdToUuid.values()) {
-        if (!hasMatchedInstance && expandedTargets.has(instanceUuid)) hasMatchedInstance = true;
-        if (!hasFocusInstance && focusKey !== null && instanceUuid === focusKey) hasFocusInstance = true;
-        if (!instanceMatchColor && expandedTargets.has(instanceUuid)) {
-          instanceMatchColor = rootColorByExpandedId.get(instanceUuid) || null;
-        }
-        if (hasMatchedInstance && hasFocusInstance) break;
-      }
-    }
-    const ownerExplicitSelected = owner ? selectedSet.has(owner) : false;
-    const isMatched = expandedTargets.has(child.uuid) || hasMatchedInstance || ownerExplicitSelected;
-    const isFocus = context.state.locateFocusUuid !== null && context.state.locateFocusUuid === child.uuid || hasFocusInstance || ownerExplicitSelected && context.state.locateFocusUuid !== null && context.state.locateFocusUuid === owner;
-    const sourceMaterials = Array.isArray(batched.material) ? batched.material : [batched.material];
-    const matchedColor = instanceMatchColor || accentColor;
-    const nextMaterials = sourceMaterials.map((material) => {
-      if (!material) return material;
-      const cloned = material.clone();
-      if ("transparent" in cloned) cloned.transparent = false;
-      if ("opacity" in cloned) cloned.opacity = 1;
-      if ("depthWrite" in cloned) cloned.depthWrite = true;
-      if ("color" in cloned && cloned.color) {
-        const baseColor = cloned.color.clone();
-        if (isMatched) {
-          cloned.color.copy(baseColor.lerp(matchedColor, isFocus ? 0.92 : 0.7));
-        } else {
-          cloned.transparent = true;
-          cloned.opacity = 0.16;
-          cloned.depthWrite = false;
-          cloned.color.copy(baseColor.lerp(dimmedColor, 0.86));
-        }
-      }
-      if ("emissive" in cloned && cloned.emissive) {
-        if (isMatched) cloned.emissive.copy(matchedColor.clone().multiplyScalar(isFocus ? 0.36 : 0.12));
-        else cloned.emissive.set(0);
-      }
-      if ("roughness" in cloned && !isMatched) cloned.roughness = Math.max(0.9, cloned.roughness ?? 0.9);
-      if ("metalness" in cloned && !isMatched) cloned.metalness = Math.min(0.02, cloned.metalness ?? 0.02);
-      cloned.needsUpdate = true;
-      return cloned;
-    });
-    batched.material = Array.isArray(batched.material) ? nextMaterials : nextMaterials[0];
-  });
-  context.optimizedMapping.forEach((mappings, originalUuid) => {
-    const isMatched = expandedTargets.has(originalUuid);
-    const isFocus = isMatched && focusKey !== null && originalUuid === focusKey;
-    const matchedColor = rootColorByExpandedId.get(originalUuid) || accentColor;
-    mappings.forEach((mapping) => {
-      const key = `${mapping.mesh.uuid}:${mapping.instanceId}`;
-      context.locateDimmedInstances.set(key, {
-        mesh: mapping.mesh,
-        instanceId: mapping.instanceId,
-        originalColor: mapping.originalColor
-      });
-      const sourceColor = new THREE.Color(mapping.originalColor);
-      const tint = isFocus ? 0.93 : isMatched ? 0.76 : 0.82;
-      const targetColor = isMatched ? matchedColor : dimmedColor;
-      mapping.mesh.setColorAt(mapping.instanceId, sourceColor.lerp(targetColor, tint));
-      if (mapping.mesh.instanceColor) mapping.mesh.instanceColor.needsUpdate = true;
-    });
-  });
-  return applyHighlightObjects(context, context.state.locateFocusUuid ? [context.state.locateFocusUuid] : []);
-}
-
-function createMarker(point, parent, dotTexture) {
-  const markerGeometry = new THREE.BufferGeometry().setAttribute(
-    "position",
-    new THREE.Float32BufferAttribute([point.x, point.y, point.z], 3)
-  );
-  const markerMaterial = new THREE.PointsMaterial({
-    color: 16711680,
-    size: 8,
-    map: dotTexture,
-    transparent: true,
-    alphaTest: 0.5,
-    depthTest: false
-  });
-  const marker = new THREE.Points(markerGeometry, markerMaterial);
-  marker.renderOrder = 999;
-  parent.add(marker);
-}
-function createLine(points, parent) {
-  const geometry = new THREE.BufferGeometry().setFromPoints(points);
-  const material = new THREE.LineBasicMaterial({ color: 16711680, depthTest: false, linewidth: 2 });
-  const line = new THREE.Line(geometry, material);
-  line.renderOrder = 998;
-  parent.add(line);
-}
-function createLabel(text, position) {
-  const canvas = document.createElement("canvas");
-  const context = canvas.getContext("2d");
-  if (!context) return new THREE.Sprite();
-  const fontSize = 48;
-  const padding = 24;
-  context.font = `Bold ${fontSize}px "Segoe UI", Arial, sans-serif`;
-  const textWidth = context.measureText(text).width;
-  canvas.width = textWidth + padding * 2;
-  canvas.height = fontSize + padding;
-  context.shadowColor = "rgba(0, 0, 0, 0.5)";
-  context.shadowBlur = 10;
-  context.fillStyle = "rgba(30, 30, 30, 0.9)";
-  const radius = 8;
-  const roundedContext = context;
-  if (roundedContext.roundRect) {
-    roundedContext.roundRect(5, 5, canvas.width - 10, canvas.height - 10, radius);
-  } else {
-    context.rect(5, 5, canvas.width - 10, canvas.height - 10);
-  }
-  context.fill();
-  context.shadowBlur = 0;
-  context.strokeStyle = "#ff0000";
-  context.lineWidth = 2;
-  context.stroke();
-  context.font = `Bold ${fontSize}px "Segoe UI", Arial, sans-serif`;
-  context.fillStyle = "#ffffff";
-  context.textAlign = "center";
-  context.textBaseline = "middle";
-  context.fillText(text, canvas.width / 2, canvas.height / 2);
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.minFilter = THREE.LinearFilter;
-  texture.magFilter = THREE.LinearFilter;
-  const material = new THREE.SpriteMaterial({
-    map: texture,
-    depthTest: false,
-    sizeAttenuation: false
-  });
-  const sprite = new THREE.Sprite(material);
-  sprite.position.copy(position);
-  const baseScale = 0.5;
-  sprite.scale.set(baseScale * (canvas.width / canvas.height), baseScale, 1);
-  sprite.renderOrder = 1001;
-  sprite.userData = { type: "label" };
-  return sprite;
-}
-function clearPreviewVisuals(context, state) {
-  if (state.previewLine) {
-    context.measureGroup.remove(state.previewLine);
-    state.previewLine = null;
-  }
-  if (state.previewPolygon) {
-    context.measureGroup.remove(state.previewPolygon);
-    state.previewPolygon = null;
-  }
-  context.tempMarker.visible = false;
-}
-function applyClearMeasurementPreview(context, resetPoints = true) {
-  const state = {
-    ...context.state,
-    currentMeasurePoints: resetPoints ? [] : [...context.state.currentMeasurePoints]
-  };
-  clearPreviewVisuals(context, state);
-  for (let i = context.measureGroup.children.length - 1; i >= 0; i--) {
-    const child = context.measureGroup.children[i];
-    if (!child.name.startsWith("measure_")) {
-      context.measureGroup.remove(child);
-    }
-  }
-  return {
-    state,
-    needsRender: true
-  };
-}
-function applyUpdateMeasurePreview(context, hoverPoint) {
-  const state = {
-    ...context.state,
-    currentMeasurePoints: [...context.state.currentMeasurePoints]
-  };
-  clearPreviewVisuals(context, state);
-  const points = [...state.currentMeasurePoints];
-  if (hoverPoint) points.push(hoverPoint);
-  if (points.length < 2) {
-    return { state, needsRender: false };
-  }
-  const geometry = new THREE.BufferGeometry().setFromPoints(points);
-  const material = new THREE.LineDashedMaterial({
-    color: 16711680,
-    dashSize: 5,
-    gapSize: 2,
-    depthTest: false
-  });
-  state.previewLine = new THREE.Line(geometry, material);
-  state.previewLine.computeLineDistances();
-  state.previewLine.renderOrder = 998;
-  context.measureGroup.add(state.previewLine);
-  return { state, needsRender: false };
-}
-function applyUpdateMeasureHover(context, clientX, clientY) {
-  const state = {
-    ...context.state,
-    currentMeasurePoints: [...context.state.currentMeasurePoints]
-  };
-  if (state.measureType === "none") {
-    context.tempMarker.visible = false;
-    return { state, needsRender: false };
-  }
-  const intersect = context.getRayIntersects(clientX, clientY);
-  if (!intersect) {
-    context.tempMarker.visible = false;
-    if (state.previewLine) state.previewLine.visible = false;
-    return { state, needsRender: true };
-  }
-  const point = intersect.point;
-  const position = context.tempMarker.geometry.attributes.position;
-  position.setXYZ(0, point.x, point.y, point.z);
-  position.needsUpdate = true;
-  context.tempMarker.visible = true;
-  if (state.currentMeasurePoints.length === 0) {
-    return { state, needsRender: true };
-  }
-  const previewResult = applyUpdateMeasurePreview(context, point);
-  return {
-    state: previewResult.state,
-    needsRender: true
-  };
-}
-function applyFinalizeMeasurement(context) {
-  const state = {
-    ...context.state,
-    currentMeasurePoints: [...context.state.currentMeasurePoints]
-  };
-  const id = `measure_${Date.now()}`;
-  const group = new THREE.Group();
-  group.name = id;
-  state.currentMeasurePoints.forEach((point) => createMarker(point, group, context.dotTexture));
-  let value = "";
-  let displayValue = "";
-  const type = state.measureType;
-  const labelPosition = new THREE.Vector3();
-  if (state.measureType === "dist") {
-    const [p1, p2] = state.currentMeasurePoints;
-    const distance = p1.distanceTo(p2);
-    const dx = Math.abs(p2.x - p1.x);
-    const dy = Math.abs(p2.y - p1.y);
-    const dz = Math.abs(p2.z - p1.z);
-    displayValue = distance.toFixed(3);
-    value = `${displayValue} (Δx:${dx.toFixed(2)}, Δy:${dy.toFixed(2)}, Δz:${dz.toFixed(2)})`;
-    createLine(state.currentMeasurePoints, group);
-    labelPosition.copy(p1).add(p2).multiplyScalar(0.5);
-  } else if (state.measureType === "angle") {
-    const [p1, center, p2] = state.currentMeasurePoints;
-    const v1 = p1.clone().sub(center).normalize();
-    const v2 = p2.clone().sub(center).normalize();
-    const angle = v1.angleTo(v2) * (180 / Math.PI);
-    displayValue = `${angle.toFixed(2)}°`;
-    value = displayValue;
-    createLine(state.currentMeasurePoints, group);
-    labelPosition.copy(center);
-  } else {
-    const [point] = state.currentMeasurePoints;
-    displayValue = `(${point.x.toFixed(2)}, ${point.y.toFixed(2)}, ${point.z.toFixed(2)})`;
-    value = displayValue;
-    labelPosition.copy(point);
-  }
-  group.add(createLabel(displayValue, labelPosition));
-  context.measureGroup.add(group);
-  context.measureRecords.set(id, {
-    id,
-    type,
-    val: value,
-    group,
-    modelUuid: state.currentMeasureModelUuid || void 0
-  });
-  const cleared = applyClearMeasurementPreview(
-    {
-      ...context,
-      state: {
-        ...state,
-        currentMeasurePoints: [],
-        currentMeasureModelUuid: null
-      }
-    },
-    false
-  );
-  const nextState = {
-    ...cleared.state,
-    currentMeasurePoints: [],
-    currentMeasureModelUuid: null
-  };
-  if (context.onMeasureUpdate) {
-    context.onMeasureUpdate(Array.from(context.measureRecords.values()));
-  }
-  return {
-    state: nextState,
-    needsRender: true,
-    completed: { id, type, val: value }
-  };
-}
-function applyAddMeasurePoint(context, point, modelUuid) {
-  if (context.state.measureType === "none") {
-    return { state: context.state, needsRender: false, completed: null };
-  }
-  const state = {
-    ...context.state,
-    currentMeasurePoints: [...context.state.currentMeasurePoints, point],
-    currentMeasureModelUuid: modelUuid ?? context.state.currentMeasureModelUuid
-  };
-  createMarker(point, context.measureGroup, context.dotTexture);
-  const shouldFinalize = state.measureType === "dist" && state.currentMeasurePoints.length === 2 || state.measureType === "angle" && state.currentMeasurePoints.length === 3 || state.measureType === "coord";
-  if (shouldFinalize) {
-    return applyFinalizeMeasurement({ ...context, state });
-  }
-  const previewResult = applyUpdateMeasurePreview({ ...context, state });
-  return {
-    state: previewResult.state,
-    needsRender: true,
-    completed: null
-  };
-}
-function applyHighlightMeasurement(context, id) {
-  context.measureRecords.forEach((record, recordId) => {
-    const isHighlighted = recordId === id;
-    const color = isHighlighted ? 65280 : 16711680;
-    record.group.traverse((child) => {
-      if (child instanceof THREE.Line || child instanceof THREE.LineLoop) {
-        child.material.color.set(color);
-      } else if (child instanceof THREE.Points) {
-        child.material.color.set(color);
-      } else if (child instanceof THREE.Sprite) {
-        child.material.color.set(isHighlighted ? 65280 : 16777215);
-      } else if (child instanceof THREE.Mesh && child.material instanceof THREE.MeshBasicMaterial) {
-        child.material.color.set(color);
-      } else if (child instanceof THREE.Box3Helper) {
-        child.material.color.set(color);
-      }
-    });
-  });
-  return {
-    state: context.state,
-    needsRender: true
-  };
-}
-function applyPickMeasurement(context, clientX, clientY) {
-  const rect = context.canvas.getBoundingClientRect();
-  context.mouse.x = (clientX - rect.left) / rect.width * 2 - 1;
-  context.mouse.y = -((clientY - rect.top) / rect.height) * 2 + 1;
-  context.raycaster.setFromCamera(context.mouse, context.camera);
-  const previousThreshold = context.raycaster.params.Line?.threshold || 0;
-  if (context.raycaster.params.Line) {
-    context.raycaster.params.Line.threshold = 5;
-  }
-  const intersects = context.raycaster.intersectObjects(context.measureGroup.children, true);
-  if (context.raycaster.params.Line) {
-    context.raycaster.params.Line.threshold = previousThreshold;
-  }
-  if (intersects.length === 0) {
-    return null;
-  }
-  let object = intersects[0].object;
-  while (object.parent && !object.name.startsWith("measure_")) {
-    object = object.parent;
-  }
-  return object.name.startsWith("measure_") ? object.name : null;
-}
-
-function buildInteractableList(context) {
-  const interactableList = [];
-  if (context.chunks.length > 0) {
-    context.chunks.forEach((chunk) => {
-      if (chunk.loaded && chunk.mesh && chunk.mesh.visible) {
-        interactableList.push(chunk.mesh);
-      }
-    });
-  }
-  const traverseLimit = (object, depth) => {
-    if (depth > 10) return;
-    if (!object.visible) return;
-    if (object.userData.chunkId) return;
-    if (object.isMesh || object.isBatchedMesh) {
-      if (!object.userData.isOptimized) {
-        interactableList.push(object);
-      }
-      return;
-    }
-    if (object.children.length === 0) return;
-    for (const child of object.children) {
-      traverseLimit(child, depth + 1);
-    }
-  };
-  for (const child of context.contentGroup.children) {
-    if (child.userData.isOptimizedGroup) continue;
-    traverseLimit(child, 0);
-  }
-  return interactableList;
-}
-function createProxyObjectForBatchedHit(context, batchedMesh, batchId, originalUuid) {
-  const nodes = context.nodeMap.get(originalUuid);
-  const node = nodes?.[0];
-  const proxy = new THREE.Object3D();
-  proxy.uuid = originalUuid;
-  if (node) {
-    proxy.name = node.name;
-    proxy.type = node.type;
-    proxy.isMesh = node.type === "Mesh";
-  }
-  proxy.getWorldPosition = (vector) => {
-    const matrix2 = new THREE.Matrix4();
-    batchedMesh.getMatrixAt(batchId, matrix2);
-    matrix2.premultiply(batchedMesh.matrixWorld);
-    return vector.setFromMatrixPosition(matrix2);
-  };
-  const matrix = new THREE.Matrix4();
-  batchedMesh.getMatrixAt(batchId, matrix);
-  proxy.position.setFromMatrixPosition(matrix);
-  return proxy;
-}
-function ensureInteractableList(context) {
-  if (context.interactableListValid) {
-    return {
-      interactableList: context.interactableList,
-      interactableListValid: true
-    };
-  }
-  return {
-    interactableList: buildInteractableList(context),
-    interactableListValid: true
-  };
-}
-function applyGetRayIntersects(context, clientX, clientY) {
-  const rect = context.canvas.getBoundingClientRect();
-  context.mouse.x = (clientX - rect.left) / rect.width * 2 - 1;
-  context.mouse.y = -((clientY - rect.top) / rect.height) * 2 + 1;
-  context.raycaster.setFromCamera(context.mouse, context.camera);
-  const state = ensureInteractableList(context);
-  const intersects = context.raycaster.intersectObjects(state.interactableList, false);
-  if (intersects.length === 0) {
-    return { intersect: null, state };
-  }
-  const hit = intersects[0];
-  if (!hit.object.isBatchedMesh) {
-    return { intersect: hit, state };
-  }
-  const batchedMesh = hit.object;
-  const batchId = hit.batchId !== void 0 ? hit.batchId : hit.instanceId;
-  if (batchId === void 0) {
-    return { intersect: hit, state };
-  }
-  const originalUuid = batchedMesh.userData.batchIdToUuid?.get(batchId);
-  if (!originalUuid) {
-    return { intersect: hit, state };
-  }
-  const originalObject = context.contentGroup.getObjectByProperty("uuid", originalUuid);
-  hit.object = originalObject ?? createProxyObjectForBatchedHit(context, batchedMesh, batchId, originalUuid);
-  return { intersect: hit, state };
-}
-function selectInteractablesByScreenRect(context, x1, y1, x2, y2) {
-  const minX = Math.min(x1, x2);
-  const maxX = Math.max(x1, x2);
-  const minY = Math.min(y1, y2);
-  const maxY = Math.max(y1, y2);
-  const originalMatrix = context.camera.projectionMatrix.clone();
-  const newMatrix = new THREE.Matrix4();
-  const selectWidth = maxX - minX;
-  const selectHeight = maxY - minY;
-  const scaleX = selectWidth / 2;
-  const scaleY = selectHeight / 2;
-  const centerX = (maxX + minX) / 2;
-  const centerY = (maxY + minY) / 2;
-  const translateMatrix = new THREE.Matrix4().makeTranslation(-centerX, -centerY, 0);
-  const scaleMatrix = new THREE.Matrix4().makeScale(1 / scaleX, 1 / scaleY, 1);
-  newMatrix.multiplyMatrices(scaleMatrix, translateMatrix);
-  const modifiedProjectionMatrix = newMatrix.multiply(originalMatrix);
-  const frustum = new THREE.Frustum();
-  const viewMatrix = context.camera.matrixWorldInverse;
-  const projViewMatrix = modifiedProjectionMatrix.clone().multiply(viewMatrix);
-  frustum.setFromProjectionMatrix(projViewMatrix);
-  const selected = [];
-  const box = new THREE.Box3();
-  const tmpMatrix = new THREE.Matrix4();
-  for (const object of context.interactableList) {
-    if (object.isBatchedMesh) {
-      const batchedMesh = object;
-      const batchIdToUuid = batchedMesh.userData.batchIdToUuid;
-      const batchIdToGeometry = batchedMesh.userData.batchIdToGeometry;
-      if (!batchIdToUuid || !batchIdToGeometry) continue;
-      for (const [batchId, uuid] of batchIdToUuid) {
-        try {
-          const geometry = batchIdToGeometry.get(batchId);
-          if (!geometry) continue;
-          batchedMesh.getMatrixAt(batchId, tmpMatrix);
-          tmpMatrix.premultiply(batchedMesh.matrixWorld);
-          const geometryBox = new THREE.Box3();
-          if (!geometry.boundingBox) geometry.computeBoundingBox();
-          geometryBox.copy(geometry.boundingBox).applyMatrix4(tmpMatrix);
-          if (frustum.intersectsBox(geometryBox)) {
-            selected.push(uuid);
-          }
-        } catch {
-        }
-      }
-      continue;
-    }
-    box.setFromObject(object);
-    if (frustum.intersectsBox(box)) {
-      selected.push(object.uuid);
-    }
-  }
-  return selected;
-}
-
-function resolveBimIdByUuid({
-  uuid,
-  nodeMap,
-  bimIdToNodeIds
-}) {
-  const nodes = nodeMap.get(uuid);
-  if (nodes && nodes.length > 0 && nodes[0].bimId) {
-    return nodes[0].bimId;
-  }
-  for (const [key, nodeIds] of bimIdToNodeIds.entries()) {
-    if (nodeIds.includes(uuid)) {
-      const parts = key.split("::");
-      return parts.length > 1 ? parts[1] : null;
-    }
-  }
-  return null;
-}
-function resolveNodeUuidByBimId(bimId, bimIdToNodeIds) {
-  for (const [key, nodeIds] of bimIdToNodeIds.entries()) {
-    if (key.endsWith(`::${bimId}`) && nodeIds.length > 0) {
-      return nodeIds[0];
-    }
-  }
-  return null;
-}
-function resolveSelectionUuid(rawUuid, nodeMap, bimIdToNodeIds) {
-  if (nodeMap.has(rawUuid)) return rawUuid;
-  return resolveNodeUuidByBimId(rawUuid, bimIdToNodeIds) || rawUuid;
-}
-function resolveNbimNode(id, nodeMap) {
-  const direct = nodeMap.get(id);
-  return direct && direct.length > 0 ? direct[0] : null;
-}
-function resolveNbimPropertyEntry({
-  id,
-  nodeMap,
-  nbimPropsByOriginalUuid
-}) {
-  const node = resolveNbimNode(id, nodeMap);
-  if (!node || !node.bimId) return null;
-  const originalUuid = node.userData?.originalUuid ? String(node.userData.originalUuid) : "";
-  if (!originalUuid) return null;
-  const map = nbimPropsByOriginalUuid.get(originalUuid);
-  if (!map) return null;
-  return {
-    entry: map[`${originalUuid}::${node.bimId}`],
-    node
-  };
-}
-function resolveNbimFlatProperties(args) {
-  const resolved = resolveNbimPropertyEntry(args);
-  if (!resolved?.entry || typeof resolved.entry !== "object") return resolved?.entry || null;
-  const { ifcRawGroups, ifcNormalizedGroups, ...flatProps } = resolved.entry;
-  return flatProps;
-}
-function resolveNbimIfcPropertyGroups(args, mode = "raw") {
-  const resolved = resolveNbimPropertyEntry(args);
-  if (!resolved?.entry || typeof resolved.entry !== "object") return null;
-  const rawGroups = resolved.entry.ifcRawGroups;
-  const normalizedGroups = resolved.entry.ifcNormalizedGroups;
-  if (mode === "normalized") {
-    return normalizedGroups || rawGroups || null;
-  }
-  return rawGroups || normalizedGroups || null;
-}
-
-function estimateTextureMemoryMb(root) {
-  let textureMemory = 0;
-  const textures = /* @__PURE__ */ new Set();
-  root.traverse((obj) => {
-    if (obj.name === "__EdgesHelper") return;
-    if (!obj.isMesh && !obj.isBatchedMesh) return;
-    const mesh = obj;
-    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-    materials.forEach((material) => {
-      if (!material) return;
-      Object.values(material).forEach((value) => {
-        if (!(value instanceof THREE.Texture) || textures.has(value)) return;
-        textures.add(value);
-        const image = value.image;
-        const width = image?.width || 0;
-        const height = image?.height || 0;
-        if (width > 0 && height > 0) {
-          textureMemory += width * height * 4 / (1024 * 1024);
-        }
-      });
-    });
-  });
-  return parseFloat(textureMemory.toFixed(2));
-}
-
-function collectSceneManagerStats(context) {
-  const drawCalls = context.renderer.info.render.calls;
-  const textureMemory = estimateTextureMemoryMb(context.contentGroup);
-  return {
-    meshes: context.originalStats.meshes,
-    faces: context.originalStats.faces,
-    memory: parseFloat(context.originalStats.memory.toFixed(2)),
-    textureMemory,
-    drawCalls,
-    chunksLoaded: context.chunkLoadedCount,
-    chunksTotal: context.chunksLength,
-    chunksQueued: context.processingChunkCount,
-    pixelRatio: Number(context.activePixelRatio.toFixed(2))
-  };
-}
-
-function syncStructureNodeVisibility(nodeMap, rootNode, visible) {
-  const setNodeVisible = (node) => {
-    node.visible = visible;
-    node.children?.forEach(setNodeVisible);
-  };
-  rootNode.children?.forEach(setNodeVisible);
-  nodeMap.forEach((nodes) => {
-    nodes.forEach((node) => {
-      node.visible = visible;
-    });
-  });
-}
-function applyOptimizedMappingsVisibility(optimizedMapping, visible) {
-  optimizedMapping.forEach((mappings) => {
-    mappings.forEach((mapping) => {
-      mapping.mesh.setVisibleAt(mapping.instanceId, visible);
-    });
-  });
-}
-function applyRenderableVisibility(object, visible) {
-  if (object.name === "Helpers" || object.name === "Measure") return;
-  if (object.isMesh && object.userData.isOptimized) {
-    object.visible = false;
-    return;
-  }
-  object.visible = visible;
-}
-function ensureParentChainVisible(object, scene) {
-  let parent = object?.parent;
-  while (parent && parent !== scene) {
-    parent.visible = true;
-    parent = parent.parent;
-  }
-}
-function collectHighlightedDescendants(highlightedUuids, uuid, object, nodes) {
-  const idsToUnhighlight = [];
-  if (highlightedUuids.has(uuid)) {
-    idsToUnhighlight.push(uuid);
-  }
-  if (object) {
-    object.traverse((child) => {
-      if (highlightedUuids.has(child.uuid)) {
-        idsToUnhighlight.push(child.uuid);
-      }
-    });
-    return idsToUnhighlight;
-  }
-  if (nodes && nodes.length > 0) {
-    const walk = (node) => {
-      if (highlightedUuids.has(node.id)) idsToUnhighlight.push(node.id);
-      node.children?.forEach(walk);
-    };
-    walk(nodes[0]);
-  }
-  return idsToUnhighlight;
-}
-function syncNodeBranchVisibility(nodeMap, node, visible) {
-  node.visible = visible;
-  node.children?.forEach((child) => syncNodeBranchVisibility(nodeMap, child, visible));
-  const mirrored = nodeMap.get(node.id);
-  mirrored?.forEach((item) => {
-    item.visible = visible;
-  });
-}
-function applyObjectMappingVisibility(optimizedMapping, objectOrNodeId, visible) {
-  const mappings = optimizedMapping.get(objectOrNodeId);
-  if (!mappings) return;
-  mappings.forEach((mapping) => {
-    mapping.mesh.setVisibleAt(mapping.instanceId, visible);
-  });
-}
-function applySetAllVisibility(context, visible) {
-  syncStructureNodeVisibility(context.nodeMap, context.structureRoot, visible);
-  applyOptimizedMappingsVisibility(context.optimizedMapping, visible);
-  context.contentGroup.traverse((object) => {
-    applyRenderableVisibility(object, visible);
-  });
-  return {
-    needsBoundsUpdate: true,
-    needsExplodeRefresh: true,
-    needsRender: true
-  };
-}
-function applySetObjectVisibility(context, uuid, visible, showParents = true) {
-  const nodes = context.nodeMap.get(uuid);
-  nodes?.forEach((node) => syncNodeBranchVisibility(context.nodeMap, node, visible));
-  const object = context.contentGroup.getObjectByProperty("uuid", uuid);
-  if (visible && object && showParents) {
-    ensureParentChainVisible(object, context.scene);
-  }
-  const idsToUnhighlight = !visible ? collectHighlightedDescendants(context.highlightedUuids, uuid, object, nodes) : [];
-  if (!object) {
-    if (nodes && nodes.length > 0) {
-      const walk = (node) => {
-        applyObjectMappingVisibility(context.optimizedMapping, node.id, visible);
-        node.children?.forEach(walk);
-      };
-      walk(nodes[0]);
-    }
-    return {
-      needsBoundsUpdate: true,
-      needsExplodeRefresh: false,
-      needsRender: true,
-      nextHighlightedUuids: idsToUnhighlight.length > 0 ? Array.from(new Set([...context.highlightedUuids].filter((id) => !idsToUnhighlight.includes(id)))) : void 0
-    };
-  }
-  object.traverse((child) => {
-    if (child.name === "Helpers" || child.name === "Measure") return;
-    applyRenderableVisibility(child, visible);
-    applyObjectMappingVisibility(context.optimizedMapping, child.uuid, visible);
-  });
-  return {
-    needsBoundsUpdate: true,
-    needsExplodeRefresh: false,
-    needsRender: true,
-    nextHighlightedUuids: idsToUnhighlight.length > 0 ? Array.from(new Set([...context.highlightedUuids].filter((id) => !idsToUnhighlight.includes(id)))) : void 0
-  };
-}
-function applyVisibilityBatch(context, changes, options = {}) {
-  if (changes.length === 0) {
-    return {
-      needsBoundsUpdate: false,
-      needsExplodeRefresh: false,
-      needsRender: false
-    };
-  }
-  let highlighted = new Set(context.highlightedUuids);
-  let needsRender = false;
-  changes.forEach((change) => {
-    const result = applySetObjectVisibility(
-      {
-        ...context,
-        highlightedUuids: highlighted
-      },
-      change.uuid,
-      change.visible,
-      change.showParents ?? true
-    );
-    if (result.nextHighlightedUuids) {
-      highlighted = new Set(result.nextHighlightedUuids);
-    }
-    needsRender = needsRender || result.needsRender;
-  });
-  return {
-    needsBoundsUpdate: options.recomputeBounds ?? true,
-    needsExplodeRefresh: options.refreshExplode ?? false,
-    needsRender,
-    nextHighlightedUuids: Array.from(highlighted)
-  };
-}
-function applyIsolateObjects(context, uuids, setObjectVisibility) {
-  applySetAllVisibility(context, false);
-  const affectedBatchedMeshes = /* @__PURE__ */ new Set();
-  uuids.forEach((uuid) => {
-    setObjectVisibility(uuid, true);
-    const nodes = context.nodeMap.get(uuid);
-    if (nodes) {
-      nodes.forEach((node) => {
-        const showChildrenRecursive = (currentNode) => {
-          if (currentNode.id !== uuid) {
-            setObjectVisibility(currentNode.id, true);
-          }
-          currentNode.children?.forEach(showChildrenRecursive);
-        };
-        showChildrenRecursive(node);
-      });
-    }
-    const mappings = context.optimizedMapping.get(uuid);
-    mappings?.forEach((mapping) => {
-      affectedBatchedMeshes.add(mapping.mesh);
-    });
-  });
-  affectedBatchedMeshes.forEach((mesh) => {
-    mesh.visible = true;
-    ensureParentChainVisible(mesh, context.scene);
-  });
-  uuids.forEach((uuid) => {
-    const object = context.contentGroup.getObjectByProperty("uuid", uuid);
-    if (object) {
-      ensureParentChainVisible(object, context.scene);
-    }
-  });
-  return {
-    needsBoundsUpdate: true,
-    needsExplodeRefresh: true,
-    needsRender: true
-  };
-}
-
-const DEFAULT_SCENE_CHUNK_OPTIONS = {
-  chunkReadCacheSize: 128,
-  chunkPrefetchWindow: 0,
-  ghostMode: "visible-first",
-  targetMinFps: 20,
-  loadProfile: "max-speed",
-  deferIfcProperties: true,
-  preferWorkerOctree: true,
-  fastGeometrySanitize: true
-};
-function resolveSceneChunkOptions(options) {
-  return {
-    chunkReadCacheSize: Math.max(8, Math.min(256, Math.floor(options?.chunkReadCacheSize ?? DEFAULT_SCENE_CHUNK_OPTIONS.chunkReadCacheSize))),
-    chunkPrefetchWindow: Math.max(0, Math.min(32, Math.floor(options?.chunkPrefetchWindow ?? DEFAULT_SCENE_CHUNK_OPTIONS.chunkPrefetchWindow))),
-    ghostMode: options?.ghostMode ?? DEFAULT_SCENE_CHUNK_OPTIONS.ghostMode,
-    targetMinFps: Math.max(20, Math.min(60, Math.floor(options?.targetMinFps ?? DEFAULT_SCENE_CHUNK_OPTIONS.targetMinFps))),
-    loadProfile: options?.loadProfile ?? DEFAULT_SCENE_CHUNK_OPTIONS.loadProfile,
-    deferIfcProperties: options?.deferIfcProperties ?? DEFAULT_SCENE_CHUNK_OPTIONS.deferIfcProperties,
-    preferWorkerOctree: options?.preferWorkerOctree ?? DEFAULT_SCENE_CHUNK_OPTIONS.preferWorkerOctree,
-    fastGeometrySanitize: options?.fastGeometrySanitize ?? DEFAULT_SCENE_CHUNK_OPTIONS.fastGeometrySanitize
-  };
-}
-
-const NBIM_CHUNK_REGISTRATION_BATCH = 220;
-const GHOST_VISIBLE_FIRST_BATCH = 180;
-class SceneManager {
-  constructor(canvas, options = {}) {
-    this.structureRoot = { id: "root", name: "Root", type: "Group", children: [] };
-    this.nodeMap = /* @__PURE__ */ new Map();
-    this.bimIdToNodeIds = /* @__PURE__ */ new Map();
-    this.lastSelectedUuid = null;
-    this.highlightedUuids = /* @__PURE__ */ new Set();
-    this.locateFocusUuid = null;
-    this.locateResultSet = /* @__PURE__ */ new Set();
-    this.locateMaterialCache = /* @__PURE__ */ new Map();
-    this.locateObjectMaterialCache = /* @__PURE__ */ new Map();
-    this.locateDimmedInstances = /* @__PURE__ */ new Map();
-    this.clashPairObjectMaterialCache = /* @__PURE__ */ new Map();
-    this.clashPairInstanceColorCache = /* @__PURE__ */ new Map();
-    this.clashPairUuids = /* @__PURE__ */ new Set();
-    this.highlightPulseColor = new THREE.Color("#ffffff");
-    this.explodeEnabled = false;
-    this.explodeStrength = 0;
-    this.explodeCenter = new THREE.Vector3();
-    this.explodeMode = "radial";
-    this.explodeObjectStates = /* @__PURE__ */ new Map();
-    this.explodeInstanceStates = /* @__PURE__ */ new Map();
-    this.explodeScratchUniform = new THREE.Vector3();
-    this.explodeScratchMix = new THREE.Vector3();
-    this.measureType = "none";
-    this.currentMeasurePoints = [];
-    this.currentMeasureModelUuid = null;
-    this.previewLine = null;
-    this.previewPolygon = null;
-    this.measureRecords = /* @__PURE__ */ new Map();
-    this.boxSelectState = createInitialBoxSelectState();
-    this.clippingPlanes = [];
-    this.clipPlaneHelpers = [];
-    this.clipHelperVisible = false;
-    this.clipHelperOpacity = 0.12;
-    this.sceneCenter = new THREE.Vector3();
-    this.globalOffset = new THREE.Vector3();
-    this.componentMap = /* @__PURE__ */ new Map();
-    this.optimizedMapping = /* @__PURE__ */ new Map();
-    this.settings = {
-      ambientInt: 2,
-      dirInt: 1,
-      bgColor: "#edf0f3",
-      viewCubeSize: 100,
-      colorSpace: "srgb",
-      toneMapping: "aces",
-      exposure: 1,
-      shadowQuality: "medium",
-      adaptiveQuality: true,
-      minPixelRatio: 0.8,
-      maxPixelRatio: 2,
-      targetFps: 50,
-      performanceMode: "balanced",
-      highlightColor: "#ff9f1c",
-      highlightShowBox: false,
-      backLightInt: 0.5,
-      maxRenderDistance: 1e6
-      // 增加默认渲染距离到 1km (针对 mm 单位)
-    };
-    this.sceneBounds = new THREE.Box3();
-    this.cachedSceneSphere = new THREE.Sphere();
-    this.sceneSphereValid = false;
-    this.precomputedBounds = new THREE.Box3();
-    this.chunks = [];
-    this.chunkIdSet = /* @__PURE__ */ new Set();
-    this.chunkById = /* @__PURE__ */ new Map();
-    this.chunkIndexById = /* @__PURE__ */ new Map();
-    this.processingChunks = /* @__PURE__ */ new Set();
-    this.cancelledChunkIds = /* @__PURE__ */ new Set();
-    this.frustum = new THREE.Frustum();
-    this.projScreenMatrix = new THREE.Matrix4();
-    this.logicTimer = null;
-    this.nbimFiles = /* @__PURE__ */ new Map();
-    this.nbimMeta = /* @__PURE__ */ new Map();
-    this.nbimPropsByOriginalUuid = /* @__PURE__ */ new Map();
-    this.sharedMaterial = new THREE.MeshStandardMaterial({
-      color: 14277857,
-      roughness: 0.82,
-      metalness: 0.03,
-      side: THREE.DoubleSide
-    });
-    this.interactableList = [];
-    this.interactableListValid = false;
-    this._needsBoundsUpdate = false;
-    this.lastReportedProgress = { loaded: -1, total: -1 };
-    this.lastChunkProgressReportAt = 0;
-    this.chunkLoadedCount = 0;
-    this.chunkPadding = 0.2;
-    this.maxConcurrentChunkLoads = 128;
-    this.maxChunkLoadsPerFrame = 64;
-    this.maxLoadedChunks = 512;
-    this.maxCachedChunks = 48;
-    this.chunkLoadingEnabled = true;
-    this.maxRenderDistance = 1e6;
-    this._lastCullingTime = 0;
-    this.chunkMeshCache = /* @__PURE__ */ new Map();
-    this.chunkCacheOrder = [];
-    this.chunkReadCache = /* @__PURE__ */ new Map();
-    this.chunkReadCacheOrder = [];
-    this.prefetchQueue = [];
-    this.prefetchQueueSet = /* @__PURE__ */ new Set();
-    this.prefetchInFlight = /* @__PURE__ */ new Set();
-    this.prefetchRoundRobinCursor = 0;
-    this.prefetchPaused = false;
-    this.originalStats = { meshes: 0, faces: 0, memory: 0 };
-    this.originalStatsByModel = /* @__PURE__ */ new Map();
-    this.workers = [];
-    this.workerQueue = [];
-    this.activeWorkerCount = 0;
-    this.maxWorkers = 4;
-    this.isCameraMoving = false;
-    this.activePixelRatio = 1;
-    this.chunkLoadResumeAt = 0;
-    this.cullingDirty = true;
-    this.deferredStructureThreshold = 2e4;
-    this.octreeWorkerThreshold = 25e3;
-    this.initialChunkLoadTarget = 18;
-    this.warmupChunkBoost = 12;
-    this.chunkWarmupActive = false;
-    this.chunkResidencyMs = 1800;
-    this.chunkRuntimeProfiles = {
-      compact: {
-        name: "compact",
-        movingFocusCentralityThreshold: 0.16,
-        movingFocusPixelThreshold: 24,
-        chunkVisibilityHoldMs: 180,
-        centerPriorityThreshold: 0.52,
-        forwardPriorityThreshold: 0.64,
-        movingCoreCentralityThreshold: 0.5,
-        movingCorePixelThreshold: 36,
-        movingCoreForwardThreshold: 0.58,
-        movingPeripheralRefreshMs: 140,
-        movingPeripheralBatchRatio: 0.24,
-        movingPeripheralMinBatchSize: 40,
-        movingCullingIntervalMs: 34,
-        recoveryCullingIntervalMs: 58,
-        idleCullingIntervalMs: 120,
-        resumeAfterMoveMs: 90,
-        postMoveRecoveryMs: 320,
-        centerPriorityWindowMs: 180,
-        movingLoadBudgetMin: 2,
-        movingLoadBudgetMax: 8,
-        recoveryLoadBudgetMin: 4,
-        recoveryLoadBudgetMax: 12,
-        recoveryLoadBudgetRatio: 0.45
-      },
-      balanced: {
-        name: "balanced",
-        movingFocusCentralityThreshold: 0.18,
-        movingFocusPixelThreshold: 28,
-        chunkVisibilityHoldMs: 220,
-        centerPriorityThreshold: 0.58,
-        forwardPriorityThreshold: 0.68,
-        movingCoreCentralityThreshold: 0.54,
-        movingCorePixelThreshold: 42,
-        movingCoreForwardThreshold: 0.62,
-        movingPeripheralRefreshMs: 180,
-        movingPeripheralBatchRatio: 0.18,
-        movingPeripheralMinBatchSize: 64,
-        movingCullingIntervalMs: 40,
-        recoveryCullingIntervalMs: 72,
-        idleCullingIntervalMs: 140,
-        resumeAfterMoveMs: 110,
-        postMoveRecoveryMs: 480,
-        centerPriorityWindowMs: 240,
-        movingLoadBudgetMin: 2,
-        movingLoadBudgetMax: 6,
-        recoveryLoadBudgetMin: 4,
-        recoveryLoadBudgetMax: 10,
-        recoveryLoadBudgetRatio: 0.36
-      },
-      massive: {
-        name: "massive",
-        movingFocusCentralityThreshold: 0.2,
-        movingFocusPixelThreshold: 32,
-        chunkVisibilityHoldMs: 260,
-        centerPriorityThreshold: 0.62,
-        forwardPriorityThreshold: 0.72,
-        movingCoreCentralityThreshold: 0.58,
-        movingCorePixelThreshold: 48,
-        movingCoreForwardThreshold: 0.66,
-        movingPeripheralRefreshMs: 220,
-        movingPeripheralBatchRatio: 0.12,
-        movingPeripheralMinBatchSize: 96,
-        movingCullingIntervalMs: 46,
-        recoveryCullingIntervalMs: 88,
-        idleCullingIntervalMs: 180,
-        resumeAfterMoveMs: 130,
-        postMoveRecoveryMs: 620,
-        centerPriorityWindowMs: 300,
-        movingLoadBudgetMin: 2,
-        movingLoadBudgetMax: 5,
-        recoveryLoadBudgetMin: 3,
-        recoveryLoadBudgetMax: 8,
-        recoveryLoadBudgetRatio: 0.28
-      }
-    };
-    this.movingPeripheralCursor = 0;
-    this.movingPeripheralLastRefreshAt = 0;
-    this.postMoveRecoveryUntil = 0;
-    this.deferredStructureTimer = null;
-    this.deferredStructureToken = 0;
-    this.loadGeneration = 0;
-    this.fastPreviewMeshLimit = 1200;
-    this.fastPreviewModels = /* @__PURE__ */ new Set();
-    this.chunkCullingTempSize = new THREE.Vector3();
-    this.chunkCullingTempDirection = new THREE.Vector3();
-    this.chunkCullingTempForward = new THREE.Vector3();
-    this.chunkCullingTempCenterNdc = new THREE.Vector3();
-    this.boundsScanBatchSize = 2400;
-    this.chunkRegistrationBatchSize = 18;
-    this.chunkGhostBatchSize = 24;
-    this.animationFrameId = null;
-    this.animateFramePending = false;
-    this.disposed = false;
-    this.interactionShadowDowngraded = false;
-    this.interactionShadowRestoreAt = 0;
-    this.interactionShadowRestoreDelayMs = 220;
-    this.cullingScanCursor = 0;
-    this.cullingTimeBudgetMovingMs = 4.5;
-    this.cullingTimeBudgetRecoveryMs = 6;
-    this.cullingTimeBudgetIdleMs = 9;
-    this.forceMaxChunkLoadSpeed = true;
-    this.ghostMeshPool = [];
-    this.canvas = canvas;
-    this.options = options;
-    this.resolvedChunkOptions = resolveSceneChunkOptions(options.chunkOptions);
-    if (options.performancePreset) {
-      this.settings.performanceMode = options.performancePreset;
-    }
-    const width = canvas.clientWidth;
-    const height = canvas.clientHeight;
-    this.dotTexture = this.createCircleTexture();
-    this.clock = new THREE.Clock();
-    this.initHardwareProfile();
-    this.ghostEdgesGeometry = new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1));
-    this.ghostMaterial = new THREE.LineBasicMaterial({ color: 4674921, transparent: true, opacity: 0.3 });
-    this.renderer = new THREE.WebGLRenderer({
-      canvas,
-      antialias: true,
-      alpha: true,
-      logarithmicDepthBuffer: false,
-      // 正交相机不建议开启对数深度缓冲区，会导致 negative near 裁剪问题
-      precision: "highp",
-      powerPreference: "high-performance"
-    });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    this.renderer.setSize(width, height, false);
-    this.renderer.setClearColor(this.settings.bgColor);
-    this.renderer.localClippingEnabled = true;
-    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
-    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.04;
-    this.activePixelRatio = this.renderer.getPixelRatio();
-    this.scene = new THREE.Scene();
-    this.contentGroup = new THREE.Group();
-    this.contentGroup.name = "Content";
-    this.scene.add(this.contentGroup);
-    this.helpersGroup = new THREE.Group();
-    this.helpersGroup.name = "Helpers";
-    this.scene.add(this.helpersGroup);
-    this.measureGroup = new THREE.Group();
-    this.measureGroup.name = "Measure";
-    this.scene.add(this.measureGroup);
-    this.ghostGroup = new THREE.Group();
-    this.ghostGroup.name = "Ghost";
-    this.scene.add(this.ghostGroup);
-    this.clipHelpersGroup = new THREE.Group();
-    this.clipHelpersGroup.name = "ClipHelpers";
-    this.scene.add(this.clipHelpersGroup);
-    const frustumSize = 100;
-    const aspect = width / height;
-    this.camera = new THREE.OrthographicCamera(
-      frustumSize * aspect / -2,
-      frustumSize * aspect / 2,
-      frustumSize / 2,
-      frustumSize / -2,
-      -1e6,
-      1e6
-    );
-    this.camera.up.set(0, 0, 1);
-    this.camera.position.set(1e3, -1e3, 1e3);
-    this.camera.lookAt(0, 0, 0);
-    this.controls = new OrbitControls(this.camera, canvas);
-    this.controls.enableDamping = false;
-    this.controls.screenSpacePanning = true;
-    this.controls.maxPolarAngle = Math.PI;
-    this.controls.mouseButtons = {
-      LEFT: THREE.MOUSE.ROTATE,
-      MIDDLE: THREE.MOUSE.PAN,
-      RIGHT: void 0
-    };
-    this.controls.addEventListener("start", () => {
-      const profile = this.getChunkRuntimeProfile();
-      this.isCameraMoving = true;
-      this.prefetchPaused = true;
-      this.chunkLoadResumeAt = performance.now() + profile.resumeAfterMoveMs;
-      this.postMoveRecoveryUntil = 0;
-      this.interactionShadowRestoreAt = 0;
-      this.movingPeripheralLastRefreshAt = 0;
-      this.movingPeripheralCursor = 0;
-      this.markSceneDirty({ needsCulling: true });
-    });
-    this.controls.addEventListener("change", () => {
-      const profile = this.getChunkRuntimeProfile();
-      this.isCameraMoving = true;
-      this.prefetchPaused = true;
-      this.chunkLoadResumeAt = performance.now() + profile.resumeAfterMoveMs;
-      this.postMoveRecoveryUntil = 0;
-      this.interactionShadowRestoreAt = 0;
-      this.markSceneDirty({ needsCulling: true });
-    });
-    this.controls.addEventListener("end", () => {
-      const now = performance.now();
-      const profile = this.getChunkRuntimeProfile();
-      this.isCameraMoving = false;
-      this.prefetchPaused = false;
-      this.chunkLoadResumeAt = now + Math.max(24, Math.floor(profile.resumeAfterMoveMs * 0.75));
-      this.postMoveRecoveryUntil = now + profile.postMoveRecoveryMs;
-      this.interactionShadowRestoreAt = now + this.interactionShadowRestoreDelayMs;
-      this.movingPeripheralLastRefreshAt = 0;
-      this.movingPeripheralCursor = 0;
-      this.markSceneDirty({ needsCulling: true });
-    });
-    this.ambientLight = new THREE.AmbientLight(16251131, this.settings.ambientInt);
-    this.scene.add(this.ambientLight);
-    this.dirLight = new THREE.DirectionalLight(16776438, this.settings.dirInt);
-    this.dirLight.position.set(60, 45, 110);
-    this.scene.add(this.dirLight);
-    this.backLight = new THREE.DirectionalLight(15331062, this.settings.backLightInt ?? 0.5);
-    this.backLight.position.set(-40, -35, 30);
-    this.scene.add(this.backLight);
-    const box = new THREE.Box3(new THREE.Vector3(), new THREE.Vector3());
-    this.selectionBox = new THREE.Box3Helper(box, new THREE.Color(16776960));
-    this.selectionBox.visible = false;
-    this.helpersGroup.add(this.selectionBox);
-    const highlightMat = new THREE.MeshBasicMaterial({
-      color: this.settings.highlightColor,
-      transparent: false,
-      opacity: 1,
-      depthTest: false,
-      depthWrite: false,
-      side: THREE.BackSide
-    });
-    this.highlightMesh = new THREE.Mesh(new THREE.BufferGeometry(), highlightMat);
-    this.highlightMesh.visible = false;
-    this.highlightMesh.renderOrder = 999;
-    this.helpersGroup.add(this.highlightMesh);
-    const markerGeo = new THREE.BufferGeometry();
-    markerGeo.setAttribute("position", new THREE.Float32BufferAttribute([0, 0, 0], 3));
-    const markerMat = new THREE.PointsMaterial({
-      color: 16711680,
-      size: 8,
-      sizeAttenuation: false,
-      map: this.dotTexture,
-      transparent: true,
-      alphaTest: 0.5,
-      depthTest: false
-    });
-    this.tempMarker = new THREE.Points(markerGeo, markerMat);
-    this.tempMarker.visible = false;
-    this.tempMarker.renderOrder = 1e3;
-    this.helpersGroup.add(this.tempMarker);
-    this.setupClipping();
-    this.raycaster = new THREE.Raycaster();
-    this.raycaster.params.Points.threshold = 10;
-    if (!this.raycaster.params.Line) this.raycaster.params.Line = { threshold: 1 };
-    this.raycaster.params.Line.threshold = 2;
-    this.mouse = new THREE.Vector2();
-    this.animate = this.animate.bind(this);
-    this.markSceneDirty();
-  }
-  registerChunk(chunk) {
-    this.chunks.push(chunk);
-    this.chunkIdSet.add(chunk.id);
-    this.chunkById.set(chunk.id, chunk);
-    this.chunkIndexById.set(chunk.id, this.chunks.length - 1);
-  }
-  rebuildChunkIdSet() {
-    this.chunkIdSet.clear();
-    this.chunkById.clear();
-    this.chunkIndexById.clear();
-    for (let index = 0; index < this.chunks.length; index++) {
-      const chunk = this.chunks[index];
-      this.chunkIdSet.add(chunk.id);
-      this.chunkById.set(chunk.id, chunk);
-      this.chunkIndexById.set(chunk.id, index);
-    }
-  }
-  getChunkById(chunkId) {
-    return this.chunkById.get(chunkId);
-  }
-  getChunkIndex(chunkId) {
-    return this.chunkIndexById.get(chunkId) ?? -1;
-  }
-  /** 按需调度一帧：合并多次调用，在相机静止且无后台任务时不常驻 requestAnimationFrame */
-  requestRender() {
-    if (this.disposed) return;
-    if (this.animateFramePending) return;
-    this.animateFramePending = true;
-    this.animationFrameId = requestAnimationFrame(this.animate);
-  }
-  markSceneDirty(options = {}) {
-    const {
-      needsRender = true,
-      needsBoundsUpdate = false,
-      needsCulling = false,
-      invalidateInteractables = false
-    } = options;
-    if (invalidateInteractables) {
-      this.interactableListValid = false;
-    }
-    if (needsBoundsUpdate) {
-      this._needsBoundsUpdate = true;
-    }
-    if (needsCulling) {
-      this.cullingDirty = true;
-    }
-    if (needsRender) {
-      this.requestRender();
-    }
-  }
-  updateSettings(newSettings) {
-    this.settings = { ...this.settings, ...newSettings };
-    this.applyHighlightSettings();
-    if (newSettings.clip) {
-      this.setClipHelperOptions({
-        visible: newSettings.clip.helperVisible,
-        opacity: newSettings.clip.helperOpacity
-      });
-    }
-    this.ambientLight.intensity = this.settings.ambientInt;
-    this.dirLight.intensity = this.settings.dirInt;
-    this.backLight.intensity = this.settings.backLightInt ?? 0.5;
-    this.renderer.outputColorSpace = this.settings.colorSpace === "linear" ? THREE.LinearSRGBColorSpace : THREE.SRGBColorSpace;
-    this.renderer.toneMapping = this.settings.toneMapping === "none" ? THREE.NoToneMapping : this.settings.toneMapping === "neutral" ? THREE.NeutralToneMapping : THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = this.settings.exposure ?? 1;
-    this.renderer.setClearColor(this.settings.bgColor);
-    if (newSettings.frustumCulling !== void 0) {
-      this.contentGroup.traverse((obj) => {
-        if (obj.isMesh) {
-          obj.frustumCulled = newSettings.frustumCulling;
-        } else if (obj.isBatchedMesh) {
-          obj.frustumCulled = false;
-        }
-      });
-    }
-    if (newSettings.maxRenderDistance !== void 0) {
-      this.maxRenderDistance = newSettings.maxRenderDistance;
-      this.checkCullingAndLoad();
-    }
-    this.renderer.render(this.scene, this.camera);
-  }
-  createCircleTexture() {
-    const size = 64;
-    const canvas = document.createElement("canvas");
-    canvas.width = size;
-    canvas.height = size;
-    const context = canvas.getContext("2d");
-    if (context) {
-      context.beginPath();
-      context.arc(size / 2, size / 2, size / 2 - 2, 0, 2 * Math.PI);
-      context.fillStyle = "#ffffff";
-      context.fill();
-    }
-    const texture = new THREE.CanvasTexture(canvas);
-    return texture;
-  }
-  animate() {
-    if (this.disposed) return;
-    this.animateFramePending = false;
-    this.animationFrameId = null;
-    const frameNow = performance.now();
-    if (this.controls) {
-      this.controls.update();
-    }
-    this.updateInteractionPerformance(frameNow);
-    this.updateAdaptiveQuality();
-    if (this._needsBoundsUpdate) {
-      this.updateSceneBounds();
-      this._needsBoundsUpdate = false;
-    }
-    this.updateCameraClipping();
-    const now = performance.now();
-    const profile = this.getChunkRuntimeProfile();
-    const phase = this.getChunkRenderPhase(now);
-    const cullingInterval = this.cullingDirty ? phase === "moving" ? profile.movingCullingIntervalMs : phase === "recovery" ? profile.recoveryCullingIntervalMs : Math.min(profile.recoveryCullingIntervalMs, 70) : profile.idleCullingIntervalMs;
-    if (!this._lastCullingTime || now - this._lastCullingTime > cullingInterval) {
-      this.checkCullingAndLoad(now);
-      this._lastCullingTime = now;
-      this.cullingDirty = false;
-    }
-    const highlightMaterial = this.highlightMesh.material;
-    if (highlightMaterial) {
-      if (this.locateFocusUuid && this.highlightMesh.visible) {
-        const focusColor = new THREE.Color(this.settings.highlightColor || "#ff9f1c");
-        const pulseMix = 0.22 + (Math.sin(frameNow / 125) + 1) * 0.3;
-        highlightMaterial.color.copy(focusColor).lerp(this.highlightPulseColor, pulseMix);
-        highlightMaterial.opacity = 1;
-      } else {
-        highlightMaterial.color.set(this.settings.highlightColor || "#ff9f1c");
-        highlightMaterial.opacity = 1;
-      }
-    }
-    const selectionLineMat = this.selectionBox.material;
-    if (this.locateFocusUuid && this.selectionBox.visible && selectionLineMat && !Array.isArray(selectionLineMat)) {
-      const baseSel = new THREE.Color(this.settings.highlightColor || "#ff9f1c");
-      const pulseSel = 0.55 + 0.45 * (0.5 + 0.5 * Math.sin(frameNow / 125));
-      selectionLineMat.color.copy(baseSel).lerp(this.highlightPulseColor, 0.34 * pulseSel);
-    } else if (selectionLineMat && !Array.isArray(selectionLineMat)) {
-      selectionLineMat.color.set(this.settings.highlightColor || "#ff9f1c");
-    }
-    this.renderer.render(this.scene, this.camera);
-    const chunksIncomplete = this.chunkLoadingEnabled && this.chunks.length > 0 && this.chunkLoadedCount < this.chunks.length;
-    const locatingPulse = !!(this.locateFocusUuid && (this.highlightMesh.visible || this.selectionBox.visible));
-    const keepLoop = this.isCameraMoving || this.isInPostMoveRecovery(now) || this.processingChunks.size > 0 || this.chunkWarmupActive || chunksIncomplete || locatingPulse;
-    if (keepLoop) {
-      this.requestRender();
-    }
-  }
-  updateAdaptiveQuality() {
-    if (!this.settings.adaptiveQuality) return;
-    const deviceRatio = window.devicePixelRatio || 1;
-    const minRatio = Math.min(deviceRatio, this.settings.minPixelRatio ?? 0.8);
-    const maxRatio = Math.min(deviceRatio, this.settings.maxPixelRatio ?? 2);
-    const chunkCount = this.chunks.length;
-    const meshCount = this.originalStats.meshes;
-    const mode = this.settings.performanceMode ?? "balanced";
-    let desiredRatio = maxRatio;
-    if (this.isCameraMoving) {
-      const movingScale = mode === "quality" ? chunkCount > 3500 || meshCount > 25e4 ? 0.68 : chunkCount > 1600 || meshCount > 12e4 ? 0.76 : 0.84 : mode === "smooth" ? chunkCount > 3500 || meshCount > 25e4 ? 0.44 : chunkCount > 1600 || meshCount > 12e4 ? 0.52 : 0.6 : chunkCount > 3500 || meshCount > 25e4 ? 0.48 : chunkCount > 1600 || meshCount > 12e4 ? 0.56 : 0.65;
-      desiredRatio = Math.max(minRatio, maxRatio * movingScale);
-    }
-    desiredRatio = Math.max(minRatio, Math.min(maxRatio, desiredRatio));
-    if (Math.abs(desiredRatio - this.activePixelRatio) < 0.05) return;
-    this.activePixelRatio = desiredRatio;
-    this.renderer.setPixelRatio(desiredRatio);
-    const rect = this.canvas.getBoundingClientRect();
-    this.renderer.setSize(Math.max(1, rect.width), Math.max(1, rect.height), false);
-  }
-  updateInteractionPerformance(now) {
-    if (this.interactionShadowDowngraded && now >= this.interactionShadowRestoreAt) {
-      this.interactionShadowDowngraded = false;
-    }
-  }
-  initHardwareProfile() {
-    const nav = navigator;
-    const cpuCount = Math.max(2, nav.hardwareConcurrency || 4);
-    const memoryGb = nav.deviceMemory || 8;
-    const preset = this.options.performancePreset ?? this.settings.performanceMode ?? "balanced";
-    const runtime = deriveInitialRuntimeFromHardware(cpuCount, preset);
-    if (this.forceMaxChunkLoadSpeed) {
-      this.maxWorkers = Math.max(4, Math.min(12, cpuCount - 1));
-      this.maxConcurrentChunkLoads = Math.max(128, Math.min(192, this.maxWorkers * 24));
-      this.maxChunkLoadsPerFrame = Math.max(64, Math.min(128, this.maxWorkers * 14));
-      this.cullingTimeBudgetMovingMs = 7.5;
-      this.cullingTimeBudgetRecoveryMs = 10.5;
-      this.cullingTimeBudgetIdleMs = 14;
-      this.chunkRegistrationBatchSize = 28;
-      this.chunkGhostBatchSize = 40;
-    } else {
-      this.maxWorkers = 4;
-      this.maxConcurrentChunkLoads = runtime.maxConcurrentChunkLoads;
-      this.maxChunkLoadsPerFrame = runtime.maxChunkLoadsPerFrame;
-    }
-    this.maxLoadedChunks = memoryGb <= 4 ? 160 : memoryGb <= 8 ? 320 : 640;
-    this.maxCachedChunks = memoryGb <= 4 ? 24 : memoryGb <= 8 ? 48 : 96;
-    this.settings.targetFps = this.resolvedChunkOptions.targetMinFps;
-  }
-  collectObjectOverview(object) {
-    let meshes = 0;
-    let faces = 0;
-    let memory = 0;
-    object.traverse((child) => {
-      const mesh = child;
-      if (!mesh.isMesh || !mesh.geometry) return;
-      meshes++;
-      if (mesh.geometry.index) {
-        faces += mesh.geometry.index.count / 3;
-      } else if (mesh.geometry.attributes.position) {
-        faces += mesh.geometry.attributes.position.count / 3;
-      }
-      memory += calculateGeometryMemory(mesh.geometry);
-    });
-    return {
-      meshes,
-      faces: Math.floor(faces),
-      memory: parseFloat(memory.toFixed(2))
-    };
-  }
-  async estimateNbimStats(file, chunks, version) {
-    let meshes = 0;
-    let faces = 0;
-    let memory = 0;
-    for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
-      const chunk = chunks[chunkIndex];
-      const buffer = await file.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength).arrayBuffer();
-      const dv = new DataView(buffer);
-      let offset = 0;
-      const geoCount = dv.getUint32(offset, true);
-      offset += 4;
-      const geometryFaces = [];
-      for (let i = 0; i < geoCount; i++) {
-        const vertCount = dv.getUint32(offset, true);
-        offset += 4;
-        const indexCount = dv.getUint32(offset, true);
-        offset += 4;
-        offset += vertCount * 12;
-        offset += vertCount * 12;
-        if (indexCount > 0) offset += indexCount * 4;
-        geometryFaces.push(indexCount > 0 ? indexCount / 3 : vertCount / 3);
-      }
-      const instanceCount = dv.getUint32(offset, true);
-      offset += 4;
-      meshes += instanceCount;
-      memory += chunk.byteLength / (1024 * 1024);
-      for (let i = 0; i < instanceCount; i++) {
-        offset += 4;
-        offset += 4;
-        offset += 4;
-        offset += 64;
-        const geoIdx = dv.getUint32(offset, true);
-        offset += 4;
-        faces += geometryFaces[geoIdx] || 0;
-      }
-      if (chunkIndex > 0 && chunkIndex % 8 === 0) {
-        await this.yieldToMainThread();
-      }
-    }
-    return {
-      meshes,
-      faces: Math.floor(faces),
-      memory: parseFloat(memory.toFixed(2))
-    };
-  }
-  registerOriginalStats(originalUuid, stats) {
-    this.originalStatsByModel.set(originalUuid, stats);
-    this.originalStats.meshes += stats.meshes;
-    this.originalStats.faces += stats.faces;
-    this.originalStats.memory = parseFloat((this.originalStats.memory + stats.memory).toFixed(2));
-  }
-  unregisterOriginalStats(originalUuid) {
-    const stats = this.originalStatsByModel.get(originalUuid);
-    if (!stats) return;
-    this.originalStats.meshes = Math.max(0, this.originalStats.meshes - stats.meshes);
-    this.originalStats.faces = Math.max(0, this.originalStats.faces - stats.faces);
-    this.originalStats.memory = parseFloat(Math.max(0, this.originalStats.memory - stats.memory).toFixed(2));
-    this.originalStatsByModel.delete(originalUuid);
-  }
-  disposeChunkMesh(mesh) {
-    disposeChunkMeshResource({
-      mesh,
-      sharedMaterial: this.sharedMaterial
-    });
-  }
-  touchChunkCache(chunkId) {
-    this.chunkCacheOrder = touchChunkMeshCacheOrder(this.chunkCacheOrder, chunkId);
-  }
-  cacheChunkMesh(chunk, mesh) {
-    const result = cacheChunkMeshEntry({
-      chunk,
-      mesh,
-      chunkMeshCache: this.chunkMeshCache,
-      chunkCacheOrder: this.chunkCacheOrder,
-      maxCachedChunks: this.maxCachedChunks,
-      disposeChunkMesh: (nextMesh) => this.disposeChunkMesh(nextMesh)
-    });
-    this.chunkCacheOrder = result.chunkCacheOrder;
-  }
-  takeCachedChunkMesh(chunkId) {
-    const result = takeCachedChunkMeshEntry({
-      chunkId,
-      chunkMeshCache: this.chunkMeshCache,
-      chunkCacheOrder: this.chunkCacheOrder
-    });
-    this.chunkCacheOrder = result.chunkCacheOrder;
-    return result.mesh;
-  }
-  clearChunkCache(filter) {
-    this.chunkCacheOrder = clearChunkMeshCacheEntries({
-      chunkMeshCache: this.chunkMeshCache,
-      chunkCacheOrder: this.chunkCacheOrder,
-      disposeChunkMesh: (mesh) => this.disposeChunkMesh(mesh),
-      filter
-    });
-  }
-  hasValidChunkBinaryRange(chunk) {
-    return hasValidChunkBinaryRange(chunk);
-  }
-  async readChunkBuffer(chunk) {
-    const result = await readChunkBuffer({
-      chunk,
-      nbimFiles: this.nbimFiles,
-      chunkReadCache: this.chunkReadCache,
-      chunkReadCacheOrder: this.chunkReadCacheOrder,
-      chunkReadCacheSize: this.resolvedChunkOptions.chunkReadCacheSize
-    });
-    this.chunkReadCacheOrder = result.chunkReadCacheOrder;
-    return result.buffer;
-  }
-  enqueueChunkPrefetch(chunkIds) {
-    this.prefetchQueue = enqueueChunkPrefetch({
-      chunkIds,
-      chunkPrefetchWindow: this.resolvedChunkOptions.chunkPrefetchWindow,
-      prefetchQueue: this.prefetchQueue,
-      prefetchQueueSet: this.prefetchQueueSet,
-      prefetchInFlight: this.prefetchInFlight
-    });
-  }
-  schedulePrefetchFromVisibleChunks(visibleChunks) {
-    const result = collectPrefetchCandidates({
-      visibleChunks,
-      chunkPrefetchWindow: this.resolvedChunkOptions.chunkPrefetchWindow,
-      prefetchPaused: this.prefetchPaused,
-      isCameraMoving: this.isCameraMoving,
-      prefetchRoundRobinCursor: this.prefetchRoundRobinCursor,
-      chunks: this.chunks,
-      processingChunks: this.processingChunks,
-      chunkReadCache: this.chunkReadCache,
-      getChunkIndex: (chunkId) => this.getChunkIndex(chunkId)
-    });
-    this.prefetchRoundRobinCursor = result.prefetchRoundRobinCursor;
-    this.enqueueChunkPrefetch(result.chunkIds);
-    void this.processPrefetchQueue();
-  }
-  async processPrefetchQueue() {
-    await processChunkPrefetchQueue({
-      prefetchPaused: this.prefetchPaused,
-      isCameraMoving: this.isCameraMoving,
-      prefetchQueue: this.prefetchQueue,
-      prefetchQueueSet: this.prefetchQueueSet,
-      prefetchInFlight: this.prefetchInFlight,
-      maxWorkers: this.maxWorkers,
-      getChunkById: (chunkId) => this.getChunkById(chunkId),
-      chunkReadCache: this.chunkReadCache,
-      readChunkBuffer: (chunk) => this.readChunkBuffer(chunk),
-      processQueue: () => this.processPrefetchQueue()
-    });
-  }
-  unregisterOptimizedMeshMapping(bm) {
-    unregisterOptimizedMeshResourceMapping({
-      mesh: bm,
-      optimizedMapping: this.optimizedMapping
-    });
-  }
-  registerOptimizedMeshMapping(bm) {
-    registerOptimizedMeshResourceMapping({
-      mesh: bm,
-      optimizedMapping: this.optimizedMapping
-    });
-  }
-  acquireGhostLine() {
-    return acquireGhostLineResource({
-      ghostMeshPool: this.ghostMeshPool,
-      ghostEdgesGeometry: this.ghostEdgesGeometry,
-      ghostMaterial: this.ghostMaterial
-    });
-  }
-  releaseGhostLine(line) {
-    releaseGhostLineResource({
-      line,
-      ghostMeshPool: this.ghostMeshPool
-    });
-  }
-  createGhostLine(name, bounds) {
-    return createGhostLineResource({
-      name,
-      bounds,
-      acquireGhostLine: () => this.acquireGhostLine()
-    });
-  }
-  ensureChunkGhost(chunk) {
-    ensureChunkGhostResource({
-      chunk,
-      ghostGroup: this.ghostGroup,
-      createGhostLine: (name, bounds) => this.createGhostLine(name, bounds)
-    });
-  }
-  attachStructureRoot(modelRoot) {
-    if (modelRoot.name === "Root" && modelRoot.children && modelRoot.children.length > 0) {
-      if (!this.structureRoot.children) this.structureRoot.children = [];
-      this.structureRoot.children.push(...modelRoot.children);
-    } else {
-      if (!this.structureRoot.children) this.structureRoot.children = [];
-      this.structureRoot.children.push(modelRoot);
-    }
-  }
-  replaceStructureNode(targetId, replacement) {
-    const replaceInNodes = (nodes) => {
-      for (let i = 0; i < nodes.length; i++) {
-        if (nodes[i].id === targetId) {
-          nodes[i] = replacement;
-          return true;
-        }
-        if (nodes[i].children && replaceInNodes(nodes[i].children)) return true;
-      }
-      return false;
-    };
-    if (this.structureRoot.children) {
-      replaceInNodes(this.structureRoot.children);
-    }
-  }
-  buildAndRegisterModelStructure(object) {
-    let modelRoot;
-    if (object.userData.isIFC) {
-      modelRoot = this.buildIFCStructure(object);
-    } else {
-      modelRoot = this.buildSceneGraph(object);
-    }
-    const markOriginalUuid = (node) => {
-      if (!node.userData) node.userData = {};
-      node.userData.originalUuid = object.uuid;
-      if (node.children) node.children.forEach(markOriginalUuid);
-    };
-    markOriginalUuid(modelRoot);
-    const indexBimIds = (node) => {
-      if (node.bimId) {
-        const key = `${object.uuid}::${node.bimId}`;
-        if (!this.bimIdToNodeIds.has(key)) this.bimIdToNodeIds.set(key, []);
-        this.bimIdToNodeIds.get(key).push(node.id);
-      }
-      if (node.children) node.children.forEach(indexBimIds);
-    };
-    indexBimIds(modelRoot);
-    return modelRoot;
-  }
-  async yieldToMainThread() {
-    await new Promise((resolve) => requestAnimationFrame(() => resolve()));
-  }
-  createPreviewGhost(bounds, name) {
-    const edges = this.createGhostLine(name, bounds);
-    if (edges.material instanceof THREE.LineBasicMaterial) {
-      edges.material.opacity = 0.45;
-    }
-    this.ghostGroup.add(edges);
-    return edges;
-  }
-  async computeItemBoundsProgressively(items, onProgress) {
-    const bounds = new THREE.Box3();
-    const tmpMin = new THREE.Vector3();
-    const tmpMax = new THREE.Vector3();
-    const tmpScale = new THREE.Vector3();
-    for (let start = 0; start < items.length; start += this.boundsScanBatchSize) {
-      const end = Math.min(items.length, start + this.boundsScanBatchSize);
-      for (let itemIndex = start; itemIndex < end; itemIndex++) {
-        const item = items[itemIndex];
-        const center = item.center;
-        let r = 0;
-        const geo = item.geometry;
-        if (!geo.boundingSphere) geo.computeBoundingSphere();
-        if (geo.boundingSphere) {
-          tmpScale.setFromMatrixScale(item.matrix);
-          const maxScale = Math.max(tmpScale.x, tmpScale.y, tmpScale.z);
-          r = geo.boundingSphere.radius * maxScale;
-        }
-        tmpMin.set(center.x - r, center.y - r, center.z - r);
-        tmpMax.set(center.x + r, center.y + r, center.z + r);
-        bounds.expandByPoint(tmpMin);
-        bounds.expandByPoint(tmpMax);
-      }
-      if (onProgress && items.length > 0) {
-        onProgress(20 + Math.min(12, Math.floor(end / items.length * 12)), "正在统计大模型范围...");
-      }
-      if (end < items.length) {
-        await this.yieldToMainThread();
-      }
-    }
-    bounds.min.subScalar(0.1);
-    bounds.max.addScalar(0.1);
-    return bounds;
-  }
-  async createChunkGhostsProgressively(ghostSpecs) {
-    if (ghostSpecs.length === 0) return;
-    for (let start = 0; start < ghostSpecs.length; start += this.chunkGhostBatchSize) {
-      const end = Math.min(ghostSpecs.length, start + this.chunkGhostBatchSize);
-      let addedAnyGhost = false;
-      for (let index = start; index < end; index++) {
-        const spec = ghostSpecs[index];
-        const chunk = this.getChunkById(spec.chunkId);
-        if (!chunk || chunk.loaded || this.cancelledChunkIds.has(spec.chunkId)) continue;
-        if (this.ghostGroup.getObjectByName(`ghost_${spec.chunkId}`)) continue;
-        const edges = this.createGhostLine(`ghost_${spec.chunkId}`, spec.bounds);
-        this.ghostGroup.add(edges);
-        addedAnyGhost = true;
-      }
-      if (addedAnyGhost) {
-        this.markSceneDirty();
-      }
-      if (end < ghostSpecs.length) {
-        await this.yieldToMainThread();
-      }
-    }
-  }
-  async registerLeafChunksProgressively(object, leafNodes, onProgress) {
-    const ghostSpecs = [];
-    for (let start = 0; start < leafNodes.length; start += this.chunkRegistrationBatchSize) {
-      const end = Math.min(leafNodes.length, start + this.chunkRegistrationBatchSize);
-      for (let index = start; index < end; index++) {
-        const node = leafNodes[index];
-        const chunkId = `${object.uuid}_chunk_${index}`;
-        const chunkBounds = node.bounds.clone();
-        node.items.forEach((item) => {
-          const treeNodes = this.nodeMap.get(item.uuid);
-          if (treeNodes) {
-            treeNodes.forEach((treeNode) => {
-              if (treeNode.bimId === void 0) {
-                treeNode.bimId = treeNode.id;
-              }
-              treeNode.chunkId = chunkId;
-            });
-          }
-        });
-        const paddedBounds = chunkBounds.clone();
-        const padSize = chunkBounds.getSize(new THREE.Vector3()).multiplyScalar(this.chunkPadding);
-        paddedBounds.expandByVector(padSize);
-        this.registerChunk({
-          id: chunkId,
-          bounds: chunkBounds,
-          paddedBounds,
-          _padding: this.chunkPadding,
-          center: chunkBounds.getCenter(new THREE.Vector3()),
-          loaded: false,
-          node,
-          groupName: `optimized_${object.uuid}`,
-          originalUuid: object.uuid
-        });
-        ghostSpecs.push({ chunkId, bounds: chunkBounds });
-      }
-      if (onProgress && leafNodes.length > 0) {
-        onProgress(40 + Math.floor(end / leafNodes.length * 50), `正在生成分块... (${end}/${leafNodes.length})`);
-      }
-      if (end < leafNodes.length) {
-        await this.yieldToMainThread();
-      }
-    }
-    return ghostSpecs;
-  }
-  async buildLeafPlans(items, bounds, maxItemsPerNode, maxDepth) {
-    const workerThreshold = this.resolvedChunkOptions.preferWorkerOctree ? 1200 : this.octreeWorkerThreshold;
-    if (items.length < workerThreshold) {
-      const octree = buildOctree(items, bounds, { maxItemsPerNode, maxDepth });
-      return collectLeafNodes(octree).map((node) => ({
-        bounds: node.bounds,
-        level: node.level,
-        items: node.items
-      }));
-    }
-    const centers = new Float32Array(items.length * 3);
-    const radii = new Float32Array(items.length);
-    for (let i = 0; i < items.length; i++) {
-      const center = items[i].center;
-      centers[i * 3] = center.x;
-      centers[i * 3 + 1] = center.y;
-      centers[i * 3 + 2] = center.z;
-      radii[i] = 0;
-      if (i > 0 && i % 16e3 === 0) {
-        await this.yieldToMainThread();
-      }
-    }
-    const result = await this.runWorkerTask({
-      taskType: "buildOctreePlan",
-      centers,
-      radii,
-      bounds: [
-        bounds.min.x,
-        bounds.min.y,
-        bounds.min.z,
-        bounds.max.x,
-        bounds.max.y,
-        bounds.max.z
-      ],
-      maxItemsPerNode,
-      maxDepth
-    }, [centers.buffer, radii.buffer]);
-    const leaves = [];
-    for (let i = 0; i < result.length; i++) {
-      const leaf = result[i];
-      leaves.push({
-        bounds: new THREE.Box3(
-          new THREE.Vector3(leaf.bounds[0], leaf.bounds[1], leaf.bounds[2]),
-          new THREE.Vector3(leaf.bounds[3], leaf.bounds[4], leaf.bounds[5])
-        ),
-        level: leaf.level,
-        items: Array.from(leaf.itemIndices, (itemIndex) => items[itemIndex])
-      });
-      if (i > 0 && i % 120 === 0) {
-        await this.yieldToMainThread();
-      }
-    }
-    return leaves;
-  }
-  updateCameraClipping() {
-    if (!this.sceneBounds || this.sceneBounds.isEmpty()) return;
-    if (!this.sceneSphereValid) {
-      this.sceneBounds.getBoundingSphere(this.cachedSceneSphere);
-      this.sceneSphereValid = true;
-    }
-    const dist = this.camera.position.distanceTo(this.cachedSceneSphere.center);
-    const range = Math.max(this.cachedSceneSphere.radius * 20, dist + this.cachedSceneSphere.radius * 5);
-    const threshold = 0.01;
-    if (Math.abs(this.camera.far - range) / Math.max(this.camera.far, 1) > threshold || Math.abs(this.camera.near - -range) / Math.max(Math.abs(this.camera.near), 1) > threshold) {
-      this.camera.near = -range;
-      this.camera.far = range;
-      this.camera.updateProjectionMatrix();
-    }
-  }
-  resize(width, height) {
-    if (!this.canvas) return;
-    let w = width;
-    let h = height;
-    if (w === void 0 || h === void 0) {
-      const rect = this.canvas.parentElement?.getBoundingClientRect() || this.canvas.getBoundingClientRect();
-      w = rect.width;
-      h = rect.height;
-    }
-    w = Math.max(1, w);
-    h = Math.max(1, h);
-    if (w === 0 || h === 0) return;
-    const aspect = w / h;
-    const cam = this.camera;
-    const currentHeight = cam.top - cam.bottom;
-    const halfHeight = currentHeight / 2;
-    const halfWidth = halfHeight * aspect;
-    cam.left = -halfWidth;
-    cam.right = halfWidth;
-    cam.top = halfHeight;
-    cam.bottom = -halfHeight;
-    cam.updateProjectionMatrix();
-    const maxRatio = this.settings.adaptiveQuality ? Math.min(window.devicePixelRatio, this.settings.maxPixelRatio ?? 2) : Math.min(window.devicePixelRatio, 2);
-    this.activePixelRatio = maxRatio;
-    this.renderer.setPixelRatio(maxRatio);
-    this.renderer.setSize(w, h, false);
-    if (this.controls) {
-      this.controls.update();
-    }
-    this.renderer.render(this.scene, this.camera);
-  }
-  reportChunkProgress() {
-    const result = reportChunkProgressIfNeeded({
-      now: performance.now(),
-      total: this.chunks.length,
-      loaded: this.chunkLoadedCount,
-      lastReportedProgress: this.lastReportedProgress,
-      lastChunkProgressReportAt: this.lastChunkProgressReportAt
-    });
-    if (this.onChunkProgress && result.shouldNotify) {
-      this.lastReportedProgress = result.nextProgress;
-      this.lastChunkProgressReportAt = result.nextReportedAt;
-      this.onChunkProgress(result.nextProgress.loaded, result.nextProgress.total);
-    }
-  }
-  getChunkRuntimeProfile(chunkCount = this.chunks.length) {
-    return selectChunkRuntimeProfile({
-      chunkCount,
-      compact: this.chunkRuntimeProfiles.compact,
-      balanced: this.chunkRuntimeProfiles.balanced,
-      massive: this.chunkRuntimeProfiles.massive
-    });
-  }
-  isInPostMoveRecovery(now) {
-    return !this.isCameraMoving && now < this.postMoveRecoveryUntil;
-  }
-  applyHighlightSettings() {
-    const highlightMaterial = this.highlightMesh.material;
-    if (highlightMaterial) {
-      highlightMaterial.color.set(this.settings.highlightColor || "#ff9f1c");
-      highlightMaterial.transparent = false;
-      highlightMaterial.opacity = 1;
-      highlightMaterial.depthTest = false;
-      highlightMaterial.depthWrite = false;
-      highlightMaterial.side = THREE.BackSide;
-      highlightMaterial.needsUpdate = true;
-    }
-    const boxMaterial = this.selectionBox.material;
-    if (Array.isArray(boxMaterial)) {
-      boxMaterial.forEach((material) => material.color.set(this.settings.highlightColor || "#ff9f1c"));
-    } else if (boxMaterial) {
-      boxMaterial.color.set(this.settings.highlightColor || "#ff9f1c");
-    }
-  }
-  getChunkRenderPhase(now) {
-    if (this.isCameraMoving) return "moving";
-    if (this.isInPostMoveRecovery(now)) return "recovery";
-    return "idle";
-  }
-  getChunkFrameBudget(phase, profile, warmupExtra) {
-    return computeChunkFrameBudget({
-      forceMaxChunkLoadSpeed: this.forceMaxChunkLoadSpeed,
-      maxChunkLoadsPerFrame: this.maxChunkLoadsPerFrame,
-      performanceMode: this.settings.performanceMode ?? "balanced",
-      chunkCount: this.chunks.length,
-      phase,
-      profile,
-      warmupExtra
-    });
-  }
-  isMovingPeripheralChunk(centrality, pixelSize, forwardness, profile) {
-    return isMovingPeripheralChunk({
-      centrality,
-      pixelSize,
-      forwardness,
-      profile
-    });
-  }
-  shouldRefreshPeripheralChunk(now, chunkIndex, totalChunks, profile) {
-    const result = updatePeripheralRefreshWindow({
-      now,
-      isCameraMoving: this.isCameraMoving,
-      chunkIndex,
-      totalChunks,
-      profile,
-      movingPeripheralCursor: this.movingPeripheralCursor,
-      movingPeripheralLastRefreshAt: this.movingPeripheralLastRefreshAt
-    });
-    this.movingPeripheralCursor = result.movingPeripheralCursor;
-    this.movingPeripheralLastRefreshAt = result.movingPeripheralLastRefreshAt;
-    return result.shouldRefresh;
-  }
-  checkCullingAndLoad(now = performance.now()) {
-    if (!this.chunkLoadingEnabled) return;
-    if (this.chunks.length === 0) return;
-    this.reportChunkProgress();
-    if (this.processingChunks.size >= this.maxConcurrentChunkLoads) return;
-    const profile = this.getChunkRuntimeProfile();
-    const phase = this.getChunkRenderPhase(now);
-    const mode = this.settings.performanceMode ?? "balanced";
-    this.camera.updateMatrixWorld();
-    this.projScreenMatrix.multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse);
-    this.frustum.setFromProjectionMatrix(this.projScreenMatrix);
-    const padding = this.chunkPadding;
-    const cameraPos = this.camera.position;
-    const cameraForward = this.chunkCullingTempForward;
-    this.camera.getWorldDirection(cameraForward);
-    const toChunkDirection = this.chunkCullingTempDirection;
-    const tempSize = this.chunkCullingTempSize;
-    const tempCenterNdc = this.chunkCullingTempCenterNdc;
-    const viewHeight = (this.camera.top - this.camera.bottom) / this.camera.zoom;
-    const canvasHeight = this.renderer.domElement.clientHeight;
-    const toLoad = [];
-    const loadedChunks = [];
-    const isClippingActive = this.renderer.clippingPlanes.length > 0;
-    let sceneMutated = false;
-    const totalChunks = this.chunks.length;
-    const cullingLoopStart = performance.now();
-    const cullingTimeBudgetMs = phase === "moving" ? this.cullingTimeBudgetMovingMs : phase === "recovery" ? this.cullingTimeBudgetRecoveryMs : this.cullingTimeBudgetIdleMs;
-    let abortedByBudget = false;
-    const sampleUnloadedWhileMoving = mode !== "quality" && phase === "moving" && totalChunks > 1800;
-    const movingSampleStride = sampleUnloadedWhileMoving ? totalChunks > 5e3 ? 8 : totalChunks > 3e3 ? 6 : 4 : 1;
-    const movingSampleSeed = sampleUnloadedWhileMoving ? Math.floor(now / Math.max(1, profile.movingPeripheralRefreshMs)) % movingSampleStride : 0;
-    const startIndex = totalChunks > 0 ? this.cullingScanCursor % totalChunks : 0;
-    for (let scanOffset = 0; scanOffset < totalChunks; scanOffset++) {
-      const chunkIndex = (startIndex + scanOffset) % totalChunks;
-      const c = this.chunks[chunkIndex];
-      if ((scanOffset & 31) === 0) {
-        const elapsed = performance.now() - cullingLoopStart;
-        if (elapsed > cullingTimeBudgetMs) {
-          abortedByBudget = true;
-          this.cullingScanCursor = (chunkIndex + 1) % totalChunks;
-          break;
-        }
-      }
-      ensureChunkSpatialState({
-        chunk: c,
-        padding,
-        tempSize
-      });
-      const inFrustum = this.frustum.intersectsBox(c.paddedBounds);
-      const isClipped = isClippingActive && this.isBoxClipped(c.bounds);
-      const evaluation = evaluateChunkVisibility({
-        chunk: c,
-        chunkIndex,
-        totalChunks,
-        now,
-        phase,
-        profile,
-        performanceMode: mode,
-        isBoxClipped: isClipped,
-        inFrustum,
-        maxRenderDistance: this.maxRenderDistance,
-        cameraPos,
-        cameraForward,
-        projScreenMatrix: this.projScreenMatrix,
-        toChunkDirection,
-        tempCenterNdc,
-        viewHeight,
-        canvasHeight,
-        sampleUnloadedWhileMoving,
-        movingSampleStride,
-        movingSampleSeed,
-        resolveShouldRefreshPeripheral: (isPeripheralWhileMoving) => !isPeripheralWhileMoving || this.shouldRefreshPeripheralChunk(now, chunkIndex, totalChunks, profile),
-        chunkWarmupActive: this.chunkWarmupActive,
-        chunkLoadedCount: this.chunkLoadedCount,
-        initialChunkLoadTarget: this.initialChunkLoadTarget,
-        chunkLoadResumeAt: this.chunkLoadResumeAt,
-        chunkMeshCached: this.chunkMeshCache.has(c.id)
-      });
-      if (evaluation.shouldSkipSample) {
-        continue;
-      }
-      if (evaluation.effectiveVisible) {
-        c.lastVisibleAt = now;
-      }
-      if (evaluation.centrality > 0.42 || evaluation.forwardness > 0.55) {
-        c.lastFocusAt = now;
-      }
-      c.lastEffectiveVisible = evaluation.effectiveVisible;
-      if (c.loaded) {
-        loadedChunks.push(c);
-        if (c.mesh) {
-          if (c.mesh.visible !== evaluation.effectiveVisible) {
-            c.mesh.visible = evaluation.effectiveVisible;
-            sceneMutated = true;
-          }
-        } else {
-          const optimizedGroup = this.contentGroup.getObjectByName(c.groupName);
-          const bm = optimizedGroup?.getObjectByName(c.id);
-          if (bm) {
-            c.mesh = bm;
-            bm.visible = evaluation.effectiveVisible;
-            sceneMutated = true;
-          }
-        }
-      } else if (!this.processingChunks.has(c.id) && evaluation.shouldBeVisible && evaluation.priority !== null) {
-        c.priority = evaluation.priority;
-        toLoad.push(c);
-      }
-    }
-    if (!abortedByBudget) {
-      this.cullingScanCursor = (startIndex + totalChunks) % Math.max(totalChunks, 1);
-    }
-    const unloadTargets = selectChunksToUnload({
-      isCameraMoving: this.isCameraMoving,
-      loadedChunks,
-      maxLoadedChunks: this.maxLoadedChunks,
-      cameraPos,
-      now,
-      chunkResidencyMs: this.chunkResidencyMs
-    });
-    for (const chunk of unloadTargets) {
-      this.unloadChunk(chunk);
-    }
-    if (unloadTargets.length > 0) {
-      sceneMutated = true;
-    }
-    const loadPlan = planChunkLoads({
-      toLoad,
-      now: performance.now(),
-      chunkLoadResumeAt: this.chunkLoadResumeAt,
-      maxConcurrentChunkLoads: this.maxConcurrentChunkLoads,
-      processingChunkCount: this.processingChunks.size,
-      chunkWarmupActive: this.chunkWarmupActive,
-      chunkLoadedCount: this.chunkLoadedCount,
-      initialChunkLoadTarget: this.initialChunkLoadTarget,
-      warmupChunkBoost: this.warmupChunkBoost,
-      getChunkFrameBudget: (nextPhase, nextProfile, warmupExtra) => this.getChunkFrameBudget(nextPhase, nextProfile, warmupExtra),
-      phase,
-      profile
-    });
-    for (const chunk of loadPlan) {
-      this.loadChunk(chunk);
-    }
-    if (loadPlan.length > 0) {
-      sceneMutated = true;
-    }
-    this.schedulePrefetchFromVisibleChunks(loadedChunks);
-    if (!this.forceMaxChunkLoadSpeed) ;
-    if (abortedByBudget) {
-      this.cullingDirty = true;
-    }
-    if (this.chunkWarmupActive && this.chunkLoadedCount >= this.initialChunkLoadTarget) {
-      this.chunkWarmupActive = false;
-      sceneMutated = true;
-    }
-    if (sceneMutated || abortedByBudget) {
-      this.markSceneDirty();
-    }
-  }
-  async runWorkerTask(data, transferables) {
-    return queueChunkWorkerTask({
-      workerQueue: this.workerQueue,
-      data,
-      transferables,
-      processQueue: () => this.processWorkerQueue()
-    });
-  }
-  processWorkerQueue() {
-    processChunkWorkerQueue({
-      activeWorkerCount: this.activeWorkerCount,
-      maxWorkers: this.maxWorkers,
-      workerQueue: this.workerQueue,
-      workers: this.workers,
-      createWorker: () => {
-        return new Worker(new URL(/* @vite-ignore */ ""+new URL('assets/chunkWorker-46LMRdEv.js', import.meta.url).href+"", import.meta.url), { type: "module" });
-      },
-      getActiveWorkerCount: () => this.activeWorkerCount,
-      onActiveWorkerCountChange: (count) => {
-        this.activeWorkerCount = count;
-      },
-      processQueue: () => this.processWorkerQueue()
-    });
-  }
-  unloadChunk(chunk) {
-    const result = applyUnloadChunk({
-      chunk,
-      unregisterOptimizedMeshMapping: (mesh) => this.unregisterOptimizedMeshMapping(mesh),
-      cacheChunkMesh: (nextChunk, mesh) => this.cacheChunkMesh(nextChunk, mesh),
-      ensureChunkGhost: (nextChunk) => this.ensureChunkGhost(nextChunk)
-    });
-    if (!result.changed) return;
-    this.chunkLoadedCount = Math.max(0, this.chunkLoadedCount + result.chunkLoadedCountDelta);
-    this.markSceneDirty({
-      invalidateInteractables: true,
-      needsBoundsUpdate: true,
-      needsCulling: true
-    });
-  }
-  async loadChunk(chunk) {
-    this.processingChunks.add(chunk.id);
-    this.markSceneDirty();
-    try {
-      let loadedNow = false;
-      let needsRender = false;
-      let needsBoundsUpdate = false;
-      let invalidateInteractables = false;
-      let needsCulling = false;
-      const { mesh: bm, prefetchCandidates } = await resolveChunkMeshForLoad({
-        chunk,
-        sharedMaterial: this.sharedMaterial,
-        takeCachedChunkMesh: (chunkId) => this.takeCachedChunkMesh(chunkId),
-        yieldToMainThread: () => this.yieldToMainThread(),
-        nbimFiles: this.nbimFiles,
-        hasValidChunkBinaryRange: (nextChunk) => this.hasValidChunkBinaryRange(nextChunk),
-        readChunkBuffer: (nextChunk) => this.readChunkBuffer(nextChunk),
-        nbimMeta: this.nbimMeta,
-        runWorkerTask: (data, transferables) => this.runWorkerTask(data, transferables),
-        reconstructBatchedMesh: (data, material) => reconstructBatchedMeshFromWorkerData({
-          data,
-          material,
-          resolveUuidByBimId: (originalUuid, bimId) => {
-            const key = `${originalUuid}::${bimId}`;
-            const nodeIds = this.bimIdToNodeIds.get(key);
-            return nodeIds?.[0] || bimId || originalUuid;
-          }
-        }),
-        isCameraMoving: this.isCameraMoving,
-        chunkPrefetchWindow: this.resolvedChunkOptions.chunkPrefetchWindow,
-        getChunkIndex: (chunkId) => this.getChunkIndex(chunkId),
-        chunks: this.chunks,
-        processingChunks: this.processingChunks
-      });
-      if (prefetchCandidates.length > 0) {
-        this.enqueueChunkPrefetch(prefetchCandidates);
-        void this.processPrefetchQueue();
-      }
-      if (bm) {
-        const attached = attachLoadedChunkMesh({
-          chunk,
-          mesh: bm,
-          cancelledChunkIds: this.cancelledChunkIds,
-          chunkIdSet: this.chunkIdSet,
-          disposeChunkMesh: (mesh) => this.disposeChunkMesh(mesh),
-          globalOffset: this.globalOffset,
-          contentGroup: this.contentGroup,
-          registerOptimizedMeshMapping: (mesh) => this.registerOptimizedMeshMapping(mesh)
-        });
-        loadedNow = attached.attached;
-        if (loadedNow) {
-          invalidateInteractables = true;
-          needsBoundsUpdate = true;
-          needsRender = true;
-        }
-      }
-      const finalized = finalizeLoadedChunk({
-        chunk,
-        loadedNow,
-        now: performance.now(),
-        chunkLoadedCount: this.chunkLoadedCount,
-        chunkWarmupActive: this.chunkWarmupActive,
-        initialChunkLoadTarget: this.initialChunkLoadTarget,
-        deactivateFastPreviewForModel: (originalUuid) => this.deactivateFastPreviewForModel(originalUuid)
-      });
-      this.chunkLoadedCount = finalized.nextChunkLoadedCount;
-      this.chunkWarmupActive = finalized.nextChunkWarmupActive;
-      if (finalized.progressChanged) {
-        this.reportChunkProgress();
-        needsCulling = true;
-        needsRender = true;
-      }
-      this.cancelledChunkIds.delete(chunk.id);
-      const ghostCleanup = cleanupChunkGhost({
-        chunkId: chunk.id,
-        ghostGroup: this.ghostGroup,
-        releaseGhostLine: (line) => this.releaseGhostLine(line)
-      });
-      if (ghostCleanup.changed) {
-        needsRender = true;
-      }
-      if (needsRender) {
-        this.markSceneDirty({
-          invalidateInteractables,
-          needsBoundsUpdate,
-          needsCulling
-        });
-      }
-    } catch (err) {
-      console.error(`加载分块 ${chunk.id} 失败:`, err);
-    } finally {
-      this.processingChunks.delete(chunk.id);
-      this.markSceneDirty();
-    }
-  }
-  setChunkLoadingEnabled(enabled) {
-    this.chunkLoadingEnabled = enabled;
-    this.prefetchPaused = !enabled;
-    this.cullingDirty = true;
-    if (enabled) {
-      this.checkCullingAndLoad();
-      return;
-    }
-    this.markSceneDirty();
-  }
-  applyNbimScaleTuning(chunkCount) {
-    const userChunkOptions = this.options.chunkOptions || {};
-    const autoTuned = chunkCount >= 2e3 ? { chunkPrefetchWindow: 0, chunkReadCacheSize: 128, targetMinFps: 20 } : chunkCount <= 1e3 ? { chunkPrefetchWindow: 0, chunkReadCacheSize: 128, targetMinFps: 20 } : { chunkPrefetchWindow: 0, chunkReadCacheSize: 128, targetMinFps: 20 };
-    this.setChunkOptions({
-      chunkPrefetchWindow: userChunkOptions.chunkPrefetchWindow ?? autoTuned.chunkPrefetchWindow,
-      chunkReadCacheSize: userChunkOptions.chunkReadCacheSize ?? autoTuned.chunkReadCacheSize,
-      targetMinFps: userChunkOptions.targetMinFps ?? autoTuned.targetMinFps,
-      ghostMode: userChunkOptions.ghostMode ?? this.resolvedChunkOptions.ghostMode,
-      loadProfile: userChunkOptions.loadProfile ?? this.resolvedChunkOptions.loadProfile,
-      deferIfcProperties: userChunkOptions.deferIfcProperties ?? this.resolvedChunkOptions.deferIfcProperties,
-      preferWorkerOctree: userChunkOptions.preferWorkerOctree ?? this.resolvedChunkOptions.preferWorkerOctree,
-      fastGeometrySanitize: userChunkOptions.fastGeometrySanitize ?? this.resolvedChunkOptions.fastGeometrySanitize
-    });
-  }
-  setChunkOptions(options = {}) {
-    const resolved = resolveSceneChunkOptions(options);
-    this.resolvedChunkOptions.chunkReadCacheSize = resolved.chunkReadCacheSize;
-    this.resolvedChunkOptions.chunkPrefetchWindow = resolved.chunkPrefetchWindow;
-    this.resolvedChunkOptions.ghostMode = resolved.ghostMode;
-    this.resolvedChunkOptions.targetMinFps = resolved.targetMinFps;
-    this.resolvedChunkOptions.loadProfile = resolved.loadProfile;
-    this.resolvedChunkOptions.deferIfcProperties = resolved.deferIfcProperties;
-    this.resolvedChunkOptions.preferWorkerOctree = resolved.preferWorkerOctree;
-    this.resolvedChunkOptions.fastGeometrySanitize = resolved.fastGeometrySanitize;
-    this.settings.targetFps = resolved.targetMinFps;
-    while (this.chunkReadCacheOrder.length > this.resolvedChunkOptions.chunkReadCacheSize) {
-      const evict = this.chunkReadCacheOrder.shift();
-      if (!evict) continue;
-      this.chunkReadCache.delete(evict);
-    }
-  }
-  getChunkOptions() {
-    return {
-      chunkReadCacheSize: this.resolvedChunkOptions.chunkReadCacheSize,
-      chunkPrefetchWindow: this.resolvedChunkOptions.chunkPrefetchWindow,
-      ghostMode: this.resolvedChunkOptions.ghostMode,
-      targetMinFps: this.resolvedChunkOptions.targetMinFps,
-      loadProfile: this.resolvedChunkOptions.loadProfile,
-      deferIfcProperties: this.resolvedChunkOptions.deferIfcProperties,
-      preferWorkerOctree: this.resolvedChunkOptions.preferWorkerOctree,
-      fastGeometrySanitize: this.resolvedChunkOptions.fastGeometrySanitize
-    };
-  }
-  setContentVisible(visible) {
-    this.contentGroup.visible = visible;
-    this.ghostGroup.visible = visible;
-    this.renderer.render(this.scene, this.camera);
-  }
-  buildSceneGraph(object) {
-    const fallbackName = object.isMesh ? `Mesh_${object.id}` : `Group_${object.id}`;
-    const node = {
-      id: object.uuid,
-      name: sanitizeDisplayLabel(object.name, object.userData?.name) || fallbackName,
-      type: object.isMesh ? "Mesh" : "Group",
-      children: [],
-      bimId: object.userData?.bimId ? String(object.userData.bimId) : object.userData?.expressID !== void 0 ? String(object.userData.expressID) : object.name ? String(object.name) : void 0,
-      userData: { ...object.userData }
-    };
-    if (!this.nodeMap.has(object.uuid)) this.nodeMap.set(object.uuid, []);
-    this.nodeMap.get(object.uuid).push(node);
-    for (const child of object.children) {
-      node.children.push(this.buildSceneGraph(child));
-    }
-    return node;
-  }
-  /**
-   * 构建基于 IFC 图层和空间结构的复合树
-   */
-  buildIFCStructure(object) {
-    const buildSpatialRecursive = (obj) => {
-      const fallbackName = obj.isMesh ? `Mesh_${obj.id}` : `Group_${obj.id}`;
-      const node = {
-        id: obj.uuid,
-        name: sanitizeDisplayLabel(obj.name, obj.userData?.name) || fallbackName,
-        type: obj.isMesh ? "Mesh" : "Group",
-        children: [],
-        bimId: obj.userData?.bimId ? String(obj.userData.bimId) : obj.userData?.expressID !== void 0 ? String(obj.userData.expressID) : obj.name ? String(obj.name) : void 0,
-        userData: { ...obj.userData }
-      };
-      if (!this.nodeMap.has(obj.uuid)) this.nodeMap.set(obj.uuid, []);
-      this.nodeMap.get(obj.uuid).push(node);
-      for (const child of obj.children) {
-        if (child.userData?.isIfcGridHelper) continue;
-        node.children.push(buildSpatialRecursive(child));
-      }
-      return node;
-    };
-    return buildSpatialRecursive(object);
-  }
-  async prepareObjectRuntimeData(object, maxAnisotropy, batchSize = 6e3) {
-    const stack = [object];
-    let traverseIndex = 0;
-    while (stack.length > 0) {
-      const child = stack.pop();
-      if (child.isMesh) {
-        const mesh = child;
-        this.componentMap.set(mesh.uuid, mesh);
-        if (mesh.userData.expressID !== void 0) {
-          this.componentMap.set(mesh.userData.expressID, mesh);
-        }
-        if (!mesh.userData.bimId) {
-          if (mesh.userData.expressID !== void 0) mesh.userData.bimId = String(mesh.userData.expressID);
-          else mesh.userData.bimId = mesh.uuid;
-        }
-        if (mesh.material) {
-          const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-          materials.forEach((mat) => {
-            if (mat.map) {
-              mat.map.anisotropy = maxAnisotropy;
-            }
-          });
-        }
-      }
-      traverseIndex++;
-      for (let i = child.children.length - 1; i >= 0; i--) {
-        stack.push(child.children[i]);
-      }
-      if (traverseIndex > 0 && traverseIndex % batchSize === 0) {
-        await this.yieldToMainThread();
-      }
-    }
-  }
-  applyGlobalOffsetForModel(object) {
-    const modelBox = new THREE.Box3().setFromObject(object);
-    if (modelBox.isEmpty()) return modelBox;
-    if (this.globalOffset.length() === 0) {
-      modelBox.getCenter(this.globalOffset);
-      console.log("初始化全局偏移以解决大坐标问题:", this.globalOffset);
-    }
-    object.position.sub(this.globalOffset);
-    object.updateMatrixWorld(true);
-    return new THREE.Box3().setFromObject(object);
-  }
-  configureModelWarmup(meshCount) {
-    this.chunkWarmupActive = true;
-    if (this.resolvedChunkOptions.loadProfile === "max-speed") {
-      this.initialChunkLoadTarget = meshCount > 1e5 ? 42 : meshCount > 3e4 ? 32 : 20;
-      this.warmupChunkBoost = 16;
-      return;
-    }
-    this.initialChunkLoadTarget = meshCount > 1e5 ? 24 : meshCount > 3e4 ? 18 : 12;
-    this.warmupChunkBoost = 12;
-  }
-  prepareStructureStage(object, meshCount, onProgress) {
-    const shouldDeferStructure = meshCount >= this.deferredStructureThreshold;
-    let deferredPlaceholderId = null;
-    if (onProgress) {
-      onProgress(5, shouldDeferStructure ? "正在准备轻量预览..." : "正在构建场景树...");
-    }
-    if (shouldDeferStructure) {
-      deferredPlaceholderId = `deferred_${object.uuid}`;
-      const placeholder = {
-        id: deferredPlaceholderId,
-        name: `${object.name || "Model"} (${meshCount} meshes)`,
-        type: "Group",
-        children: [],
-        userData: {
-          originalUuid: object.uuid,
-          deferred: true,
-          meshCount
-        }
-      };
-      this.attachStructureRoot(placeholder);
-      if (this.onStructureUpdate) this.onStructureUpdate();
-    } else {
-      const modelRoot = this.buildAndRegisterModelStructure(object);
-      this.attachStructureRoot(modelRoot);
-    }
-    return { shouldDeferStructure, deferredPlaceholderId };
-  }
-  prepareModelBoundsStage(object, modelBox) {
-    if (!modelBox.isEmpty()) {
-      this.precomputedBounds.union(modelBox);
-      this.sceneBounds.copy(this.precomputedBounds);
-    }
-    return !modelBox.isEmpty() ? this.createPreviewGhost(modelBox.clone(), `preview_${object.uuid}`) : null;
-  }
-  async prepareModelRuntimeStage(object, meshCount) {
-    const maxAnisotropy = this.renderer.capabilities.getMaxAnisotropy();
-    const shouldDeferRuntimeData = meshCount > 3e4;
-    if (shouldDeferRuntimeData) {
-      void this.prepareObjectRuntimeData(object, maxAnisotropy, 8e3);
-    } else {
-      await this.prepareObjectRuntimeData(object, maxAnisotropy, 6e3);
-    }
-  }
-  prepareFastVisibleStage(object, meshCount, onProgress) {
-    if (meshCount < 12e3) return false;
-    let visibleCount = 0;
-    const limit = this.fastPreviewMeshLimit;
-    object.traverse((child) => {
-      if (!child.isMesh) return;
-      const mesh = child;
-      const isVisible = visibleCount < limit;
-      mesh.visible = isVisible;
-      mesh.userData.fastPreview = isVisible;
-      if (isVisible) visibleCount++;
-    });
-    if (onProgress) {
-      onProgress(8, `正在准备快速预览... (${visibleCount} meshes)`);
-    }
-    if (visibleCount > 0) {
-      object.userData.fastPreviewActive = true;
-      this.fastPreviewModels.add(object.uuid);
-    }
-    return visibleCount > 0;
-  }
-  attachModelToContentGroup(object, keepVisible = false) {
-    const fileGroup = new THREE.Group();
-    fileGroup.name = `file_${object.uuid}`;
-    fileGroup.userData.originalUuid = object.uuid;
-    const modelName = sanitizeFileStem(
-      sanitizeDisplayLabel(
-        typeof object.userData?.modelName === "string" ? object.userData.modelName : "",
-        stripFileExtension(object.name),
-        object.name
-      ) || "model"
-    );
-    fileGroup.userData.modelName = modelName;
-    object.userData.originalUuid = object.uuid;
-    object.userData.modelName = modelName;
-    fileGroup.add(object);
-    object.visible = keepVisible;
-    this.contentGroup.add(fileGroup);
-    this.markSceneDirty({
-      invalidateInteractables: true,
-      needsRender: false
-    });
-  }
-  async prepareModelChunkStage(object, meshCount, onProgress) {
-    if (onProgress) onProgress(10, "正在收集构件...");
-    const preferFastCollect = this.resolvedChunkOptions.loadProfile === "max-speed";
-    const collectBatchedThreshold = preferFastCollect ? 1200 : this.octreeWorkerThreshold;
-    const items = meshCount >= collectBatchedThreshold ? await collectItemsBatched(object, {
-      batchSize: preferFastCollect ? 5200 : 3e3,
-      onProgress: (processed, total) => {
-        if (!onProgress || total === 0) return;
-        const ratio = processed / total;
-        onProgress(10 + Math.round(ratio * 10), `正在收集构件... (${processed}/${total})`);
-      }
-    }) : collectItems(object);
-    if (items.length === 0) return;
-    if (onProgress) onProgress(20, `已收集 ${items.length} 个构件，正在计算八叉树...`);
-    const bounds = await this.computeItemBoundsProgressively(items, onProgress);
-    if (onProgress) onProgress(35, "正在计算八叉树...");
-    const maxItemsPerNode = 3e3;
-    const maxDepth = 6;
-    const leafNodes = await this.buildLeafPlans(items, bounds, maxItemsPerNode, maxDepth);
-    const ghostSpecs = await this.registerLeafChunksProgressively(object, leafNodes, onProgress);
-    this.reportChunkProgress();
-    this.checkCullingAndLoad();
-    void this.createChunkGhostsProgressively(ghostSpecs);
-    const meshesToHideSet = /* @__PURE__ */ new Set();
-    for (const item of items) {
-      const sourceMesh = item.sourceMesh;
-      if (sourceMesh?.isMesh) {
-        meshesToHideSet.add(sourceMesh);
-      }
-    }
-    const meshesToHide = meshesToHideSet.size > 0 ? Array.from(meshesToHideSet) : (() => {
-      const fallbackMeshes = [];
-      object.traverse((child) => {
-        if (child.isMesh) {
-          fallbackMeshes.push(child);
-        }
-      });
-      return fallbackMeshes;
-    })();
-    for (let i = 0; i < meshesToHide.length; i++) {
-      const child = meshesToHide[i];
-      if (object.userData.fastPreviewActive && child.userData.fastPreview) {
-        continue;
-      }
-      child.visible = false;
-      child.userData.isOptimized = true;
-      if (i > 0 && i % 6e3 === 0) {
-        await this.yieldToMainThread();
-      }
-    }
-    if (onProgress) onProgress(95, "分块准备完成");
-  }
-  finalizeModelStage(previewGhost, onProgress) {
-    this.sceneBounds = this.computeTotalBounds(false);
-    this.precomputedBounds = this.sceneBounds.clone();
-    if (this.globalOffset.length() > 0) {
-      this.precomputedBounds.translate(this.globalOffset);
-    }
-    this.updateSettings(this.settings);
-    if (onProgress) onProgress(100, "模型已加入加载队列");
-    this.checkCullingAndLoad();
-    if (!previewGhost) return;
-    this.ghostGroup.remove(previewGhost);
-    this.releaseGhostLine(previewGhost);
-    this.markSceneDirty();
-  }
-  cancelDeferredStructureBuild() {
-    if (this.deferredStructureTimer) {
-      clearTimeout(this.deferredStructureTimer);
-      this.deferredStructureTimer = null;
-    }
-    this.deferredStructureToken++;
-  }
-  beginLoadGeneration() {
-    this.loadGeneration += 1;
-    return this.loadGeneration;
-  }
-  isLoadGenerationCurrent(generation) {
-    return generation === this.loadGeneration;
-  }
-  deactivateFastPreviewForModel(originalUuid) {
-    if (!this.fastPreviewModels.has(originalUuid)) return;
-    this.fastPreviewModels.delete(originalUuid);
-    const fileGroup = this.contentGroup.getObjectByName(`file_${originalUuid}`);
-    if (!fileGroup) return;
-    fileGroup.traverse((child) => {
-      if (child.isMesh) {
-        child.visible = false;
-        if (child.userData.fastPreview) delete child.userData.fastPreview;
-      }
-      if (child.userData?.fastPreviewActive) {
-        child.userData.fastPreviewActive = false;
-      }
-    });
-  }
-  scheduleDeferredStructureReplacement(object, shouldDeferStructure, deferredPlaceholderId) {
-    if (shouldDeferStructure && deferredPlaceholderId) {
-      this.cancelDeferredStructureBuild();
-      const token = this.deferredStructureToken;
-      this.deferredStructureTimer = setTimeout(() => {
-        try {
-          if (token !== this.deferredStructureToken) return;
-          const modelRoot = this.buildAndRegisterModelStructure(object);
-          this.replaceStructureNode(deferredPlaceholderId, modelRoot);
-          if (this.onStructureUpdate) this.onStructureUpdate();
-        } catch (error) {
-          console.warn("延迟构建结构树失败:", error);
-        }
-      }, 80);
-      return;
-    }
-    if (this.onStructureUpdate) {
-      this.onStructureUpdate();
-    }
-  }
-  async addModel(object, onProgress) {
-    object.updateMatrixWorld(true);
-    const modelBox = this.applyGlobalOffsetForModel(object);
-    const objectOverview = this.collectObjectOverview(object);
-    const meshCount = objectOverview.meshes;
-    this.configureModelWarmup(meshCount);
-    this.registerOriginalStats(object.uuid, objectOverview);
-    const { shouldDeferStructure, deferredPlaceholderId } = this.prepareStructureStage(object, meshCount, onProgress);
-    const previewGhost = this.prepareModelBoundsStage(object, modelBox);
-    const quickVisibleEnabled = this.prepareFastVisibleStage(object, meshCount, onProgress);
-    await this.prepareModelRuntimeStage(object, meshCount);
-    this.attachModelToContentGroup(object, quickVisibleEnabled);
-    await this.prepareModelChunkStage(object, meshCount, onProgress);
-    this.finalizeModelStage(previewGhost, onProgress);
-    this.scheduleDeferredStructureReplacement(object, shouldDeferStructure, deferredPlaceholderId);
-  }
-  removeObject(uuid) {
-    this.cancelDeferredStructureBuild();
-    const nodes = this.nodeMap.get(uuid);
-    const originalUuid = nodes?.[0]?.userData?.originalUuid || uuid;
-    const optimizedGroupsToRemove = [];
-    this.contentGroup.traverse((child) => {
-      const isMatch = child.name === `optimized_${uuid}` || child.name === `file_${uuid}` || child.userData.originalUuid === uuid || child.userData.originalUuid === originalUuid || child.name.startsWith("optimized_") && (child.userData.originalUuid === uuid || child.userData.originalUuid === originalUuid) || child.name.startsWith("file_") && (child.userData.originalUuid === uuid || child.userData.originalUuid === originalUuid);
-      if (isMatch) {
-        optimizedGroupsToRemove.push(child);
-      }
-    });
-    optimizedGroupsToRemove.forEach((group) => {
-      group.traverse((child) => {
-        if (child.isBatchedMesh) {
-          const bm = child;
-          this.disposeChunkMesh(bm);
-        }
-      });
-      group.removeFromParent();
-    });
-    const obj = this.contentGroup.getObjectByProperty("uuid", uuid);
-    const processRemoval = (o) => {
-      const id = o instanceof THREE.Object3D ? o.uuid : o.id;
-      const mappings = this.optimizedMapping.get(id);
-      if (mappings) {
-        mappings.forEach((m) => {
-          m.mesh.setVisibleAt(m.instanceId, false);
-        });
-        this.optimizedMapping.delete(id);
-      }
-      if (o.isMesh) {
-        const mesh = o;
-        if (mesh.geometry) mesh.geometry.dispose();
-        if (mesh.material) {
-          const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-          materials.forEach((m) => m.dispose());
-        }
-      } else if (o.isBatchedMesh) {
-        const bm = o;
-        this.disposeChunkMesh(bm);
-      }
-      this.componentMap.delete(id);
-      if (o instanceof THREE.Object3D && o.userData.expressID !== void 0) {
-        this.componentMap.delete(o.userData.expressID);
-      }
-      const nodeInfos = this.nodeMap.get(id);
-      if (nodeInfos) {
-        nodeInfos.forEach((nodeInfo) => {
-          if (nodeInfo.bimId !== void 0) {
-            this.componentMap.delete(nodeInfo.bimId);
-          }
-        });
-      }
-      this.nodeMap.delete(id);
-    };
-    if (obj) {
-      obj.traverse(processRemoval);
-      obj.removeFromParent();
-    } else if (nodes && nodes.length > 0) {
-      const traverseNode = (n) => {
-        processRemoval(n);
-        if (n.children) n.children.forEach(traverseNode);
-      };
-      traverseNode(nodes[0]);
-    }
-    this.markSceneDirty({
-      invalidateInteractables: true,
-      needsRender: false
-    });
-    this.unregisterOriginalStats(originalUuid);
-    this.fastPreviewModels.delete(uuid);
-    this.fastPreviewModels.delete(originalUuid);
-    this.clearChunkCache((chunkId, mesh) => {
-      const owner = mesh.userData.originalUuid || "";
-      return owner === uuid || owner === originalUuid || chunkId.startsWith(uuid) || chunkId.startsWith(originalUuid);
-    });
-    if (this.currentMeasureModelUuid === uuid || this.currentMeasureModelUuid === originalUuid) {
-      this.currentMeasureModelUuid = null;
-    }
-    this.chunks = this.chunks.filter((c) => {
-      const isMatch = c.originalUuid === uuid || c.originalUuid === originalUuid || c.id.startsWith(uuid);
-      if (isMatch) {
-        this.cancelledChunkIds.add(c.id);
-        this.processingChunks.delete(c.id);
-        const ghost = this.ghostGroup.getObjectByName(`ghost_${c.id}`);
-        if (ghost) {
-          this.ghostGroup.remove(ghost);
-          this.releaseGhostLine(ghost);
-        }
-        return false;
-      }
-      return true;
-    });
-    this.rebuildChunkIdSet();
-    if (this.structureRoot) {
-      const filterNodes = (nodes2) => {
-        return nodes2.filter((n) => {
-          if (n.id === uuid) return false;
-          if (!this.nodeMap.has(n.id) && n.id !== "root") return false;
-          if (n.children) {
-            n.children = filterNodes(n.children);
-          }
-          return true;
-        });
-      };
-      if (this.structureRoot.id === uuid) {
-        this.structureRoot = { id: "root", name: "Root", type: "Group", children: [] };
-      } else if (this.structureRoot.children) {
-        this.structureRoot.children = filterNodes(this.structureRoot.children);
-      }
-    }
-    this.precomputedBounds = this.computeTotalBounds();
-    if (this.precomputedBounds.isEmpty()) {
-      this.contentGroup.traverse((child) => {
-        if (child.isMesh && child.visible) {
-          const box = new THREE.Box3().setFromObject(child);
-          if (!box.isEmpty()) this.precomputedBounds.union(box);
-        }
-      });
-    }
-    this.updateSceneBounds();
-    if (this.onStructureUpdate) this.onStructureUpdate();
-    this.markSceneDirty({
-      invalidateInteractables: true,
-      needsBoundsUpdate: true,
-      needsCulling: true
-    });
-    this.measureRecords.forEach((record, recordId) => {
-      let isRelated = record.modelUuid === uuid || record.modelUuid === originalUuid;
-      if (!isRelated && record.modelUuid && obj) {
-        obj.traverse((child) => {
-          if (child.uuid === record.modelUuid) {
-            isRelated = true;
-          }
-        });
-      }
-      if (isRelated) {
-        this.removeMeasurement(recordId);
-      }
-    });
-    return true;
-  }
-  async removeModel(uuid) {
-    return this.removeObject(uuid);
-  }
-  // --- NBIM 导入/导出功能 ---
-  generateChunkBinaryV8(items, bimIdToIndex) {
-    const uniqueGeos = [];
-    const geoMap = /* @__PURE__ */ new Map();
-    items.forEach((item) => {
-      if (item.geometry && !geoMap.has(item.geometry)) {
-        geoMap.set(item.geometry, uniqueGeos.length);
-        uniqueGeos.push(item.geometry);
-      }
-    });
-    let size = 4;
-    for (const geo of uniqueGeos) {
-      const vertCount = geo.attributes.position.count;
-      const index = geo.index;
-      const indexCount = index ? index.count : 0;
-      size += 4 + 4 + vertCount * 12 + vertCount * 12;
-      if (indexCount > 0) size += indexCount * 4;
-    }
-    size += 4;
-    size += items.length * (4 + 4 + 4 + 64 + 4);
-    const buffer = new ArrayBuffer(size);
-    const dv = new DataView(buffer);
-    let offset = 0;
-    dv.setUint32(offset, uniqueGeos.length, true);
-    offset += 4;
-    for (const geo of uniqueGeos) {
-      const pos = geo.getAttribute("position");
-      const norm = geo.getAttribute("normal");
-      const count = pos.count;
-      const index = geo.index;
-      const indexCount = index ? index.count : 0;
-      dv.setUint32(offset, count, true);
-      offset += 4;
-      dv.setUint32(offset, indexCount, true);
-      offset += 4;
-      for (let i = 0; i < count; i++) {
-        dv.setFloat32(offset, pos.getX(i), true);
-        offset += 4;
-        dv.setFloat32(offset, pos.getY(i), true);
-        offset += 4;
-        dv.setFloat32(offset, pos.getZ(i), true);
-        offset += 4;
-      }
-      for (let i = 0; i < count; i++) {
-        dv.setFloat32(offset, norm.getX(i), true);
-        offset += 4;
-        dv.setFloat32(offset, norm.getY(i), true);
-        offset += 4;
-        dv.setFloat32(offset, norm.getZ(i), true);
-        offset += 4;
-      }
-      if (index && indexCount > 0) {
-        for (let i = 0; i < indexCount; i++) {
-          dv.setUint32(offset, index.getX(i), true);
-          offset += 4;
-        }
-      }
-    }
-    dv.setUint32(offset, items.length, true);
-    offset += 4;
-    for (const item of items) {
-      const treeNodes = this.nodeMap.get(item.uuid);
-      const firstNode = treeNodes?.[0];
-      const bimId = item.bimId || firstNode?.bimId || firstNode?.id || item.uuid;
-      const bimIdIndex = bimIdToIndex.get(bimId) ?? 0;
-      dv.setUint32(offset, bimIdIndex, true);
-      offset += 4;
-      const typeIndex = typeof item.typeIndex === "number" ? item.typeIndex : 0;
-      dv.setUint32(offset, typeIndex, true);
-      offset += 4;
-      dv.setUint32(offset, item.color, true);
-      offset += 4;
-      const elements = item.matrix.elements;
-      for (let k = 0; k < 16; k++) {
-        dv.setFloat32(offset, elements[k], true);
-        offset += 4;
-      }
-      const geoId = geoMap.get(item.geometry) || 0;
-      dv.setUint32(offset, geoId, true);
-      offset += 4;
-    }
-    return buffer;
-  }
-  async exportNbim(fileName) {
-    if (this.chunks.length === 0) throw new Error("无模型数据可导出");
-    const bimIdTable = [""];
-    const bimIdToIndex = /* @__PURE__ */ new Map();
-    const addBimId = (bimId) => {
-      if (!bimId) return;
-      if (bimIdToIndex.has(bimId)) return;
-      const idx = bimIdTable.length;
-      bimIdTable.push(bimId);
-      bimIdToIndex.set(bimId, idx);
-    };
-    const traverseBimIds = (node) => {
-      addBimId(node.bimId);
-      if (node.children) node.children.forEach(traverseBimIds);
-    };
-    traverseBimIds(this.structureRoot);
-    const { ifcApiByModel, ifcManagerByModel } = collectIfcModelReferences(this.contentGroup);
-    const bimProperties = await collectNbimBimProperties({
-      structureRoot: this.structureRoot,
-      ifcApiByModel,
-      ifcManagerByModel
-    });
-    const { chunkBlobs, exportChunks, currentOffset } = await prepareNbimExportChunks({
-      chunks: this.chunks,
-      nbimFiles: this.nbimFiles,
-      nbimMeta: this.nbimMeta,
-      bimIdToIndex,
-      hasValidChunkBinaryRange: (chunk) => this.hasValidChunkBinaryRange(chunk),
-      generateChunkBinaryV8: (items, indexMap) => this.generateChunkBinaryV8(items, indexMap)
-    });
-    const manifest = {
-      globalBounds: {
-        min: { x: this.sceneBounds.min.x, y: this.sceneBounds.min.y, z: this.sceneBounds.min.z },
-        max: { x: this.sceneBounds.max.x, y: this.sceneBounds.max.y, z: this.sceneBounds.max.z }
-      },
-      chunks: exportChunks,
-      stats: this.originalStats,
-      structureTree: buildExportStructureTree(this.structureRoot),
-      bimIdTable,
-      bimProperties
-    };
-    const manifestBytes = encodeNbimManifest(manifest, this.structureRoot);
-    const header = new ArrayBuffer(1024);
-    const dv = new DataView(header);
-    dv.setUint32(0, 1296646734, true);
-    dv.setUint32(4, 8, true);
-    dv.setUint32(8, currentOffset, true);
-    dv.setUint32(12, manifestBytes.byteLength, true);
-    const blobParts = [header, ...chunkBlobs, manifestBytes];
-    const finalBlob = new Blob(blobParts, { type: "application/octet-stream" });
-    const url = URL.createObjectURL(finalBlob);
-    const a = document.createElement("a");
-    a.href = url;
-    const defaultStem = deriveDefaultNbimStem(this.contentGroup);
-    const resolvedName = sanitizeFileStem(stripFileExtension((fileName || "").trim()) || defaultStem);
-    a.download = `${resolvedName}.nbim`;
-    a.click();
-    URL.revokeObjectURL(url);
-  }
-  async loadNbim(file, onProgress) {
-    const fileId = `nbim_${file.name}_${(/* @__PURE__ */ new Date()).getTime()}`;
-    this.nbimFiles.set(fileId, file);
-    if (onProgress) onProgress(10, "正在解析 NBIM 文件头...");
-    const header = await readNbimHeader(file);
-    const magic = header.magic;
-    if (magic !== 1296646734) throw new Error("不是有效的 NBIM 文件");
-    const version = header.version;
-    if (version !== 8) {
-      throw new Error(`不支持的 NBIM 版本: ${version}，当前仅支持 V8`);
-    }
-    if (onProgress) onProgress(20, "正在读取元数据...");
-    const manifest = await readNbimManifest(file, header);
-    this.nbimMeta.set(fileId, { version, bimIdTable: manifest.bimIdTable });
-    const boundsState = applyNbimGlobalBounds({
-      globalBounds: manifest.globalBounds,
-      precomputedBounds: this.precomputedBounds,
-      sceneBounds: this.sceneBounds,
-      globalOffset: this.globalOffset
-    });
-    this.precomputedBounds.copy(boundsState.precomputedBounds);
-    this.sceneBounds.copy(boundsState.sceneBounds);
-    this.globalOffset.copy(boundsState.globalOffset);
-    if (boundsState.initializedOffset) {
-      debugLog("SceneManager/NBIM", "初始化全局偏移", this.globalOffset);
-    }
-    const modelRoot = manifest.structureTree;
-    appendNbimStructure({
-      structureRoot: this.structureRoot,
-      modelRoot
-    });
-    const rootId = modelRoot?.id || fileId;
-    const manifestBimProperties = manifest?.bimProperties && typeof manifest.bimProperties === "object" ? manifest.bimProperties : {};
-    const { defaultOwner, grouped } = groupNbimPropertiesByOwner(manifestBimProperties, rootId);
-    grouped.forEach((props, owner) => this.nbimPropsByOriginalUuid.set(owner, props));
-    const quickStats = buildNbimQuickStats({
-      manifestStats: manifest.stats,
-      modelRoot,
-      chunks: manifest.chunks
-    });
-    this.registerOriginalStats(rootId, quickStats);
-    const fileGroup = createNbimContainerGroup({
-      fileName: file.name,
-      modelRootName: typeof modelRoot?.name === "string" ? modelRoot.name : "",
-      rootId
-    });
-    this.contentGroup.add(fileGroup);
-    this.interactableListValid = false;
-    populateNbimNodeMappings({
-      modelRoot,
-      defaultOwner,
-      nodeMap: this.nodeMap,
-      bimIdToNodeIds: this.bimIdToNodeIds
-    });
-    if (onProgress) onProgress(30, "正在初始化分块...");
-    const chunkEntries = Array.isArray(manifest.chunks) ? manifest.chunks : [];
-    this.applyNbimScaleTuning(chunkEntries.length);
-    const immediateGhostLimit = this.resolvedChunkOptions.ghostMode === "all" ? Number.MAX_SAFE_INTEGER : GHOST_VISIBLE_FIRST_BATCH;
-    const { deferredGhostSpecs } = await registerNbimChunks({
-      chunkEntries,
-      globalOffset: this.globalOffset,
-      chunkPadding: this.chunkPadding,
-      rootId,
-      fileId,
-      immediateGhostLimit,
-      registrationBatchSize: NBIM_CHUNK_REGISTRATION_BATCH,
-      onProgress,
-      registerChunk: (chunk) => this.registerChunk(chunk),
-      createGhostLine: (name, bounds) => this.createGhostLine(name, bounds),
-      addGhostLine: (line) => this.ghostGroup.add(line),
-      yieldToMainThread: () => this.yieldToMainThread()
-    });
-    if (deferredGhostSpecs.length > 0) {
-      void this.createChunkGhostsProgressively(deferredGhostSpecs);
-    }
-    this.reportChunkProgress();
-    this.fitView(true);
-    const loadFinalize = finalizeNbimLoad({
-      chunkCount: this.chunks.length,
-      hasManifestStats: Boolean(manifest.stats),
-      hasManifestChunks: Boolean(manifest.chunks?.length)
-    });
-    this.chunkWarmupActive = loadFinalize.chunkWarmupActive;
-    this.initialChunkLoadTarget = loadFinalize.initialChunkLoadTarget;
-    if (onProgress) onProgress(100, "NBIM 已就绪，正在按需加载...");
-    this.checkCullingAndLoad();
-    if (loadFinalize.shouldEstimateStats) {
-      void this.estimateNbimStats(file, manifest.chunks, version).then((stats) => {
-        this.unregisterOriginalStats(rootId);
-        this.registerOriginalStats(rootId, stats);
-      }).catch((error) => {
-        console.warn("NBIM 统计估算失败:", error);
-      });
-    }
-  }
-  async clear() {
-    this.beginLoadGeneration();
-    debugLog("SceneManager", "开始清空场景...");
-    this.cancelDeferredStructureBuild();
-    this.resetExplode();
-    this.clearLocateFocus();
-    try {
-      const disposeObject = (obj) => {
-        if (obj.isMesh) {
-          const mesh = obj;
-          if (mesh.geometry) mesh.geometry.dispose();
-          if (mesh.material) {
-            const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-            materials.forEach((m) => m.dispose());
-          }
-        } else if (obj.isBatchedMesh) {
-          const bm = obj;
-          if (bm.geometry) bm.geometry.dispose();
-          if (bm.material) {
-            const materials = Array.isArray(bm.material) ? bm.material : [bm.material];
-            materials.forEach((m) => m.dispose());
-          }
-        }
-      };
-      this.contentGroup.traverse(disposeObject);
-      while (this.contentGroup.children.length > 0) {
-        this.contentGroup.remove(this.contentGroup.children[0]);
-      }
-      while (this.ghostGroup.children.length > 0) {
-        const ghost = this.ghostGroup.children[0];
-        this.ghostGroup.remove(ghost);
-        this.releaseGhostLine(ghost);
-      }
-      this.ghostMeshPool.length = 0;
-      this.selectionBox.visible = false;
-      this.highlightMesh.visible = false;
-      this.clearAllMeasurements();
-      this.optimizedMapping.clear();
-      this.sceneBounds.makeEmpty();
-      this.precomputedBounds.makeEmpty();
-      this.nbimFiles.clear();
-      this.nbimMeta.clear();
-      this.nbimPropsByOriginalUuid.clear();
-      this.structureRoot = { id: "root", name: "Root", type: "Group", children: [] };
-      this.nodeMap.clear();
-      this.bimIdToNodeIds.clear();
-      this.chunks = [];
-      this.chunkIdSet.clear();
-      this.chunkById.clear();
-      this.chunkIndexById.clear();
-      this.lastReportedProgress = { loaded: -1, total: -1 };
-      this.processingChunks.clear();
-      this.cancelledChunkIds.clear();
-      this.prefetchQueue = [];
-      this.prefetchQueueSet.clear();
-      this.prefetchInFlight.clear();
-      this.chunkLoadedCount = 0;
-      this.reportChunkProgress();
-      this.componentMap.clear();
-      this.clearChunkCache();
-      this.chunkReadCache.clear();
-      this.chunkReadCacheOrder = [];
-      this.originalStats = { meshes: 0, faces: 0, memory: 0 };
-      this.originalStatsByModel.clear();
-      this.fastPreviewModels.clear();
-      this.chunkLoadingEnabled = true;
-      this.contentGroup.visible = true;
-      this.ghostGroup.visible = true;
-      this.chunkWarmupActive = false;
-      this.globalOffset.set(0, 0, 0);
-      debugLog("SceneManager", "场景已清空");
-      this.markSceneDirty();
-    } catch (error) {
-      console.error("清空场景失败:", error);
-      throw error;
-    }
-  }
-  getStructureNodes(id) {
-    return this.nodeMap.get(id);
-  }
-  getBimIdByUuid(uuid) {
-    return resolveBimIdByUuid({
-      uuid,
-      nodeMap: this.nodeMap,
-      bimIdToNodeIds: this.bimIdToNodeIds
-    });
-  }
-  resolveNodeUuidByBimId(bimId) {
-    return resolveNodeUuidByBimId(bimId, this.bimIdToNodeIds);
-  }
-  resolveSelectionUuid(rawUuid) {
-    return resolveSelectionUuid(rawUuid, this.nodeMap, this.bimIdToNodeIds);
-  }
-  resolveNbimNode(id) {
-    return resolveNbimNode(id, this.nodeMap);
-  }
-  getNbimProperties(id) {
-    return resolveNbimFlatProperties({
-      id,
-      nodeMap: this.nodeMap,
-      nbimPropsByOriginalUuid: this.nbimPropsByOriginalUuid
-    });
-  }
-  getNbimIfcPropertyGroups(id, mode = "raw") {
-    return resolveNbimIfcPropertyGroups({
-      id,
-      nodeMap: this.nodeMap,
-      nbimPropsByOriginalUuid: this.nbimPropsByOriginalUuid
-    }, mode);
-  }
-  getVisibilityContext() {
-    return {
-      scene: this.scene,
-      contentGroup: this.contentGroup,
-      structureRoot: this.structureRoot,
-      nodeMap: this.nodeMap,
-      optimizedMapping: this.optimizedMapping,
-      highlightedUuids: this.highlightedUuids
-    };
-  }
-  getHighlightContext() {
-    return {
-      contentGroup: this.contentGroup,
-      selectionBox: this.selectionBox,
-      highlightMesh: this.highlightMesh,
-      optimizedMapping: this.optimizedMapping,
-      settings: this.settings,
-      state: {
-        highlightedUuids: this.highlightedUuids,
-        locateResultSet: this.locateResultSet,
-        locateFocusUuid: this.locateFocusUuid,
-        lastSelectedUuid: this.lastSelectedUuid
-      },
-      locateMaterialCache: this.locateMaterialCache,
-      locateObjectMaterialCache: this.locateObjectMaterialCache,
-      locateDimmedInstances: this.locateDimmedInstances,
-      clearClashPairHighlight: () => this.clearClashPairHighlight(),
-      nodeMap: this.nodeMap
-    };
-  }
-  getPickingContext() {
-    return {
-      canvas: this.canvas,
-      camera: this.camera,
-      raycaster: this.raycaster,
-      mouse: this.mouse,
-      contentGroup: this.contentGroup,
-      chunks: this.chunks,
-      nodeMap: this.nodeMap,
-      interactableList: this.interactableList,
-      interactableListValid: this.interactableListValid
-    };
-  }
-  syncHighlightState(state) {
-    this.highlightedUuids = state.highlightedUuids;
-    this.locateResultSet = state.locateResultSet;
-    this.locateFocusUuid = state.locateFocusUuid;
-    this.lastSelectedUuid = state.lastSelectedUuid;
-  }
-  syncPickingState(state) {
-    this.interactableList = state.interactableList;
-    this.interactableListValid = state.interactableListValid;
-  }
-  getMeasurementContext() {
-    return {
-      canvas: this.canvas,
-      camera: this.camera,
-      raycaster: this.raycaster,
-      mouse: this.mouse,
-      measureGroup: this.measureGroup,
-      tempMarker: this.tempMarker,
-      dotTexture: this.dotTexture,
-      measureRecords: this.measureRecords,
-      state: {
-        measureType: this.measureType,
-        currentMeasurePoints: this.currentMeasurePoints,
-        currentMeasureModelUuid: this.currentMeasureModelUuid,
-        previewLine: this.previewLine,
-        previewPolygon: this.previewPolygon
-      },
-      getRayIntersects: (clientX, clientY) => this.getRayIntersects(clientX, clientY),
-      onMeasureUpdate: this.onMeasureUpdate
-    };
-  }
-  syncMeasurementState(state) {
-    this.measureType = state.measureType;
-    this.currentMeasurePoints = state.currentMeasurePoints;
-    this.currentMeasureModelUuid = state.currentMeasureModelUuid;
-    this.previewLine = state.previewLine;
-    this.previewPolygon = state.previewPolygon;
-  }
-  syncBoxSelectState(state) {
-    this.boxSelectState = state;
-  }
-  getClippingContext() {
-    return {
-      renderer: this.renderer,
-      clipHelpersGroup: this.clipHelpersGroup,
-      state: {
-        clippingPlanes: this.clippingPlanes,
-        clipPlaneHelpers: this.clipPlaneHelpers,
-        clipHelperVisible: this.clipHelperVisible,
-        clipHelperOpacity: this.clipHelperOpacity
-      }
-    };
-  }
-  syncClippingState(state) {
-    this.clippingPlanes = state.clippingPlanes;
-    this.clipPlaneHelpers = state.clipPlaneHelpers;
-    this.clipHelperVisible = state.clipHelperVisible;
-    this.clipHelperOpacity = state.clipHelperOpacity;
-  }
-  setAllVisibility(visible) {
-    applySetAllVisibility(this.getVisibilityContext(), visible);
-    this.updateSceneBounds();
-    this.refreshExplodeState();
-    this.markSceneDirty();
-  }
-  hideObjects(uuids) {
-    this.setObjectsVisibility(uuids, false);
-  }
-  applyVisibilityBatch(changes, options = {}) {
-    const result = applyVisibilityBatch(this.getVisibilityContext(), changes, options);
-    if (result.nextHighlightedUuids) {
-      this.highlightObjects(result.nextHighlightedUuids);
-    }
-    if (options.invalidateInteractables ?? true) {
-      this.markSceneDirty({
-        invalidateInteractables: true,
-        needsRender: false
-      });
-    }
-    if (result.needsBoundsUpdate) this.updateSceneBounds();
-    if (result.needsExplodeRefresh) this.refreshExplodeState();
-    if (result.needsRender) this.markSceneDirty();
-  }
-  setObjectsVisibility(uuids, visible, options = {}) {
-    if (uuids.length === 0) return;
-    const changes = uuids.map((uuid) => ({
-      uuid,
-      visible,
-      showParents: options.showParents
-    }));
-    const recomputeBounds = !options.deferRefresh;
-    this.applyVisibilityBatch(changes, {
-      recomputeBounds,
-      refreshExplode: options.refreshExplode ?? false,
-      invalidateInteractables: !options.deferRefresh
-    });
-  }
-  isolateObjects(uuids) {
-    applyIsolateObjects(
-      this.getVisibilityContext(),
-      uuids,
-      (uuid, visible, showParents) => {
-        const inner = applySetObjectVisibility(this.getVisibilityContext(), uuid, visible, showParents);
-        if (inner.nextHighlightedUuids) {
-          const highlightContext = this.getHighlightContext();
-          const highlightResult = applyHighlightObjects(highlightContext, inner.nextHighlightedUuids);
-          this.syncHighlightState(highlightContext.state);
-          if (highlightResult.needsRender) this.markSceneDirty();
-        }
-      }
-    );
-    this.markSceneDirty({
-      invalidateInteractables: true,
-      needsRender: false
-    });
-    this.updateSceneBounds();
-    this.refreshExplodeState();
-    this.markSceneDirty();
-  }
-  setObjectVisibility(uuid, visible, showParents = true) {
-    const result = applySetObjectVisibility(this.getVisibilityContext(), uuid, visible, showParents);
-    if (result.nextHighlightedUuids) {
-      this.highlightObjects(result.nextHighlightedUuids);
-    }
-    this.markSceneDirty({
-      invalidateInteractables: true,
-      needsRender: false
-    });
-    if (result.needsBoundsUpdate) this.updateSceneBounds();
-    if (result.needsRender) this.markSceneDirty();
-  }
-  highlightObject(uuid) {
-    this.highlightObjects(uuid ? [uuid] : []);
-  }
-  toLocalDirection(directionWorld, matrixWorld) {
-    return directionWorld.clone().transformDirection(matrixWorld.clone().invert()).normalize();
-  }
-  getExplodeWorldDirection(vectorFromCenter) {
-    const direction = vectorFromCenter.clone();
-    if (this.explodeMode === "horizontal") {
-      direction.z = 0;
-    } else if (this.explodeMode === "vertical") {
-      direction.x = 0;
-      direction.y = 0;
-      direction.z = direction.z >= 0 ? 1 : -1;
-    }
-    if (direction.lengthSq() < 1e-8) {
-      if (this.explodeMode === "vertical") return new THREE.Vector3(0, 0, 1);
-      if (this.explodeMode === "horizontal") return new THREE.Vector3(1, 0, 0);
-      return new THREE.Vector3(0, 0, 1);
-    }
-    return direction.normalize();
-  }
-  /** 由 UUID 导出的稳定单位向量，近似均匀分布于球面（与径向方向混合后爆炸更散、更匀） */
-  explodeStableUnitDirection(seed, target) {
-    stableExplodeDirection(seed, target);
-  }
-  captureExplodeSnapshot() {
-    this.explodeObjectStates.clear();
-    this.explodeInstanceStates.clear();
-    let bounds = this.computeTotalBounds(true, true);
-    if (bounds.isEmpty()) bounds = this.computeTotalBounds(false, true);
-    if (bounds.isEmpty()) {
-      this.explodeCenter.set(0, 0, 0);
-      return;
-    }
-    this.explodeCenter.copy(bounds.getCenter(new THREE.Vector3()));
-    const radius = Math.max(bounds.getSize(new THREE.Vector3()).length() * 0.5, 1);
-    const objectBox = new THREE.Box3();
-    const objectCenter = new THREE.Vector3();
-    this.contentGroup.updateMatrixWorld(true);
-    this.contentGroup.traverse((obj) => {
-      const mesh = obj;
-      if (!mesh.isMesh || !obj.visible || obj.userData?.isIfcGridHelper) return;
-      objectBox.setFromObject(obj);
-      if (objectBox.isEmpty()) return;
-      objectCenter.copy(objectBox.getCenter(new THREE.Vector3()));
-      const offset = objectCenter.sub(this.explodeCenter);
-      const distN = offset.length() / radius;
-      const weight = 0.14 + 0.86 * Math.pow(THREE.MathUtils.clamp(distN, 0, 2.5) / 2.5, 0.38);
-      let directionWorld;
-      if (this.explodeMode === "radial") {
-        const radial = this.getExplodeWorldDirection(offset);
-        this.explodeStableUnitDirection(obj.uuid, this.explodeScratchUniform);
-        const mix = Math.pow(1 - Math.min(distN / 1.08, 1), 1.15);
-        directionWorld = this.explodeScratchMix.copy(radial).multiplyScalar(1 - mix).addScaledVector(this.explodeScratchUniform, mix).normalize();
-      } else {
-        directionWorld = this.getExplodeWorldDirection(offset);
-      }
-      const directionLocal = this.toLocalDirection(directionWorld, obj.parent?.matrixWorld || new THREE.Matrix4());
-      this.explodeObjectStates.set(obj.uuid, {
-        object: obj,
-        basePosition: obj.position.clone(),
-        directionLocal,
-        weight
-      });
-    });
-    const instanceBox = new THREE.Box3();
-    const instanceMatrix = new THREE.Matrix4();
-    const worldMatrix = new THREE.Matrix4();
-    this.optimizedMapping.forEach((mappings, originalUuid) => {
-      const isVisible = this.nodeMap.get(originalUuid)?.some((node) => node.visible !== false) ?? true;
-      if (!isVisible) return;
-      mappings.forEach((mapping) => {
-        const key = `${mapping.mesh.uuid}:${mapping.instanceId}`;
-        if (this.explodeInstanceStates.has(key)) return;
-        mapping.mesh.getMatrixAt(mapping.instanceId, instanceMatrix);
-        const geometry = mapping.geometry || mapping.mesh.geometry;
-        if (!geometry?.boundingBox) geometry?.computeBoundingBox?.();
-        if (!geometry?.boundingBox) return;
-        worldMatrix.copy(mapping.mesh.matrixWorld).multiply(instanceMatrix);
-        instanceBox.copy(geometry.boundingBox).applyMatrix4(worldMatrix);
-        if (instanceBox.isEmpty()) return;
-        objectCenter.copy(instanceBox.getCenter(new THREE.Vector3()));
-        const offset = objectCenter.sub(this.explodeCenter);
-        const distN = offset.length() / radius;
-        const weight = 0.14 + 0.86 * Math.pow(THREE.MathUtils.clamp(distN, 0, 2.5) / 2.5, 0.38);
-        let directionWorld;
-        if (this.explodeMode === "radial") {
-          const radial = this.getExplodeWorldDirection(offset);
-          this.explodeStableUnitDirection(key, this.explodeScratchUniform);
-          const mix = Math.pow(1 - Math.min(distN / 1.08, 1), 1.15);
-          directionWorld = this.explodeScratchMix.copy(radial).multiplyScalar(1 - mix).addScaledVector(this.explodeScratchUniform, mix).normalize();
-        } else {
-          directionWorld = this.getExplodeWorldDirection(offset);
-        }
-        this.explodeInstanceStates.set(key, {
-          mesh: mapping.mesh,
-          instanceId: mapping.instanceId,
-          baseMatrix: instanceMatrix.clone(),
-          directionLocal: this.toLocalDirection(directionWorld, mapping.mesh.matrixWorld),
-          weight
-        });
-      });
-    });
-  }
-  applyExplodeState() {
-    const bounds = this.computeTotalBounds(true, true);
-    const size = bounds.isEmpty() ? new THREE.Vector3(100, 100, 100) : bounds.getSize(new THREE.Vector3());
-    const magnitude = Math.max(size.length() * 0.125 * (this.explodeStrength / 100), 0);
-    this.explodeObjectStates.forEach((state) => {
-      state.object.position.copy(state.basePosition).addScaledVector(state.directionLocal, magnitude * state.weight);
-      state.object.updateMatrixWorld();
-    });
-    const translation = new THREE.Vector3();
-    const quaternion = new THREE.Quaternion();
-    const scale = new THREE.Vector3();
-    const matrixWork = new THREE.Matrix4();
-    this.explodeInstanceStates.forEach((state) => {
-      matrixWork.copy(state.baseMatrix);
-      matrixWork.decompose(translation, quaternion, scale);
-      translation.addScaledVector(state.directionLocal, magnitude * state.weight);
-      matrixWork.compose(translation, quaternion, scale);
-      state.mesh.setMatrixAt(state.instanceId, matrixWork);
-      if (state.mesh.instanceMatrix) state.mesh.instanceMatrix.needsUpdate = true;
-    });
-    this.interactableListValid = false;
-    this.updateSceneBounds();
-    this.markSceneDirty();
-  }
-  restoreExplodeSnapshot() {
-    this.explodeObjectStates.forEach((state) => {
-      state.object.position.copy(state.basePosition);
-      state.object.updateMatrixWorld();
-    });
-    this.explodeInstanceStates.forEach((state) => {
-      state.mesh.setMatrixAt(state.instanceId, state.baseMatrix);
-      if (state.mesh.instanceMatrix) state.mesh.instanceMatrix.needsUpdate = true;
-    });
-    this.interactableListValid = false;
-    this.updateSceneBounds();
-    this.markSceneDirty();
-  }
-  refreshExplodeState() {
-    if (!this.explodeEnabled) return;
-    this.restoreExplodeSnapshot();
-    this.captureExplodeSnapshot();
-    this.applyExplodeState();
-  }
-  setExplodeEnabled(enabled) {
-    if (enabled === this.explodeEnabled) return;
-    this.explodeEnabled = enabled;
-    if (!enabled) {
-      this.restoreExplodeSnapshot();
-      this.explodeObjectStates.clear();
-      this.explodeInstanceStates.clear();
-      return;
-    }
-    this.captureExplodeSnapshot();
-    this.applyExplodeState();
-  }
-  setExplodeStrength(value) {
-    this.explodeStrength = THREE.MathUtils.clamp(value, 0, 100);
-    if (!this.explodeEnabled) return;
-    if (this.explodeObjectStates.size === 0 && this.explodeInstanceStates.size === 0) {
-      this.captureExplodeSnapshot();
-    }
-    this.applyExplodeState();
-  }
-  setExplodeMode(mode) {
-    this.explodeMode = mode;
-    if (!this.explodeEnabled) return;
-    this.restoreExplodeSnapshot();
-    this.captureExplodeSnapshot();
-    this.applyExplodeState();
-  }
-  resetExplode() {
-    this.explodeStrength = 0;
-    if (this.explodeEnabled) {
-      this.restoreExplodeSnapshot();
-    }
-    this.explodeEnabled = false;
-    this.explodeObjectStates.clear();
-    this.explodeInstanceStates.clear();
-  }
-  clearClashPairHighlight() {
-    this.clashPairObjectMaterialCache.forEach((material, uuid) => {
-      const obj = this.contentGroup.getObjectByProperty("uuid", uuid);
-      if (!obj || !obj.isMesh && !obj.isBatchedMesh) return;
-      obj.material = material;
-    });
-    this.clashPairObjectMaterialCache.clear();
-    this.clashPairInstanceColorCache.forEach(({ mesh, instanceId, originalColor }) => {
-      mesh.setColorAt(instanceId, new THREE.Color(originalColor));
-      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-    });
-    this.clashPairInstanceColorCache.clear();
-    this.clashPairUuids.clear();
-  }
-  setClashPairHighlight(aUuid, bUuid, colorAHex = "#ff4d4f", colorBHex = "#1890ff") {
-    const normalizedA = String(aUuid || "").trim();
-    const normalizedB = String(bUuid || "").trim();
-    if (!normalizedA || !normalizedB) {
-      this.clearClashPairHighlight();
-      this.markSceneDirty();
-      return;
-    }
-    this.clearLocateFocus();
-    this.clearClashPairHighlight();
-    const aTargets = this.expandLocateTargets([normalizedA]);
-    const bTargets = this.expandLocateTargets([normalizedB]);
-    const colorA = new THREE.Color(colorAHex);
-    const colorB = new THREE.Color(colorBHex);
-    this.contentGroup.traverse((child) => {
-      const mesh = child;
-      if (!mesh.isMesh || !mesh.material) return;
-      const side = aTargets.has(child.uuid) ? "A" : bTargets.has(child.uuid) ? "B" : null;
-      if (!side) return;
-      if (!this.clashPairObjectMaterialCache.has(child.uuid)) {
-        this.clashPairObjectMaterialCache.set(child.uuid, mesh.material);
-      }
-      const sourceMaterials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-      const tintColor = side === "A" ? colorA : colorB;
-      const nextMaterials = sourceMaterials.map((material) => {
-        if (!material) return material;
-        const cloned = material.clone();
-        if ("transparent" in cloned) cloned.transparent = false;
-        if ("opacity" in cloned) cloned.opacity = 1;
-        if ("depthWrite" in cloned) cloned.depthWrite = true;
-        if ("color" in cloned && cloned.color) {
-          cloned.color.copy(cloned.color.clone().lerp(tintColor, 0.86));
-        }
-        if ("emissive" in cloned && cloned.emissive) {
-          cloned.emissive.copy(tintColor.clone().multiplyScalar(0.36));
-        }
-        cloned.needsUpdate = true;
-        return cloned;
-      });
-      mesh.material = Array.isArray(mesh.material) ? nextMaterials : nextMaterials[0];
-    });
-    const originalColorByInstance = /* @__PURE__ */ new Map();
-    this.optimizedMapping.forEach((mappings) => {
-      mappings.forEach((mapping) => {
-        originalColorByInstance.set(`${mapping.mesh.uuid}:${mapping.instanceId}`, mapping.originalColor);
-      });
-    });
-    this.contentGroup.traverse((child) => {
-      const batched = child;
-      if (!child.isBatchedMesh) return;
-      const batchIdToUuid = batched.userData?.batchIdToUuid;
-      if (!batchIdToUuid || batchIdToUuid.size === 0) return;
-      let touched = false;
-      batchIdToUuid.forEach((instanceUuid, instanceId) => {
-        const side = aTargets.has(instanceUuid) ? "A" : bTargets.has(instanceUuid) ? "B" : null;
-        if (!side) return;
-        const key = `${batched.uuid}:${instanceId}`;
-        if (!this.clashPairInstanceColorCache.has(key)) {
-          const mappedOriginalColor = originalColorByInstance.get(key);
-          if (typeof mappedOriginalColor === "number") {
-            this.clashPairInstanceColorCache.set(key, {
-              mesh: batched,
-              instanceId,
-              originalColor: mappedOriginalColor
-            });
-          } else {
-            const currentColor = new THREE.Color();
-            batched.getColorAt(instanceId, currentColor);
-            this.clashPairInstanceColorCache.set(key, {
-              mesh: batched,
-              instanceId,
-              originalColor: currentColor.getHex()
-            });
-          }
-        }
-        const origin = this.clashPairInstanceColorCache.get(key)?.originalColor;
-        if (typeof origin !== "number") return;
-        const tintColor = side === "A" ? colorA : colorB;
-        batched.setColorAt(instanceId, new THREE.Color(origin).lerp(tintColor, 0.88));
-        touched = true;
-      });
-      if (touched && batched.instanceColor) batched.instanceColor.needsUpdate = true;
-    });
-    this.clashPairUuids = /* @__PURE__ */ new Set([normalizedA, normalizedB]);
-    this.markSceneDirty();
-  }
-  clearLocateFocus() {
-    const context = this.getHighlightContext();
-    const result = applyClearLocateFocus(context);
-    this.syncHighlightState(context.state);
-    if (result.needsRender) this.markSceneDirty();
-  }
-  expandLocateTargets(ids) {
-    const expanded = /* @__PURE__ */ new Set();
-    const queue = [...ids];
-    const visited = /* @__PURE__ */ new Set();
-    while (queue.length > 0) {
-      const current = queue.shift();
-      if (!current || visited.has(current)) continue;
-      visited.add(current);
-      expanded.add(current);
-      const nodes = this.nodeMap.get(current);
-      if (!nodes || nodes.length === 0) continue;
-      for (const node of nodes) {
-        if (!node.children || node.children.length === 0) continue;
-        for (const child of node.children) {
-          if (!visited.has(child.id)) queue.push(child.id);
-        }
-      }
-    }
-    return expanded;
-  }
-  setLocateResultSet(uuids, focusUuid = null) {
-    const context = this.getHighlightContext();
-    const result = applySetLocateResultSet(context, uuids, focusUuid);
-    this.syncHighlightState(context.state);
-    if (result.needsRender) this.markSceneDirty();
-  }
-  setLocateFocusContext(uuids, focusUuid = null, highlightColors) {
-    const context = this.getHighlightContext();
-    const result = applySetLocateResultSet(context, uuids, focusUuid, { highlightColors });
-    this.syncHighlightState(context.state);
-    if (result.needsRender) this.markSceneDirty();
-  }
-  setLocateFocus(uuid) {
-    if (!uuid) {
-      this.clearLocateFocus();
-      return;
-    }
-    this.setLocateResultSet([uuid], uuid);
-  }
-  highlightObjects(uuids) {
-    const context = this.getHighlightContext();
-    const result = applyHighlightObjects(context, uuids);
-    this.syncHighlightState(context.state);
-    if (result.needsRender) this.markSceneDirty();
-  }
-  pick(clientX, clientY) {
-    const intersect = this.getRayIntersects(clientX, clientY);
-    if (!intersect) return null;
-    return { object: intersect.object, intersect };
-  }
-  getRayIntersects(clientX, clientY) {
-    const result = applyGetRayIntersects(this.getPickingContext(), clientX, clientY);
-    this.syncPickingState(result.state);
-    return result.intersect;
-  }
-  computeTotalBounds(onlyVisible = false, forceRecompute = false) {
-    if (!onlyVisible && !forceRecompute && !this.precomputedBounds.isEmpty()) {
-      const box = this.precomputedBounds.clone();
-      if (this.globalOffset.length() > 0) {
-        box.translate(this.globalOffset.clone().negate());
-      }
-      return box;
-    }
-    const totalBox = new THREE.Box3();
-    this.contentGroup.updateMatrixWorld(true);
-    this.contentGroup.traverse((obj) => {
-      if (onlyVisible && !obj.visible) return;
-      if (obj.isMesh && !obj._skipTraverse) {
-        const mesh = obj;
-        if (mesh.geometry) {
-          const box = new THREE.Box3().setFromObject(mesh);
-          if (!box.isEmpty()) totalBox.union(box);
-        }
-      } else if (obj.isBatchedMesh && !obj._skipTraverse) {
-        const bm = obj;
-        if (bm.computeBoundingBox) {
-          bm.computeBoundingBox();
-          if (bm.boundingBox) {
-            const box = bm.boundingBox.clone().applyMatrix4(bm.matrixWorld);
-            totalBox.union(box);
-          }
-        } else {
-          const box = new THREE.Box3().setFromObject(bm);
-          if (!box.isEmpty()) totalBox.union(box);
-        }
-      }
-    });
-    this.contentGroup.traverse((obj) => {
-      delete obj._skipTraverse;
-    });
-    if (this.chunks.length > 0) {
-      this.chunks.forEach((c) => {
-        if (!onlyVisible || c.loaded) {
-          totalBox.union(c.bounds);
-        }
-      });
-    }
-    if (totalBox.isEmpty() && !this.precomputedBounds.isEmpty()) {
-      const fallback = this.precomputedBounds.clone();
-      if (this.globalOffset.length() > 0) {
-        fallback.translate(this.globalOffset.clone().negate());
-      }
-      return fallback;
-    }
-    return totalBox;
-  }
-  updateSceneBounds() {
-    const fullBox = this.computeTotalBounds(false, true);
-    this.precomputedBounds = fullBox.clone();
-    if (this.globalOffset.length() > 0) {
-      this.precomputedBounds.translate(this.globalOffset);
-    }
-    this.sceneBounds.copy(fullBox);
-    this.sceneSphereValid = false;
-  }
-  fitView(keepOrientation = true) {
-    this.contentGroup.updateMatrixWorld(true);
-    let box = this.computeTotalBounds(true);
-    if (box.isEmpty()) {
-      box = this.computeTotalBounds(false);
-    }
-    this.sceneBounds = box.clone();
-    this.fitBox(box, !keepOrientation);
-  }
-  unionObjectBounds(obj, targetBox) {
-    const box = new THREE.Box3();
-    if (obj.userData?.boundingBox) {
-      box.copy(obj.userData.boundingBox).applyMatrix4(obj.matrixWorld);
-    } else {
-      box.setFromObject(obj);
-    }
-    if (!box.isEmpty()) targetBox.union(box);
-  }
-  unionTilesNodeBounds(node, targetBox) {
-    const encodedBox = node?.userData?.tilesBoundingVolumeBox;
-    if (!Array.isArray(encodedBox) || encodedBox.length < 12) return;
-    const center = new THREE.Vector3(encodedBox[0], encodedBox[1], encodedBox[2]);
-    const axisX = new THREE.Vector3(encodedBox[3], encodedBox[4], encodedBox[5]);
-    const axisY = new THREE.Vector3(encodedBox[6], encodedBox[7], encodedBox[8]);
-    const axisZ = new THREE.Vector3(encodedBox[9], encodedBox[10], encodedBox[11]);
-    const extent = new THREE.Vector3(axisX.length(), axisY.length(), axisZ.length());
-    const box = new THREE.Box3(center.clone().sub(extent), center.clone().add(extent));
-    if (!box.isEmpty()) targetBox.union(box);
-  }
-  unionOptimizedBounds(uuid, targetBox) {
-    const mappings = this.optimizedMapping.get(uuid);
-    if (!mappings || mappings.length === 0) return;
-    const instanceMatrix = new THREE.Matrix4();
-    for (const mapping of mappings) {
-      const geometry = mapping.geometry || mapping.mesh.geometry;
-      if (!geometry.boundingBox) geometry.computeBoundingBox();
-      if (!geometry.boundingBox) continue;
-      mapping.mesh.getMatrixAt(mapping.instanceId, instanceMatrix);
-      instanceMatrix.premultiply(mapping.mesh.matrixWorld);
-      const box = geometry.boundingBox.clone().applyMatrix4(instanceMatrix);
-      if (!box.isEmpty()) targetBox.union(box);
-    }
-  }
-  unionNodeBounds(uuid, targetBox, visited = /* @__PURE__ */ new Set()) {
-    if (!uuid || visited.has(uuid)) return;
-    visited.add(uuid);
-    const obj = this.contentGroup.getObjectByProperty("uuid", uuid);
-    if (obj) {
-      this.unionObjectBounds(obj, targetBox);
-    }
-    this.unionOptimizedBounds(uuid, targetBox);
-    const nodes = this.nodeMap.get(uuid) || [];
-    for (const node of nodes) {
-      this.unionTilesNodeBounds(node, targetBox);
-      const children = Array.isArray(node.children) ? node.children : [];
-      for (const child of children) {
-        this.unionNodeBounds(child.id, targetBox, visited);
-      }
-    }
-  }
-  fitViewToObject(uuid) {
-    const box = new THREE.Box3();
-    this.unionNodeBounds(uuid, box);
-    if (!box.isEmpty()) this.fitBox(box, false, 1.14);
-  }
-  getBoundsForObject(uuid) {
-    if (!uuid) return null;
-    const box = new THREE.Box3();
-    this.unionNodeBounds(uuid, box);
-    return box.isEmpty() ? null : box;
-  }
-  collectBoundsForUuids(uuids) {
-    const box = new THREE.Box3();
-    const unique = Array.from(new Set((uuids || []).filter(Boolean)));
-    unique.forEach((uuid) => this.unionNodeBounds(uuid, box));
-    return box;
-  }
-  fitViewToObjects(uuids) {
-    const box = this.collectBoundsForUuids(uuids);
-    if (!box.isEmpty()) this.fitBox(box, false, 1.14);
-  }
-  fitBox(box, updateCameraPosition = true, paddingOverride) {
-    if (box.isEmpty()) {
-      this.camera.zoom = 1;
-      this.camera.position.set(1e3, 1e3, 1e3);
-      this.camera.lookAt(0, 0, 0);
-      this.controls.target.set(0, 0, 0);
-      this.camera.updateProjectionMatrix();
-      this.controls.update();
-      return;
-    }
-    const center = box.getCenter(new THREE.Vector3());
-    const size = box.getSize(new THREE.Vector3());
-    const maxDim = Math.max(size.x, size.y, size.z);
-    const extent = maxDim > 0 ? maxDim : 100;
-    const padding = paddingOverride ?? 1.02;
-    const w = this.canvas.clientWidth;
-    const h = this.canvas.clientHeight;
-    const aspect = w / h;
-    let fH, fW;
-    if (aspect >= 1) {
-      fH = extent * padding;
-      fW = fH * aspect;
-    } else {
-      fW = extent * padding;
-      fH = fW / aspect;
-    }
-    const zBuffer = Math.max(extent * 5, 2e3);
-    this.camera.near = -zBuffer;
-    this.camera.far = zBuffer;
-    let targetZoom = 1;
-    let targetLeft = -fW / 2;
-    let targetRight = fW / 2;
-    let targetTop = fH / 2;
-    let targetBottom = -fH / 2;
-    if (updateCameraPosition) {
-      const offset = new THREE.Vector3(1, -1, 1).normalize();
-      const dist = Math.max(extent * 2, 2e3);
-      const targetPosition = center.clone().add(offset.multiplyScalar(dist));
-      const targetLookAt = center.clone();
-      const startPosition = this.camera.position.clone();
-      const startTarget = this.controls.target.clone();
-      const startTime = performance.now();
-      const duration = 600;
-      const animate = () => {
-        const elapsed = performance.now() - startTime;
-        const progress = Math.min(elapsed / duration, 1);
-        const eased = 1 - Math.pow(1 - progress, 3);
-        this.camera.position.lerpVectors(startPosition, targetPosition, eased);
-        this.controls.target.lerpVectors(startTarget, targetLookAt, eased);
-        this.camera.lookAt(this.controls.target);
-        this.camera.zoom = 1 + (targetZoom - 1) * eased;
-        this.camera.left = this.camera.left + (targetLeft - this.camera.left) * eased;
-        this.camera.right = this.camera.right + (targetRight - this.camera.right) * eased;
-        this.camera.top = this.camera.top + (targetTop - this.camera.top) * eased;
-        this.camera.bottom = this.camera.bottom + (targetBottom - this.camera.bottom) * eased;
-        this.camera.updateProjectionMatrix();
-        this.controls.update();
-        this.renderer.render(this.scene, this.camera);
-        if (progress < 1) {
-          requestAnimationFrame(animate);
-        }
-      };
-      animate();
-    } else {
-      const direction = new THREE.Vector3();
-      this.camera.getWorldDirection(direction);
-      const dist = this.camera.position.distanceTo(this.controls.target);
-      const targetPosition = center.clone().add(direction.multiplyScalar(-dist));
-      const targetLookAt = center.clone();
-      const paddingForOrientationFit = 1.01;
-      const camRight = new THREE.Vector3(1, 0, 0).applyQuaternion(this.camera.quaternion);
-      const camUp = new THREE.Vector3(0, 1, 0).applyQuaternion(this.camera.quaternion);
-      const halfBaseWidth = Math.max(1e-6, (this.camera.right - this.camera.left) * 0.5);
-      const halfBaseHeight = Math.max(1e-6, (this.camera.top - this.camera.bottom) * 0.5);
-      const corners = [
-        new THREE.Vector3(box.min.x, box.min.y, box.min.z),
-        new THREE.Vector3(box.min.x, box.min.y, box.max.z),
-        new THREE.Vector3(box.min.x, box.max.y, box.min.z),
-        new THREE.Vector3(box.min.x, box.max.y, box.max.z),
-        new THREE.Vector3(box.max.x, box.min.y, box.min.z),
-        new THREE.Vector3(box.max.x, box.min.y, box.max.z),
-        new THREE.Vector3(box.max.x, box.max.y, box.min.z),
-        new THREE.Vector3(box.max.x, box.max.y, box.max.z)
-      ];
-      let maxProjX = 0;
-      let maxProjY = 0;
-      for (let i = 0; i < corners.length; i++) {
-        const delta = corners[i].clone().sub(center);
-        maxProjX = Math.max(maxProjX, Math.abs(delta.dot(camRight)));
-        maxProjY = Math.max(maxProjY, Math.abs(delta.dot(camUp)));
-      }
-      const safeHalfX = Math.max(1e-3, maxProjX * paddingForOrientationFit);
-      const safeHalfY = Math.max(1e-3, maxProjY * paddingForOrientationFit);
-      const targetZoom2 = Math.max(
-        1e-4,
-        Math.min(1e6, Math.min(halfBaseWidth / safeHalfX, halfBaseHeight / safeHalfY))
-      );
-      const startPosition = this.camera.position.clone();
-      const startTarget = this.controls.target.clone();
-      const startZoom = this.camera.zoom;
-      const startTime = performance.now();
-      const duration = 600;
-      const animate = () => {
-        const elapsed = performance.now() - startTime;
-        const progress = Math.min(elapsed / duration, 1);
-        const eased = 1 - Math.pow(1 - progress, 3);
-        this.camera.position.lerpVectors(startPosition, targetPosition, eased);
-        this.controls.target.lerpVectors(startTarget, targetLookAt, eased);
-        this.camera.lookAt(this.controls.target);
-        this.camera.zoom = startZoom + (targetZoom2 - startZoom) * eased;
-        this.camera.updateProjectionMatrix();
-        this.controls.update();
-        this.renderer.render(this.scene, this.camera);
-        if (progress < 1) {
-          requestAnimationFrame(animate);
-        }
-      };
-      animate();
-    }
-  }
-  setView(view) {
-    let box = this.computeTotalBounds(true);
-    if (box.isEmpty()) box = this.computeTotalBounds(false);
-    this.sceneBounds = box.clone();
-    const center = box.isEmpty() ? new THREE.Vector3(0, 0, 0) : box.getCenter(new THREE.Vector3());
-    const size = box.isEmpty() ? new THREE.Vector3(100, 100, 100) : box.getSize(new THREE.Vector3());
-    const maxDim = Math.max(size.x, size.y, size.z);
-    const dist = Math.max(maxDim * 2, 10);
-    let pos = new THREE.Vector3();
-    switch (view) {
-      case "top":
-        pos.set(0, 0, dist);
-        break;
-      case "bottom":
-        pos.set(0, 0, -dist);
-        break;
-      case "front":
-        pos.set(0, -dist, 0);
-        break;
-      case "back":
-        pos.set(0, dist, 0);
-        break;
-      case "left":
-        pos.set(-dist, 0, 0);
-        break;
-      case "right":
-        pos.set(dist, 0, 0);
-        break;
-      case "se":
-      case "top-front-right":
-        pos.set(dist, -dist, dist);
-        break;
-      case "sw":
-      case "top-front-left":
-        pos.set(-dist, -dist, dist);
-        break;
-      case "ne":
-      case "top-back-right":
-        pos.set(dist, dist, dist);
-        break;
-      case "nw":
-      case "top-back-left":
-        pos.set(-dist, dist, dist);
-        break;
-      case "bottom-front-right":
-        pos.set(dist, -dist, -dist);
-        break;
-      case "bottom-front-left":
-        pos.set(-dist, -dist, -dist);
-        break;
-      case "bottom-back-right":
-        pos.set(dist, dist, -dist);
-        break;
-      case "bottom-back-left":
-        pos.set(-dist, dist, -dist);
-        break;
-      case "top-front":
-        pos.set(0, -dist, dist);
-        break;
-      case "top-back":
-        pos.set(0, dist, dist);
-        break;
-      case "top-left":
-        pos.set(-dist, 0, dist);
-        break;
-      case "top-right":
-        pos.set(dist, 0, dist);
-        break;
-      case "bottom-front":
-        pos.set(0, -dist, -dist);
-        break;
-      case "bottom-back":
-        pos.set(0, dist, -dist);
-        break;
-      case "bottom-left":
-        pos.set(-dist, 0, -dist);
-        break;
-      case "bottom-right":
-        pos.set(dist, 0, -dist);
-        break;
-      case "front-left":
-        pos.set(-dist, -dist, 0);
-        break;
-      case "front-right":
-        pos.set(dist, -dist, 0);
-        break;
-      case "back-left":
-        pos.set(-dist, dist, 0);
-        break;
-      case "back-right":
-        pos.set(dist, dist, 0);
-        break;
-    }
-    if (pos.lengthSq() > 0) {
-      pos.normalize().multiplyScalar(dist);
-      this.camera.position.copy(center).add(pos);
-      this.camera.lookAt(center);
-      this.controls.target.copy(center);
-      this.controls.update();
-      this.fitBox(box, false);
-    }
-  }
-  getCameraState() {
-    return {
-      position: this.camera.position.toArray(),
-      target: this.controls.target.toArray(),
-      zoom: this.camera.zoom,
-      left: this.camera.left,
-      right: this.camera.right,
-      top: this.camera.top,
-      bottom: this.camera.bottom
-    };
-  }
-  setCameraState(state) {
-    if (!state) return;
-    this.camera.position.fromArray(state.position);
-    this.controls.target.fromArray(state.target);
-    if (state.zoom !== void 0) this.camera.zoom = state.zoom;
-    if (state.left !== void 0) this.camera.left = state.left;
-    if (state.right !== void 0) this.camera.right = state.right;
-    if (state.top !== void 0) this.camera.top = state.top;
-    if (state.bottom !== void 0) this.camera.bottom = state.bottom;
-    this.camera.updateProjectionMatrix();
-    this.controls.update();
-    this.markSceneDirty();
-  }
-  // --- 测量定位逻辑 ---
-  locateMeasurement(id) {
-    const record = this.measureRecords.get(id);
-    if (!record) return;
-    const box = new THREE.Box3();
-    record.group.traverse((obj) => {
-      if (obj.isMesh || obj.isLine || obj.isSprite) {
-        obj.updateMatrixWorld();
-        if (obj.geometry) {
-          if (!obj.geometry.boundingBox) obj.geometry.computeBoundingBox();
-          const b = obj.geometry.boundingBox.clone();
-          b.applyMatrix4(obj.matrixWorld);
-          box.union(b);
-        }
-      }
-    });
-    if (box.isEmpty()) return;
-    const center = box.getCenter(new THREE.Vector3());
-    const size = box.getSize(new THREE.Vector3());
-    const maxDim = Math.max(size.x, size.y, size.z) || 1;
-    this.controls.target.copy(center);
-    const targetZoom = (this.camera.top - this.camera.bottom) / (maxDim * 0.5);
-    this.camera.zoom = Math.min(targetZoom, 100);
-    this.camera.updateProjectionMatrix();
-    this.controls.update();
-    this.markSceneDirty();
-  }
-  // --- 测量逻辑 ---
-  startMeasurement(type) {
-    this.measureType = type;
-    this.currentMeasurePoints = [];
-    this.currentMeasureModelUuid = null;
-    this.clearMeasurementPreview();
-  }
-  addMeasurePoint(point, modelUuid) {
-    const context = this.getMeasurementContext();
-    const result = applyAddMeasurePoint(context, point, modelUuid);
-    this.syncMeasurementState(result.state);
-    if (result.needsRender) this.markSceneDirty();
-    return result.completed ?? null;
-  }
-  updateMeasurePreview(hoverPoint) {
-    const context = this.getMeasurementContext();
-    const result = applyUpdateMeasurePreview(context, hoverPoint);
-    this.syncMeasurementState(result.state);
-  }
-  updateMeasureHover(clientX, clientY) {
-    const context = this.getMeasurementContext();
-    const result = applyUpdateMeasureHover(context, clientX, clientY);
-    this.syncMeasurementState(result.state);
-    if (result.needsRender) this.markSceneDirty();
-  }
-  finalizeMeasurement() {
-    const context = this.getMeasurementContext();
-    const result = applyFinalizeMeasurement(context);
-    this.syncMeasurementState(result.state);
-    if (result.needsRender) this.markSceneDirty();
-    return result.completed ?? null;
-  }
-  highlightMeasurement(id) {
-    const result = applyHighlightMeasurement(this.getMeasurementContext(), id);
-    this.syncMeasurementState(result.state);
-    this.markSceneDirty();
-  }
-  pickMeasurement(clientX, clientY) {
-    return applyPickMeasurement(this.getMeasurementContext(), clientX, clientY);
-  }
-  /**
-   * 获取对象的面积和体积
-   */
-  getObjectGeometryData(uuid) {
-    return getObjectGeometryDataFromScene({
-      uuid,
-      optimizedMapping: this.optimizedMapping,
-      contentGroup: this.contentGroup
-    });
-  }
-  // ========== 框选方法 ==========
-  /**
-   * 开始框选
-   */
-  startBoxSelect(clientX, clientY) {
-    const result = applyStartBoxSelect(this.boxSelectState, clientX, clientY);
-    this.syncBoxSelectState(result.state);
-  }
-  /**
-   * 更新框选范围
-   */
-  updateBoxSelect(clientX, clientY) {
-    const result = applyUpdateBoxSelect(this.boxSelectState, clientX, clientY);
-    this.syncBoxSelectState(result.state);
-  }
-  /**
-   * 完成框选，返回选中的对象 UUID 列表
-   */
-  endBoxSelect() {
-    const result = applyEndBoxSelect(
-      this.boxSelectState,
-      this.canvas,
-      (x1, y1, x2, y2) => this.selectByScreenRect(x1, y1, x2, y2)
-    );
-    this.syncBoxSelectState(result.state);
-    return result.selected;
-  }
-  /**
-   * 取消框选
-   */
-  cancelBoxSelect() {
-    const result = applyCancelBoxSelect(this.boxSelectState);
-    this.syncBoxSelectState(result.state);
-  }
-  /**
-   * 通过屏幕矩形选择对象
-   */
-  selectByScreenRect(x1, y1, x2, y2) {
-    const pickingState = ensureInteractableList(this.getPickingContext());
-    this.syncPickingState(pickingState);
-    return selectInteractablesByScreenRect(
-      {
-        camera: this.camera,
-        interactableList: this.interactableList
-      },
-      x1,
-      y1,
-      x2,
-      y2
-    );
-  }
-  removeMeasurement(id) {
-    if (this.measureRecords.has(id)) {
-      const record = this.measureRecords.get(id);
-      if (record) {
-        this.measureGroup.remove(record.group);
-        this.measureRecords.delete(id);
-        if (this.onMeasureUpdate) {
-          this.onMeasureUpdate(Array.from(this.measureRecords.values()));
-        }
-        this.markSceneDirty();
-      }
-    }
-  }
-  clearAllMeasurements() {
-    this.measureRecords.forEach((record) => {
-      this.measureGroup.remove(record.group);
-    });
-    this.measureRecords.clear();
-    this.clearMeasurementPreview();
-    if (this.onMeasureUpdate) {
-      this.onMeasureUpdate([]);
-    }
-    this.markSceneDirty();
-  }
-  clearMeasurementPreview() {
-    const context = this.getMeasurementContext();
-    const result = applyClearMeasurementPreview(context);
-    this.syncMeasurementState(result.state);
-    this.markSceneDirty();
-  }
-  // --- 剖切逻辑 ---
-  setupClipping() {
-    const result = applySetupClipping(this.getClippingContext());
-    this.syncClippingState(result.state);
-  }
-  setClipHelperOptions(options) {
-    const result = applySetClipHelperOptions(this.getClippingContext(), options);
-    this.syncClippingState(result.state);
-    this.markSceneDirty();
-  }
-  setClippingEnabled(enabled) {
-    this.renderer.clippingPlanes = enabled ? this.clippingPlanes : [];
-    if (!enabled) {
-      this.clipPlaneHelpers.forEach((h) => h.visible = false);
-    }
-    this.markSceneDirty();
-  }
-  updateClippingPlanes(bounds, values, active) {
-    const result = applyUpdateClippingPlanes(this.getClippingContext(), bounds, values, active);
-    this.syncClippingState(result.state);
-    if (result.needsRender) this.markSceneDirty();
-  }
-  /**
-   * 检查包围盒是否完全被当前剖切面裁剪掉
-   * 如果包围盒完全在任意一个激活的剖切面的“背面”，则认为被裁剪
-   */
-  isBoxClipped(box) {
-    return isBoxClippedByPlanes(this.clippingPlanes, box);
-  }
-  getStats() {
-    return collectSceneManagerStats({
-      renderer: this.renderer,
-      contentGroup: this.contentGroup,
-      originalStats: this.originalStats,
-      chunkLoadedCount: this.chunkLoadedCount,
-      chunksLength: this.chunks.length,
-      processingChunkCount: this.processingChunks.size,
-      activePixelRatio: this.activePixelRatio
-    });
-  }
-  dispose() {
-    this.disposed = true;
-    this.animateFramePending = false;
-    this.cancelBoxSelect();
-    disposeSceneManagerResources({
-      cancelDeferredStructureBuild: () => this.cancelDeferredStructureBuild(),
-      clearLocateFocus: () => this.clearLocateFocus(),
-      releaseGhostLine: (line) => this.releaseGhostLine(line),
-      clearChunkCache: () => this.clearChunkCache(),
-      controls: this.controls,
-      selectionBox: this.selectionBox,
-      highlightMesh: this.highlightMesh,
-      tempMarker: this.tempMarker,
-      dotTexture: this.dotTexture,
-      sharedMaterial: this.sharedMaterial,
-      ghostEdgesGeometry: this.ghostEdgesGeometry,
-      ghostMaterial: this.ghostMaterial,
-      renderer: this.renderer,
-      ghostGroup: this.ghostGroup,
-      workers: this.workers,
-      workerQueue: this.workerQueue,
-      logicTimer: this.logicTimer,
-      animationFrameId: this.animationFrameId,
-      onAnimationFrameDisposed: () => {
-        this.animationFrameId = null;
-      },
-      onWorkersDisposed: () => {
-        this.workers = [];
-        this.activeWorkerCount = 0;
-      },
-      onQueuesReset: () => {
-        this.processingChunks.clear();
-        this.cancelledChunkIds.clear();
-        this.prefetchQueue = [];
-        this.prefetchQueueSet.clear();
-        this.prefetchInFlight.clear();
-        this.chunkReadCache.clear();
-        this.chunkReadCacheOrder = [];
-      },
-      onStateCachesReset: () => {
-        this.highlightedUuids.clear();
-        this.locateResultSet.clear();
-        this.fastPreviewModels.clear();
-        this.ghostMeshPool.length = 0;
-      }
-    });
-  }
-}
-
-const themes = {
+import { jsx as t, jsxs as l, Fragment as ae } from "react/jsx-runtime";
+import _t, { useState as O, useEffect as q, useRef as ee, useCallback as T, useMemo as Se, Component as sr } from "react";
+import { s as yn, a as Kt, e as lr, b as cr, S as ur } from "./utils-DuOAw0Kj.js";
+import * as L from "three";
+import { OBB as dr } from "three/examples/jsm/math/OBB.js";
+const an = {
   light: {
     bg: "#F8FAFF",
     panelBg: "#FFFFFF",
@@ -6328,19 +12,56 @@ const themes = {
     text: "#1C1B1F",
     textLight: "#000000",
     textMuted: "#49454F",
-    accent: "#0061A4",
+    accent: "#0c62a2",
     highlight: "#E0E2EC",
-    itemHover: "rgba(0, 97, 164, 0.08)",
+    itemHover: "rgba(12, 98, 162, 0.08)",
     success: "#217346",
     warning: "#CA8A04",
     danger: "#B3261E",
     canvasBg: "#FFFFFF",
     shadow: "rgba(0, 0, 0, 0.15)"
   }
-};
-const DEFAULT_FONT = "'Roboto', 'Inter', 'Segoe UI', 'Microsoft YaHei', sans-serif";
-
-const resources = {
+}, hr = "'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif", ko = an.light;
+function Pe(e) {
+  return typeof window > "u" ? "" : getComputedStyle(document.documentElement).getPropertyValue(e).trim();
+}
+function Mo() {
+  const e = an.light, n = {
+    bg: Pe("--bg-primary"),
+    panelBg: Pe("--bg-panel"),
+    headerBg: Pe("--bg-header"),
+    border: Pe("--border-color"),
+    text: Pe("--text-primary"),
+    textLight: "#000000",
+    textMuted: Pe("--text-muted"),
+    accent: Pe("--accent"),
+    highlight: Pe("--bg-selected"),
+    itemHover: Pe("--bg-hover"),
+    success: Pe("--success"),
+    warning: Pe("--warning"),
+    danger: Pe("--error"),
+    canvasBg: Pe("--bg-canvas"),
+    shadow: Pe("--shadow-md")
+  };
+  return {
+    bg: n.bg || e.bg,
+    panelBg: n.panelBg || e.panelBg,
+    headerBg: n.headerBg || e.headerBg,
+    border: n.border || e.border,
+    text: n.text || e.text,
+    textLight: n.textLight || e.textLight,
+    textMuted: n.textMuted || e.textMuted,
+    accent: n.accent || e.accent,
+    highlight: n.highlight || e.highlight,
+    itemHover: n.itemHover || e.itemHover,
+    success: n.success || e.success,
+    warning: n.warning || e.warning,
+    danger: n.danger || e.danger,
+    canvasBg: n.canvasBg || e.canvasBg,
+    shadow: n.shadow || e.shadow
+  };
+}
+const pr = {
   en: {
     home: "Home",
     menu_open_file: "Open File",
@@ -6641,7 +362,16 @@ const resources = {
     about_license_nc: "Non-commercial Use Only",
     license_details: "License Details",
     third_party_libs: "Third-party Libraries",
-    license_summary: "This software is licensed under Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0).\n\nKey terms:\n• Free for non-commercial use only\n• Commercial use is strictly prohibited\n• Attribution required\n• ShareAlike for adaptations (non-commercial)\n• No warranties or liability\n\nFor commercial licensing, contact: zhangly1403@163.com",
+    license_summary: `This software is licensed under Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0).
+
+Key terms:
+• Free for non-commercial use only
+• Commercial use is strictly prohibited
+• Attribution required
+• ShareAlike for adaptations (non-commercial)
+• No warranties or liability
+
+For commercial licensing, contact: zhangly1403@163.com`,
     third_party_desc: "This software uses the following open-source libraries:",
     view_package_json: "View full dependency list in package.json",
     full_license: "Full license:",
@@ -7026,7 +756,16 @@ const resources = {
     about_license_nc: "仅限非商业用途",
     license_details: "授权协议详情",
     third_party_libs: "第三方库",
-    license_summary: "本软件采用知识共享署名-非商业性使用 4.0 国际许可协议 (CC BY-NC 4.0)。\n\n主要条款：\n• 仅限非商业用途免费使用\n• 禁止用于任何商业目的\n• 必须保留署名\n• 相同方式共享（非商业性改编）\n• 不提供任何担保或责任\n\n如需商业授权，请联系：zhangly1403@163.com",
+    license_summary: `本软件采用知识共享署名-非商业性使用 4.0 国际许可协议 (CC BY-NC 4.0)。
+
+主要条款：
+• 仅限非商业用途免费使用
+• 禁止用于任何商业目的
+• 必须保留署名
+• 相同方式共享（非商业性改编）
+• 不提供任何担保或责任
+
+如需商业授权，请联系：zhangly1403@163.com`,
     third_party_desc: "本软件使用了以下开源库：",
     view_package_json: "查看完整依赖列表请参考 package.json",
     full_license: "完整协议:",
@@ -7111,904 +850,777 @@ const resources = {
     confirm: "确定",
     writing: "正在写入文件..."
   }
-};
-const getTranslation = (lang, key) => {
-  return resources[lang][key] || key;
-};
-
-const iconSize = 24;
-const iconStrokeWidth = 1.5;
-const createIcon = (paths, props = {}) => {
-  const { size, color, ...rest } = props;
-  return /* @__PURE__ */ jsx(
+}, Ct = (e, n) => pr[e][n] || n, bn = 24, mr = 1.5, se = (e, n = {}) => {
+  const { size: i, color: a, ...r } = n;
+  return /* @__PURE__ */ t(
     "svg",
     {
-      width: size || iconSize,
-      height: size || iconSize,
+      width: i || bn,
+      height: i || bn,
       viewBox: "0 0 24 24",
       fill: "none",
-      stroke: color || "currentColor",
-      strokeWidth: iconStrokeWidth,
+      stroke: a || "currentColor",
+      strokeWidth: mr,
       strokeLinecap: "round",
       strokeLinejoin: "round",
-      ...rest,
-      children: paths
+      ...r,
+      children: e
     }
   );
-};
-const IconChevronRight = (props) => createIcon(/* @__PURE__ */ jsx("polyline", { points: "9 18 15 12 9 6" }), props);
-const IconChevronLeft = (props) => createIcon(/* @__PURE__ */ jsx("polyline", { points: "15 18 9 12 15 6" }), props);
-const IconChevronDown = (props) => createIcon(/* @__PURE__ */ jsx("polyline", { points: "6 9 12 15 18 9" }), props);
-const IconChevronUp = (props) => createIcon(/* @__PURE__ */ jsx("polyline", { points: "18 15 12 9 6 15" }), props);
-const IconTarget = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("circle", { cx: "12", cy: "12", r: "7" }),
-    /* @__PURE__ */ jsx("circle", { cx: "12", cy: "12", r: "2.5" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "2", x2: "12", y2: "5" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "19", x2: "12", y2: "22" }),
-    /* @__PURE__ */ jsx("line", { x1: "2", y1: "12", x2: "5", y2: "12" }),
-    /* @__PURE__ */ jsx("line", { x1: "19", y1: "12", x2: "22", y2: "12" })
+}, It = (e) => se(/* @__PURE__ */ t("polyline", { points: "9 18 15 12 9 6" }), e), fr = (e) => se(/* @__PURE__ */ t("polyline", { points: "15 18 9 12 15 6" }), e), Ot = (e) => se(/* @__PURE__ */ t("polyline", { points: "6 9 12 15 18 9" }), e), _r = (e) => se(/* @__PURE__ */ t("polyline", { points: "18 15 12 9 6 15" }), e), gr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("circle", { cx: "12", cy: "12", r: "7" }),
+    /* @__PURE__ */ t("circle", { cx: "12", cy: "12", r: "2.5" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "2", x2: "12", y2: "5" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "19", x2: "12", y2: "22" }),
+    /* @__PURE__ */ t("line", { x1: "2", y1: "12", x2: "5", y2: "12" }),
+    /* @__PURE__ */ t("line", { x1: "19", y1: "12", x2: "22", y2: "12" })
   ] }),
-  props
-);
-const IconClear = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("polyline", { points: "3 6 5 6 21 6" }),
-    /* @__PURE__ */ jsx("path", { d: "M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" }),
-    /* @__PURE__ */ jsx("line", { x1: "10", y1: "11", x2: "10", y2: "17" }),
-    /* @__PURE__ */ jsx("line", { x1: "14", y1: "11", x2: "14", y2: "17" })
+  e
+), yr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("polyline", { points: "3 6 5 6 21 6" }),
+    /* @__PURE__ */ t("path", { d: "M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" }),
+    /* @__PURE__ */ t("line", { x1: "10", y1: "11", x2: "10", y2: "17" }),
+    /* @__PURE__ */ t("line", { x1: "14", y1: "11", x2: "14", y2: "17" })
   ] }),
-  props
-);
-const IconClose = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("line", { x1: "18", y1: "6", x2: "6", y2: "18" }),
-    /* @__PURE__ */ jsx("line", { x1: "6", y1: "6", x2: "18", y2: "18" })
+  e
+), ot = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("line", { x1: "18", y1: "6", x2: "6", y2: "18" }),
+    /* @__PURE__ */ t("line", { x1: "6", y1: "6", x2: "18", y2: "18" })
   ] }),
-  props
-);
-const IconFile = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("path", { d: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" }),
-    /* @__PURE__ */ jsx("polyline", { points: "14 2 14 8 20 8" })
+  e
+), br = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("path", { d: "M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" }),
+    /* @__PURE__ */ t("polyline", { points: "14 2 14 8 20 8" })
   ] }),
-  props
-);
-const IconMaximize = (props) => createIcon(
-  /* @__PURE__ */ jsx(Fragment, { children: /* @__PURE__ */ jsx("path", { d: "M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" }) }),
-  props
-);
-const IconRuler = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("rect", { x: "2", y: "2", width: "20", height: "16", rx: "1" }),
-    /* @__PURE__ */ jsx("line", { x1: "6", y1: "14", x2: "6", y2: "17" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "14", x2: "12", y2: "16" }),
-    /* @__PURE__ */ jsx("line", { x1: "18", y1: "14", x2: "18", y2: "17" })
+  e
+), vr = (e) => se(
+  /* @__PURE__ */ t(ae, { children: /* @__PURE__ */ t("path", { d: "M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" }) }),
+  e
+), wr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("rect", { x: "2", y: "2", width: "20", height: "16", rx: "1" }),
+    /* @__PURE__ */ t("line", { x1: "6", y1: "14", x2: "6", y2: "17" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "14", x2: "12", y2: "16" }),
+    /* @__PURE__ */ t("line", { x1: "18", y1: "14", x2: "18", y2: "17" })
   ] }),
-  props
-);
-const IconScissors = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("circle", { cx: "6", cy: "6", r: "3" }),
-    /* @__PURE__ */ jsx("circle", { cx: "6", cy: "18", r: "3" }),
-    /* @__PURE__ */ jsx("line", { x1: "20", y1: "4", x2: "8.12", y2: "15.88" }),
-    /* @__PURE__ */ jsx("line", { x1: "14.47", y1: "14.48", x2: "20", y2: "20" }),
-    /* @__PURE__ */ jsx("line", { x1: "8.12", y1: "8.12", x2: "12", y2: "12" })
+  e
+), xr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("circle", { cx: "6", cy: "6", r: "3" }),
+    /* @__PURE__ */ t("circle", { cx: "6", cy: "18", r: "3" }),
+    /* @__PURE__ */ t("line", { x1: "20", y1: "4", x2: "8.12", y2: "15.88" }),
+    /* @__PURE__ */ t("line", { x1: "14.47", y1: "14.48", x2: "20", y2: "20" }),
+    /* @__PURE__ */ t("line", { x1: "8.12", y1: "8.12", x2: "12", y2: "12" })
   ] }),
-  props
-);
-const IconSettings = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("circle", { cx: "12", cy: "12", r: "3" }),
-    /* @__PURE__ */ jsx("path", { d: "M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" })
+  e
+), Cr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("circle", { cx: "12", cy: "12", r: "3" }),
+    /* @__PURE__ */ t("path", { d: "M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" })
   ] }),
-  props
-);
-const IconInfo = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("circle", { cx: "12", cy: "12", r: "10" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "16", x2: "12", y2: "12" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "8", x2: "12.01", y2: "8" })
+  e
+), Nr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("circle", { cx: "12", cy: "12", r: "10" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "16", x2: "12", y2: "12" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "8", x2: "12.01", y2: "8" })
   ] }),
-  props
-);
-const IconTrash2 = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("polyline", { points: "3 6 5 6 21 6" }),
-    /* @__PURE__ */ jsx("path", { d: "M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" }),
-    /* @__PURE__ */ jsx("line", { x1: "10", y1: "11", x2: "10", y2: "17" }),
-    /* @__PURE__ */ jsx("line", { x1: "14", y1: "11", x2: "14", y2: "17" })
+  e
+), Sr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("polyline", { points: "3 6 5 6 21 6" }),
+    /* @__PURE__ */ t("path", { d: "M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" }),
+    /* @__PURE__ */ t("line", { x1: "10", y1: "11", x2: "10", y2: "17" }),
+    /* @__PURE__ */ t("line", { x1: "14", y1: "11", x2: "14", y2: "17" })
   ] }),
-  props
-);
-const IconMousePointer = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("path", { d: "M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3z" }),
-    /* @__PURE__ */ jsx("path", { d: "M13 13l6 6" })
+  e
+), kr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("path", { d: "M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3z" }),
+    /* @__PURE__ */ t("path", { d: "M13 13l6 6" })
   ] }),
-  props
-);
-const IconBox = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("path", { d: "M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" }),
-    /* @__PURE__ */ jsx("polyline", { points: "3.27 6.96 12 12.01 20.73 6.96" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "22.08", x2: "12", y2: "12" })
+  e
+), kn = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("path", { d: "M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" }),
+    /* @__PURE__ */ t("polyline", { points: "3.27 6.96 12 12.01 20.73 6.96" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "22.08", x2: "12", y2: "12" })
   ] }),
-  props
-);
-const IconList = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("line", { x1: "8", y1: "6", x2: "21", y2: "6" }),
-    /* @__PURE__ */ jsx("line", { x1: "8", y1: "12", x2: "21", y2: "12" }),
-    /* @__PURE__ */ jsx("line", { x1: "8", y1: "18", x2: "21", y2: "18" }),
-    /* @__PURE__ */ jsx("line", { x1: "3", y1: "6", x2: "3.01", y2: "6" }),
-    /* @__PURE__ */ jsx("line", { x1: "3", y1: "12", x2: "3.01", y2: "12" }),
-    /* @__PURE__ */ jsx("line", { x1: "3", y1: "18", x2: "3.01", y2: "18" })
+  e
+), Mr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("line", { x1: "8", y1: "6", x2: "21", y2: "6" }),
+    /* @__PURE__ */ t("line", { x1: "8", y1: "12", x2: "21", y2: "12" }),
+    /* @__PURE__ */ t("line", { x1: "8", y1: "18", x2: "21", y2: "18" }),
+    /* @__PURE__ */ t("line", { x1: "3", y1: "6", x2: "3.01", y2: "6" }),
+    /* @__PURE__ */ t("line", { x1: "3", y1: "12", x2: "3.01", y2: "12" }),
+    /* @__PURE__ */ t("line", { x1: "3", y1: "18", x2: "3.01", y2: "18" })
   ] }),
-  props
-);
-const IconActivity = (props) => createIcon(
-  /* @__PURE__ */ jsx(Fragment, { children: /* @__PURE__ */ jsx("polyline", { points: "22 12 18 12 15 21 9 3 6 12 2 12" }) }),
-  props
-);
-const IconCamera = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("path", { d: "M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" }),
-    /* @__PURE__ */ jsx("circle", { cx: "12", cy: "13", r: "4" })
+  e
+), Lr = (e) => se(
+  /* @__PURE__ */ t(ae, { children: /* @__PURE__ */ t("polyline", { points: "22 12 18 12 15 21 9 3 6 12 2 12" }) }),
+  e
+), Er = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("path", { d: "M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" }),
+    /* @__PURE__ */ t("circle", { cx: "12", cy: "13", r: "4" })
   ] }),
-  props
-);
-const IconEye = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("path", { d: "M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" }),
-    /* @__PURE__ */ jsx("circle", { cx: "12", cy: "12", r: "3" })
+  e
+), zr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("path", { d: "M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" }),
+    /* @__PURE__ */ t("circle", { cx: "12", cy: "12", r: "3" })
   ] }),
-  props
-);
-const IconSearch = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("circle", { cx: "11", cy: "11", r: "7" }),
-    /* @__PURE__ */ jsx("line", { x1: "16.65", y1: "16.65", x2: "21", y2: "21" })
+  e
+), Dr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("circle", { cx: "11", cy: "11", r: "7" }),
+    /* @__PURE__ */ t("line", { x1: "16.65", y1: "16.65", x2: "21", y2: "21" })
   ] }),
-  props
-);
-const IconGrid = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("rect", { x: "3", y: "3", width: "7", height: "7" }),
-    /* @__PURE__ */ jsx("rect", { x: "14", y: "3", width: "7", height: "7" }),
-    /* @__PURE__ */ jsx("rect", { x: "14", y: "14", width: "7", height: "7" }),
-    /* @__PURE__ */ jsx("rect", { x: "3", y: "14", width: "7", height: "7" })
+  e
+), Vr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("rect", { x: "3", y: "3", width: "7", height: "7" }),
+    /* @__PURE__ */ t("rect", { x: "14", y: "3", width: "7", height: "7" }),
+    /* @__PURE__ */ t("rect", { x: "14", y: "14", width: "7", height: "7" }),
+    /* @__PURE__ */ t("rect", { x: "3", y: "14", width: "7", height: "7" })
   ] }),
-  props
-);
-const IconImage = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("rect", { x: "3", y: "3", width: "18", height: "18", rx: "2", ry: "2" }),
-    /* @__PURE__ */ jsx("circle", { cx: "8.5", cy: "8.5", r: "1.5" }),
-    /* @__PURE__ */ jsx("polyline", { points: "21 15 16 10 5 21" })
+  e
+), Ar = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("rect", { x: "3", y: "3", width: "18", height: "18", rx: "2", ry: "2" }),
+    /* @__PURE__ */ t("circle", { cx: "8.5", cy: "8.5", r: "1.5" }),
+    /* @__PURE__ */ t("polyline", { points: "21 15 16 10 5 21" })
   ] }),
-  props
-);
-const IconLayers = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("polygon", { points: "12 2 2 7 12 12 22 7 12 2" }),
-    /* @__PURE__ */ jsx("polyline", { points: "2 12 12 17 22 12" }),
-    /* @__PURE__ */ jsx("polyline", { points: "2 17 12 22 22 17" })
+  e
+), $r = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("polygon", { points: "12 2 2 7 12 12 22 7 12 2" }),
+    /* @__PURE__ */ t("polyline", { points: "2 12 12 17 22 12" }),
+    /* @__PURE__ */ t("polyline", { points: "2 17 12 22 22 17" })
   ] }),
-  props
-);
-const IconExplode = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("circle", { cx: "12", cy: "12", r: "2.25" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "2", x2: "12", y2: "6" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "18", x2: "12", y2: "22" }),
-    /* @__PURE__ */ jsx("line", { x1: "2", y1: "12", x2: "6", y2: "12" }),
-    /* @__PURE__ */ jsx("line", { x1: "18", y1: "12", x2: "22", y2: "12" }),
-    /* @__PURE__ */ jsx("line", { x1: "4.9", y1: "4.9", x2: "7.8", y2: "7.8" }),
-    /* @__PURE__ */ jsx("line", { x1: "16.2", y1: "16.2", x2: "19.1", y2: "19.1" }),
-    /* @__PURE__ */ jsx("line", { x1: "4.9", y1: "19.1", x2: "7.8", y2: "16.2" }),
-    /* @__PURE__ */ jsx("line", { x1: "16.2", y1: "7.8", x2: "19.1", y2: "4.9" })
+  e
+), Br = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("circle", { cx: "12", cy: "12", r: "2.25" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "2", x2: "12", y2: "6" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "18", x2: "12", y2: "22" }),
+    /* @__PURE__ */ t("line", { x1: "2", y1: "12", x2: "6", y2: "12" }),
+    /* @__PURE__ */ t("line", { x1: "18", y1: "12", x2: "22", y2: "12" }),
+    /* @__PURE__ */ t("line", { x1: "4.9", y1: "4.9", x2: "7.8", y2: "7.8" }),
+    /* @__PURE__ */ t("line", { x1: "16.2", y1: "16.2", x2: "19.1", y2: "19.1" }),
+    /* @__PURE__ */ t("line", { x1: "4.9", y1: "19.1", x2: "7.8", y2: "16.2" }),
+    /* @__PURE__ */ t("line", { x1: "16.2", y1: "7.8", x2: "19.1", y2: "4.9" })
   ] }),
-  props
-);
-const IconSelectAll = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("path", { d: "M3 3h4v4H3zM17 3h4v4h-4zM3 17h4v4H3zM17 17h4v4h-4z", fill: "none" }),
-    /* @__PURE__ */ jsx("line", { x1: "7", y1: "5", x2: "17", y2: "5" }),
-    /* @__PURE__ */ jsx("line", { x1: "5", y1: "7", x2: "5", y2: "17" }),
-    /* @__PURE__ */ jsx("line", { x1: "17", y1: "19", x2: "7", y2: "19" }),
-    /* @__PURE__ */ jsx("line", { x1: "19", y1: "17", x2: "19", y2: "7" })
+  e
+), Ir = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("path", { d: "M3 3h4v4H3zM17 3h4v4h-4zM3 17h4v4H3zM17 17h4v4h-4z", fill: "none" }),
+    /* @__PURE__ */ t("line", { x1: "7", y1: "5", x2: "17", y2: "5" }),
+    /* @__PURE__ */ t("line", { x1: "5", y1: "7", x2: "5", y2: "17" }),
+    /* @__PURE__ */ t("line", { x1: "17", y1: "19", x2: "7", y2: "19" }),
+    /* @__PURE__ */ t("line", { x1: "19", y1: "17", x2: "19", y2: "7" })
   ] }),
-  props
-);
-const IconViewTop = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 12,13 3,8", fill: "currentColor", fillOpacity: "0.55" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  e
+), Or = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 12,13 3,8", fill: "currentColor", fillOpacity: "0.55" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
   ] }),
-  props
-);
-const IconViewBottom = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
-    /* @__PURE__ */ jsx("polygon", { points: "3,16 12,13 21,16 12,21", fill: "currentColor", fillOpacity: "0.55" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  e
+), Fr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
+    /* @__PURE__ */ t("polygon", { points: "3,16 12,13 21,16 12,21", fill: "currentColor", fillOpacity: "0.55" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
   ] }),
-  props
-);
-const IconViewFront = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
-    /* @__PURE__ */ jsx("polygon", { points: "3,8 12,13 12,21 3,16", fill: "currentColor", fillOpacity: "0.45" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  e
+), Pr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
+    /* @__PURE__ */ t("polygon", { points: "3,8 12,13 12,21 3,16", fill: "currentColor", fillOpacity: "0.45" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
   ] }),
-  props
-);
-const IconViewBack = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
-    /* @__PURE__ */ jsx("polygon", { points: "21,8 12,13 12,21 21,16", fill: "currentColor", fillOpacity: "0.45" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  e
+), Tr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
+    /* @__PURE__ */ t("polygon", { points: "21,8 12,13 12,21 21,16", fill: "currentColor", fillOpacity: "0.45" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
   ] }),
-  props
-);
-const IconViewLeft = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
-    /* @__PURE__ */ jsx("polygon", { points: "3,8 12,3 12,13 3,8", fill: "currentColor", fillOpacity: "0.45" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  e
+), Rr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
+    /* @__PURE__ */ t("polygon", { points: "3,8 12,3 12,13 3,8", fill: "currentColor", fillOpacity: "0.45" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
   ] }),
-  props
-);
-const IconViewRight = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
-    /* @__PURE__ */ jsx("polygon", { points: "21,8 12,3 12,13 21,8", fill: "currentColor", fillOpacity: "0.45" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  e
+), jr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
+    /* @__PURE__ */ t("polygon", { points: "21,8 12,3 12,13 21,8", fill: "currentColor", fillOpacity: "0.45" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
   ] }),
-  props
-);
-const IconViewSW = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
-    /* @__PURE__ */ jsx("polygon", { points: "3,8 12,13 12,21 3,16", fill: "currentColor", fillOpacity: "0.45" }),
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 12,13 3,8", fill: "currentColor", fillOpacity: "0.25" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  e
+), Ur = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
+    /* @__PURE__ */ t("polygon", { points: "3,8 12,13 12,21 3,16", fill: "currentColor", fillOpacity: "0.45" }),
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 12,13 3,8", fill: "currentColor", fillOpacity: "0.25" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
   ] }),
-  props
-);
-const IconViewSE = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
-    /* @__PURE__ */ jsx("polygon", { points: "21,8 12,13 12,21 21,16", fill: "currentColor", fillOpacity: "0.45" }),
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 12,13 3,8", fill: "currentColor", fillOpacity: "0.25" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  e
+), Hr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
+    /* @__PURE__ */ t("polygon", { points: "21,8 12,13 12,21 21,16", fill: "currentColor", fillOpacity: "0.45" }),
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 12,13 3,8", fill: "currentColor", fillOpacity: "0.25" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
   ] }),
-  props
-);
-const IconViewNE = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
-    /* @__PURE__ */ jsx("polygon", { points: "21,8 12,13 12,21 21,16", fill: "currentColor", fillOpacity: "0.25" }),
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 12,13 3,8", fill: "currentColor", fillOpacity: "0.45" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  e
+), Gr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
+    /* @__PURE__ */ t("polygon", { points: "21,8 12,13 12,21 21,16", fill: "currentColor", fillOpacity: "0.25" }),
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 12,13 3,8", fill: "currentColor", fillOpacity: "0.45" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
   ] }),
-  props
-);
-const IconViewNW = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
-    /* @__PURE__ */ jsx("polygon", { points: "3,8 12,13 12,21 3,16", fill: "currentColor", fillOpacity: "0.25" }),
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 12,13 3,8", fill: "currentColor", fillOpacity: "0.45" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  e
+), Wr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.08" }),
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
+    /* @__PURE__ */ t("polygon", { points: "3,8 12,13 12,21 3,16", fill: "currentColor", fillOpacity: "0.25" }),
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 12,13 3,8", fill: "currentColor", fillOpacity: "0.45" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
   ] }),
-  props
-);
-const IconSolid = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.35" }),
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  e
+), Kr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "currentColor", fillOpacity: "0.35" }),
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "13", x2: "12", y2: "21" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
   ] }),
-  props
-);
-const IconTransparent = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "none" }),
-    /* @__PURE__ */ jsx("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", strokeDasharray: "2 2" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "13", x2: "12", y2: "21", strokeDasharray: "2 2" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
-    /* @__PURE__ */ jsx("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
+  e
+), Xr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", fill: "none" }),
+    /* @__PURE__ */ t("polygon", { points: "12,3 21,8 21,16 12,21 3,16 3,8", strokeDasharray: "2 2" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "13", x2: "12", y2: "21", strokeDasharray: "2 2" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "3", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "3", y1: "8", x2: "12", y2: "13" }),
+    /* @__PURE__ */ t("line", { x1: "21", y1: "8", x2: "12", y2: "13" })
   ] }),
-  props
-);
-const IconOpenFile = (props) => createIcon(
-  /* @__PURE__ */ jsx(Fragment, { children: /* @__PURE__ */ jsx("path", { d: "M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" }) }),
-  props
-);
-const IconExportScene = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("path", { d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" }),
-    /* @__PURE__ */ jsx("polyline", { points: "7 10 12 15 17 10" }),
-    /* @__PURE__ */ jsx("line", { x1: "12", y1: "15", x2: "12", y2: "3" })
+  e
+), Yr = (e) => se(
+  /* @__PURE__ */ t(ae, { children: /* @__PURE__ */ t("path", { d: "M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" }) }),
+  e
+), qr = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("path", { d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" }),
+    /* @__PURE__ */ t("polyline", { points: "7 10 12 15 17 10" }),
+    /* @__PURE__ */ t("line", { x1: "12", y1: "15", x2: "12", y2: "3" })
   ] }),
-  props
-);
-const IconCopy = (props) => createIcon(
-  /* @__PURE__ */ jsxs(Fragment, { children: [
-    /* @__PURE__ */ jsx("rect", { x: "9", y: "9", width: "13", height: "13", rx: "2", ry: "2" }),
-    /* @__PURE__ */ jsx("path", { d: "M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" })
+  e
+), tn = (e) => se(
+  /* @__PURE__ */ l(ae, { children: [
+    /* @__PURE__ */ t("rect", { x: "9", y: "9", width: "13", height: "13", rx: "2", ry: "2" }),
+    /* @__PURE__ */ t("path", { d: "M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" })
   ] }),
-  props
-);
-
-const ImageButton = ({
-  icon,
-  label,
-  active,
-  theme,
-  style,
-  className = "",
-  disabled,
-  ...props
-}) => {
-  return /* @__PURE__ */ jsxs(
-    "button",
-    {
-      style: { opacity: disabled ? 0.4 : 1, cursor: disabled ? "not-allowed" : "pointer", ...style },
-      className: `ui-toolbar-btn ${active ? "active" : ""} ${className}`,
-      disabled,
-      ...props,
-      children: [
-        /* @__PURE__ */ jsx("div", { className: "ui-toolbar-btn-icon", children: icon }),
-        label && /* @__PURE__ */ jsx("div", { className: "ui-toolbar-btn-label", children: label })
-      ]
-    }
-  );
-};
-
-const Toolbar = (props) => {
+  e
+), Le = ({
+  icon: e,
+  label: n,
+  active: i,
+  theme: a,
+  style: r,
+  className: s = "",
+  disabled: h,
+  ...c
+}) => /* @__PURE__ */ l(
+  "button",
+  {
+    style: { opacity: h ? 0.4 : 1, cursor: h ? "not-allowed" : "pointer", ...r },
+    className: `ui-toolbar-btn ${i ? "active" : ""} ${s}`,
+    disabled: h,
+    ...c,
+    children: [
+      /* @__PURE__ */ t("div", { className: "ui-toolbar-btn-icon", children: e }),
+      n && /* @__PURE__ */ t("div", { className: "ui-toolbar-btn-label", children: n })
+    ]
+  }
+), Qr = (e) => {
   const {
-    t,
-    theme,
-    hiddenMenus = []
-  } = props;
-  const isHidden = (id) => (hiddenMenus || []).includes(id);
-  const fileInputRef = React.useRef(null);
-  const batchConvertInputRef = React.useRef(null);
-  const [openMenu, setOpenMenu] = useState(null);
-  const menuRef = React.useRef(null);
-  useEffect(() => {
-    const handleClickOutside = (event) => {
-      if (menuRef.current && !menuRef.current.contains(event.target)) {
-        setOpenMenu(null);
-      }
+    t: n,
+    theme: i,
+    hiddenMenus: a = []
+  } = e, r = (m) => (a || []).includes(m), s = _t.useRef(null), h = _t.useRef(null), [c, u] = O(null), p = _t.useRef(null);
+  q(() => {
+    const m = (_) => {
+      p.current && !p.current.contains(_.target) && u(null);
     };
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
+    return document.addEventListener("mousedown", m), () => document.removeEventListener("mousedown", m);
   }, []);
-  const toggleMenu = (menuId) => {
-    setOpenMenu(openMenu === menuId ? null : menuId);
-  };
-  const renderDropdown = (menuId, items) => {
-    if (openMenu !== menuId) return null;
-    return /* @__PURE__ */ jsx("div", { ref: menuRef, className: "ui-toolbar-menu", children: items });
-  };
-  const menuItem = (icon, label, onClick) => /* @__PURE__ */ jsxs(
+  const d = (m) => {
+    u(c === m ? null : m);
+  }, y = (m, _) => c !== m ? null : /* @__PURE__ */ t("div", { ref: p, className: "ui-toolbar-menu", children: _ }), f = (m, _, o) => /* @__PURE__ */ l(
     "div",
     {
       className: "ui-toolbar-menu-item",
-      onClick,
+      onClick: o,
       children: [
-        /* @__PURE__ */ jsx("span", { className: "ui-toolbar-menu-icon", children: icon }),
-        label
+        /* @__PURE__ */ t("span", { className: "ui-toolbar-menu-icon", children: m }),
+        _
       ]
     }
-  );
-  const menuDivider = () => /* @__PURE__ */ jsx("div", { className: "ui-toolbar-menu-divider" });
-  return /* @__PURE__ */ jsxs("div", { className: "ui-toolbar", children: [
-    /* @__PURE__ */ jsx(
+  ), v = () => /* @__PURE__ */ t("div", { className: "ui-toolbar-menu-divider" });
+  return /* @__PURE__ */ l("div", { className: "ui-toolbar", children: [
+    /* @__PURE__ */ t(
       "input",
       {
         type: "file",
-        ref: fileInputRef,
+        ref: s,
         style: { display: "none" },
-        multiple: true,
+        multiple: !0,
         accept: ".lmb,.lmbz,.glb,.gltf,.ifc,.nbim,.fbx,.obj,.stl,.ply,.3ds,.dae,.stp,.step,.igs,.iges",
-        onChange: props.handleOpenFiles
+        onChange: e.handleOpenFiles
       }
     ),
-    /* @__PURE__ */ jsx(
+    /* @__PURE__ */ t(
       "input",
       {
         type: "file",
-        ref: batchConvertInputRef,
+        ref: h,
         style: { display: "none" },
-        multiple: true,
+        multiple: !0,
         accept: ".lmb,.lmbz,.glb,.gltf,.ifc,.fbx,.obj,.stl,.ply,.3ds,.dae,.stp,.step,.igs,.iges",
-        onChange: props.handleBatchConvert
+        onChange: e.handleBatchConvert
       }
     ),
-    !isHidden("file") && /* @__PURE__ */ jsx("div", { className: "ui-toolbar-group", children: /* @__PURE__ */ jsxs("div", { className: "ui-toolbar-menu-anchor", children: [
-      /* @__PURE__ */ jsx(
-        ImageButton,
+    !r("file") && /* @__PURE__ */ t("div", { className: "ui-toolbar-group", children: /* @__PURE__ */ l("div", { className: "ui-toolbar-menu-anchor", children: [
+      /* @__PURE__ */ t(
+        Le,
         {
-          icon: /* @__PURE__ */ jsx(IconFile, {}),
-          label: t("tb_file"),
-          active: openMenu === "file",
-          onClick: () => toggleMenu("file"),
-          theme
+          icon: /* @__PURE__ */ t(br, {}),
+          label: n("tb_file"),
+          active: c === "file",
+          onClick: () => d("file"),
+          theme: i
         }
       ),
-      renderDropdown("file", /* @__PURE__ */ jsxs(Fragment, { children: [
-        !isHidden("open_file") && menuItem(/* @__PURE__ */ jsx(IconOpenFile, {}), t("menu_open_file"), () => {
-          fileInputRef.current?.click();
-          setOpenMenu(null);
+      y("file", /* @__PURE__ */ l(ae, { children: [
+        !r("open_file") && f(/* @__PURE__ */ t(Yr, {}), n("menu_open_file"), () => {
+          s.current?.click(), u(null);
         }),
-        !isHidden("export") && menuItem(/* @__PURE__ */ jsx(IconExportScene, {}), t("menu_export"), () => {
-          props.setActiveTool?.("export");
-          setOpenMenu(null);
+        !r("export") && f(/* @__PURE__ */ t(qr, {}), n("menu_export"), () => {
+          e.setActiveTool?.("export"), u(null);
         }),
-        !isHidden("clear") && /* @__PURE__ */ jsxs(Fragment, { children: [
-          menuDivider(),
-          menuItem(/* @__PURE__ */ jsx(IconClear, {}), t("op_clear"), () => {
-            props.handleClear?.();
-            setOpenMenu(null);
+        !r("clear") && /* @__PURE__ */ l(ae, { children: [
+          v(),
+          f(/* @__PURE__ */ t(yr, {}), n("op_clear"), () => {
+            e.handleClear?.(), u(null);
           })
         ] })
       ] }))
     ] }) }),
-    !isHidden("view") && /* @__PURE__ */ jsxs("div", { className: "ui-toolbar-group", children: [
-      /* @__PURE__ */ jsx(
-        ImageButton,
+    !r("view") && /* @__PURE__ */ l("div", { className: "ui-toolbar-group", children: [
+      /* @__PURE__ */ t(
+        Le,
         {
-          icon: /* @__PURE__ */ jsx(IconMaximize, {}),
-          label: t("tb_fit"),
-          onClick: () => props.sceneMgr?.fitView(),
-          theme
+          icon: /* @__PURE__ */ t(vr, {}),
+          label: n("tb_fit"),
+          onClick: () => e.sceneMgr?.fitView(),
+          theme: i
         }
       ),
-      /* @__PURE__ */ jsxs("div", { className: "ui-toolbar-menu-anchor", children: [
-        /* @__PURE__ */ jsx(
-          ImageButton,
+      /* @__PURE__ */ l("div", { className: "ui-toolbar-menu-anchor", children: [
+        /* @__PURE__ */ t(
+          Le,
           {
-            icon: /* @__PURE__ */ jsx(IconEye, {}),
-            label: t("tb_view"),
-            active: openMenu === "views",
-            onClick: () => toggleMenu("views"),
-            theme
+            icon: /* @__PURE__ */ t(zr, {}),
+            label: n("tb_view"),
+            active: c === "views",
+            onClick: () => d("views"),
+            theme: i
           }
         ),
-        renderDropdown("views", /* @__PURE__ */ jsxs(Fragment, { children: [
-          menuItem(/* @__PURE__ */ jsx(IconViewFront, {}), t("view_front"), () => {
-            props.handleView?.("front");
-            setOpenMenu(null);
+        y("views", /* @__PURE__ */ l(ae, { children: [
+          f(/* @__PURE__ */ t(Pr, {}), n("view_front"), () => {
+            e.handleView?.("front"), u(null);
           }),
-          menuItem(/* @__PURE__ */ jsx(IconViewBack, {}), t("view_back"), () => {
-            props.handleView?.("back");
-            setOpenMenu(null);
+          f(/* @__PURE__ */ t(Tr, {}), n("view_back"), () => {
+            e.handleView?.("back"), u(null);
           }),
-          menuItem(/* @__PURE__ */ jsx(IconViewTop, {}), t("view_top"), () => {
-            props.handleView?.("top");
-            setOpenMenu(null);
+          f(/* @__PURE__ */ t(Or, {}), n("view_top"), () => {
+            e.handleView?.("top"), u(null);
           }),
-          menuItem(/* @__PURE__ */ jsx(IconViewBottom, {}), t("view_bottom"), () => {
-            props.handleView?.("bottom");
-            setOpenMenu(null);
+          f(/* @__PURE__ */ t(Fr, {}), n("view_bottom"), () => {
+            e.handleView?.("bottom"), u(null);
           }),
-          menuItem(/* @__PURE__ */ jsx(IconViewLeft, {}), t("view_left"), () => {
-            props.handleView?.("left");
-            setOpenMenu(null);
+          f(/* @__PURE__ */ t(Rr, {}), n("view_left"), () => {
+            e.handleView?.("left"), u(null);
           }),
-          menuItem(/* @__PURE__ */ jsx(IconViewRight, {}), t("view_right"), () => {
-            props.handleView?.("right");
-            setOpenMenu(null);
+          f(/* @__PURE__ */ t(jr, {}), n("view_right"), () => {
+            e.handleView?.("right"), u(null);
           }),
-          menuDivider(),
-          menuItem(/* @__PURE__ */ jsx(IconViewSE, {}), t("view_se"), () => {
-            props.handleView?.("se");
-            setOpenMenu(null);
+          v(),
+          f(/* @__PURE__ */ t(Hr, {}), n("view_se"), () => {
+            e.handleView?.("se"), u(null);
           }),
-          menuItem(/* @__PURE__ */ jsx(IconViewSW, {}), t("view_sw"), () => {
-            props.handleView?.("sw");
-            setOpenMenu(null);
+          f(/* @__PURE__ */ t(Ur, {}), n("view_sw"), () => {
+            e.handleView?.("sw"), u(null);
           }),
-          menuItem(/* @__PURE__ */ jsx(IconViewNE, {}), t("view_ne"), () => {
-            props.handleView?.("ne");
-            setOpenMenu(null);
+          f(/* @__PURE__ */ t(Gr, {}), n("view_ne"), () => {
+            e.handleView?.("ne"), u(null);
           }),
-          menuItem(/* @__PURE__ */ jsx(IconViewNW, {}), t("view_nw"), () => {
-            props.handleView?.("nw");
-            setOpenMenu(null);
+          f(/* @__PURE__ */ t(Wr, {}), n("view_nw"), () => {
+            e.handleView?.("nw"), u(null);
           })
         ] }))
       ] })
     ] }),
-    !isHidden("interface") && /* @__PURE__ */ jsxs("div", { className: "ui-toolbar-group", children: [
-      !isHidden("wireframe") && /* @__PURE__ */ jsxs("div", { className: "ui-toolbar-menu-anchor", children: [
-        /* @__PURE__ */ jsx(
-          ImageButton,
+    !r("interface") && /* @__PURE__ */ l("div", { className: "ui-toolbar-group", children: [
+      !r("wireframe") && /* @__PURE__ */ l("div", { className: "ui-toolbar-menu-anchor", children: [
+        /* @__PURE__ */ t(
+          Le,
           {
-            icon: /* @__PURE__ */ jsx(IconLayers, {}),
-            label: t("display_mode") || "样式",
-            active: openMenu === "displayMode",
-            onClick: () => toggleMenu("displayMode"),
-            theme
+            icon: /* @__PURE__ */ t($r, {}),
+            label: n("display_mode") || "样式",
+            active: c === "displayMode",
+            onClick: () => d("displayMode"),
+            theme: i
           }
         ),
-        renderDropdown("displayMode", /* @__PURE__ */ jsxs(Fragment, { children: [
-          menuItem(/* @__PURE__ */ jsx(IconSolid, {}), t("dm_solid") || "着色", () => {
-            props.handleDisplayModeChange?.("solid");
-            setOpenMenu(null);
+        y("displayMode", /* @__PURE__ */ l(ae, { children: [
+          f(/* @__PURE__ */ t(Kr, {}), n("dm_solid") || "着色", () => {
+            e.handleDisplayModeChange?.("solid"), u(null);
           }),
-          menuItem(/* @__PURE__ */ jsx(IconTransparent, {}), t("dm_transparent") || "透明", () => {
-            props.handleDisplayModeChange?.("transparent");
-            setOpenMenu(null);
+          f(/* @__PURE__ */ t(Xr, {}), n("dm_transparent") || "透明", () => {
+            e.handleDisplayModeChange?.("transparent"), u(null);
           })
         ] }))
       ] }),
-      !isHidden("outline") && /* @__PURE__ */ jsx(
-        ImageButton,
+      !r("outline") && /* @__PURE__ */ t(
+        Le,
         {
-          icon: /* @__PURE__ */ jsx(IconBox, {}),
-          label: t("tb_model"),
-          active: props.showOutline,
-          onClick: () => props.setShowOutline?.(!props.showOutline),
-          theme
+          icon: /* @__PURE__ */ t(kn, {}),
+          label: n("tb_model"),
+          active: e.showOutline,
+          onClick: () => e.setShowOutline?.(!e.showOutline),
+          theme: i
         }
       ),
-      !isHidden("props") && /* @__PURE__ */ jsx(
-        ImageButton,
+      !r("props") && /* @__PURE__ */ t(
+        Le,
         {
-          icon: /* @__PURE__ */ jsx(IconList, {}),
-          label: t("tb_props"),
-          active: props.showProps,
-          onClick: () => props.setShowProps?.(!props.showProps),
-          theme
+          icon: /* @__PURE__ */ t(Mr, {}),
+          label: n("tb_props"),
+          active: e.showProps,
+          onClick: () => e.setShowProps?.(!e.showProps),
+          theme: i
         }
       ),
-      !isHidden("pick") && /* @__PURE__ */ jsx(
-        ImageButton,
+      !r("pick") && /* @__PURE__ */ t(
+        Le,
         {
-          icon: /* @__PURE__ */ jsx(IconMousePointer, {}),
-          label: t("tb_pick"),
-          active: props.pickEnabled,
-          onClick: () => props.setPickEnabled?.(!props.pickEnabled),
-          theme
+          icon: /* @__PURE__ */ t(kr, {}),
+          label: n("tb_pick"),
+          active: e.pickEnabled,
+          onClick: () => e.setPickEnabled?.(!e.pickEnabled),
+          theme: i
         }
       )
     ] }),
-    !isHidden("tool") && /* @__PURE__ */ jsxs("div", { className: "ui-toolbar-group", children: [
-      !isHidden("measure") && /* @__PURE__ */ jsx(
-        ImageButton,
+    !r("tool") && /* @__PURE__ */ l("div", { className: "ui-toolbar-group", children: [
+      !r("measure") && /* @__PURE__ */ t(
+        Le,
         {
-          icon: /* @__PURE__ */ jsx(IconRuler, {}),
-          label: t("tb_measure"),
-          active: props.activeTool === "measure",
-          onClick: () => props.setActiveTool?.(props.activeTool === "measure" ? "none" : "measure"),
-          theme
+          icon: /* @__PURE__ */ t(wr, {}),
+          label: n("tb_measure"),
+          active: e.activeTool === "measure",
+          onClick: () => e.setActiveTool?.(e.activeTool === "measure" ? "none" : "measure"),
+          theme: i
         }
       ),
-      !isHidden("boxSelect") && /* @__PURE__ */ jsx(
-        ImageButton,
+      !r("boxSelect") && /* @__PURE__ */ t(
+        Le,
         {
-          icon: /* @__PURE__ */ jsx(IconSelectAll, {}),
-          label: t("tb_boxSelect"),
-          active: props.activeTool === "boxSelect",
-          onClick: () => props.setActiveTool?.(props.activeTool === "boxSelect" ? "none" : "boxSelect"),
-          theme
+          icon: /* @__PURE__ */ t(Ir, {}),
+          label: n("tb_boxSelect"),
+          active: e.activeTool === "boxSelect",
+          onClick: () => e.setActiveTool?.(e.activeTool === "boxSelect" ? "none" : "boxSelect"),
+          theme: i
         }
       ),
-      !isHidden("clip") && /* @__PURE__ */ jsx(
-        ImageButton,
+      !r("clip") && /* @__PURE__ */ t(
+        Le,
         {
-          icon: /* @__PURE__ */ jsx(IconScissors, {}),
-          label: t("tb_clip"),
-          active: props.activeTool === "clip",
-          onClick: () => props.setActiveTool?.(props.activeTool === "clip" ? "none" : "clip"),
-          theme
+          icon: /* @__PURE__ */ t(xr, {}),
+          label: n("tb_clip"),
+          active: e.activeTool === "clip",
+          onClick: () => e.setActiveTool?.(e.activeTool === "clip" ? "none" : "clip"),
+          theme: i
         }
       ),
-      !isHidden("viewpoint") && /* @__PURE__ */ jsx(
-        ImageButton,
+      !r("viewpoint") && /* @__PURE__ */ t(
+        Le,
         {
-          icon: /* @__PURE__ */ jsx(IconCamera, {}),
-          label: t("tb_view"),
-          active: props.activeTool === "viewpoint",
-          onClick: () => props.setActiveTool?.(props.activeTool === "viewpoint" ? "none" : "viewpoint"),
-          theme
+          icon: /* @__PURE__ */ t(Er, {}),
+          label: n("tb_view"),
+          active: e.activeTool === "viewpoint",
+          onClick: () => e.setActiveTool?.(e.activeTool === "viewpoint" ? "none" : "viewpoint"),
+          theme: i
         }
       ),
-      !isHidden("screenshot") && /* @__PURE__ */ jsx(
-        ImageButton,
+      !r("screenshot") && /* @__PURE__ */ t(
+        Le,
         {
-          icon: /* @__PURE__ */ jsx(IconImage, {}),
-          label: t("tb_screenshot") || "截图",
-          active: props.activeTool === "screenshot",
-          onClick: () => props.openScreenshotPanel?.(),
-          theme
+          icon: /* @__PURE__ */ t(Ar, {}),
+          label: n("tb_screenshot") || "截图",
+          active: e.activeTool === "screenshot",
+          onClick: () => e.openScreenshotPanel?.(),
+          theme: i
         }
       ),
-      !isHidden("search") && /* @__PURE__ */ jsx(
-        ImageButton,
+      !r("search") && /* @__PURE__ */ t(
+        Le,
         {
-          icon: /* @__PURE__ */ jsx(IconSearch, {}),
-          label: t("tb_search") || "搜索",
-          active: props.activeTool === "search",
-          onClick: () => props.setActiveTool?.(props.activeTool === "search" ? "none" : "search"),
-          theme
+          icon: /* @__PURE__ */ t(Dr, {}),
+          label: n("tb_search") || "搜索",
+          active: e.activeTool === "search",
+          onClick: () => e.setActiveTool?.(e.activeTool === "search" ? "none" : "search"),
+          theme: i
         }
       ),
-      !isHidden("clash") && /* @__PURE__ */ jsx(
-        ImageButton,
+      !r("clash") && /* @__PURE__ */ t(
+        Le,
         {
-          icon: /* @__PURE__ */ jsx(IconTarget, {}),
-          label: t("tb_clash") || "碰撞",
-          active: props.activeTool === "clash",
-          onClick: () => props.setActiveTool?.(props.activeTool === "clash" ? "none" : "clash"),
-          theme
+          icon: /* @__PURE__ */ t(gr, {}),
+          label: n("tb_clash") || "碰撞",
+          active: e.activeTool === "clash",
+          onClick: () => e.setActiveTool?.(e.activeTool === "clash" ? "none" : "clash"),
+          theme: i
         }
       ),
-      !isHidden("explode") && /* @__PURE__ */ jsx(
-        ImageButton,
+      !r("explode") && /* @__PURE__ */ t(
+        Le,
         {
-          icon: /* @__PURE__ */ jsx(IconExplode, {}),
-          label: t("tb_explode") || "爆炸",
-          active: props.activeTool === "explode",
-          onClick: () => props.setActiveTool?.(props.activeTool === "explode" ? "none" : "explode"),
-          theme
+          icon: /* @__PURE__ */ t(Br, {}),
+          label: n("tb_explode") || "爆炸",
+          active: e.activeTool === "explode",
+          onClick: () => e.setActiveTool?.(e.activeTool === "explode" ? "none" : "explode"),
+          theme: i
         }
       )
     ] }),
-    !isHidden("about") && /* @__PURE__ */ jsxs("div", { className: "ui-toolbar-group", children: [
-      !isHidden("settings") && /* @__PURE__ */ jsx(
-        ImageButton,
+    !r("about") && /* @__PURE__ */ l("div", { className: "ui-toolbar-group", children: [
+      !r("settings") && /* @__PURE__ */ t(
+        Le,
         {
-          icon: /* @__PURE__ */ jsx(IconSettings, {}),
-          label: t("tb_settings"),
-          active: props.activeTool === "settings",
-          onClick: () => props.setActiveTool?.(props.activeTool === "settings" ? "none" : "settings"),
-          theme
+          icon: /* @__PURE__ */ t(Cr, {}),
+          label: n("tb_settings"),
+          active: e.activeTool === "settings",
+          onClick: () => e.setActiveTool?.(e.activeTool === "settings" ? "none" : "settings"),
+          theme: i
         }
       ),
-      /* @__PURE__ */ jsx(
-        ImageButton,
+      /* @__PURE__ */ t(
+        Le,
         {
-          icon: /* @__PURE__ */ jsx(IconInfo, {}),
-          label: t("tb_about"),
-          onClick: () => props.onOpenAbout?.(),
-          theme
+          icon: /* @__PURE__ */ t(Nr, {}),
+          label: n("tb_about"),
+          onClick: () => e.onOpenAbout?.(),
+          theme: i
         }
       )
     ] })
   ] });
-};
-
-const Button = ({
-  children,
-  variant = "default",
-  size = "md",
-  active,
-  theme,
-  style,
-  className = "",
-  ...props
+}, Ee = ({
+  children: e,
+  variant: n = "default",
+  size: i = "md",
+  active: a,
+  theme: r,
+  style: s,
+  className: h = "",
+  ...c
 }) => {
-  let btnClass = "ui-btn";
-  if (variant === "primary") btnClass += " ui-btn-primary";
-  else if (variant === "danger") btnClass += " ui-btn-danger";
-  else if (variant === "ghost") btnClass += " ui-btn-ghost";
-  else btnClass += " ui-btn-default";
-  if (size === "sm") btnClass += " ui-btn-sm";
-  else if (size === "lg") btnClass += " ui-btn-lg";
-  else btnClass += " ui-btn-md";
-  if (active) btnClass += " active";
-  return /* @__PURE__ */ jsx("button", { className: `${btnClass} ${className}`, style, ...props, children });
-};
-
-const Slider = ({
-  min,
-  max,
-  step = 1,
-  value,
-  onChange,
-  theme,
-  disabled = false,
-  style
+  let u = "ui-btn";
+  return n === "primary" ? u += " ui-btn-primary" : n === "danger" ? u += " ui-btn-danger" : n === "ghost" ? u += " ui-btn-ghost" : u += " ui-btn-default", i === "sm" ? u += " ui-btn-sm" : i === "lg" ? u += " ui-btn-lg" : u += " ui-btn-md", a && (u += " active"), /* @__PURE__ */ t("button", { className: `${u} ${h}`, style: s, ...c, children: e });
+}, mt = ({
+  min: e,
+  max: n,
+  step: i = 1,
+  value: a,
+  onChange: r,
+  theme: s,
+  disabled: h = !1,
+  style: c
 }) => {
-  const percentage = (value - min) / (max - min) * 100;
-  const sliderRef = useRef(null);
-  const calcValueFromX = useCallback((clientX) => {
-    if (!sliderRef.current) return value;
-    const rect = sliderRef.current.getBoundingClientRect();
-    const percent = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-    const newValue = min + percent * (max - min);
-    return Math.round(newValue / step) * step;
-  }, [min, max, step, value]);
-  const handleMouseDown = useCallback((e) => {
-    if (disabled) return;
-    e.preventDefault();
-    const targetValue = calcValueFromX(e.clientX);
-    onChange(Math.max(min, Math.min(max, targetValue)));
-    const handleMouseMove = (moveEvent) => {
-      const newValue = calcValueFromX(moveEvent.clientX);
-      onChange(Math.max(min, Math.min(max, newValue)));
+  const u = (a - e) / (n - e) * 100, p = ee(null), d = T((f) => {
+    if (!p.current) return a;
+    const v = p.current.getBoundingClientRect(), m = Math.max(0, Math.min(1, (f - v.left) / v.width)), _ = e + m * (n - e);
+    return Math.round(_ / i) * i;
+  }, [e, n, i, a]), y = T((f) => {
+    if (h) return;
+    f.preventDefault();
+    const v = d(f.clientX);
+    r(Math.max(e, Math.min(n, v)));
+    const m = (o) => {
+      const b = d(o.clientX);
+      r(Math.max(e, Math.min(n, b)));
+    }, _ = () => {
+      document.removeEventListener("mousemove", m), document.removeEventListener("mouseup", _);
     };
-    const handleMouseUp = () => {
-      document.removeEventListener("mousemove", handleMouseMove);
-      document.removeEventListener("mouseup", handleMouseUp);
-    };
-    document.addEventListener("mousemove", handleMouseMove);
-    document.addEventListener("mouseup", handleMouseUp);
-  }, [calcValueFromX, onChange, min, max, disabled]);
-  return /* @__PURE__ */ jsxs(
+    document.addEventListener("mousemove", m), document.addEventListener("mouseup", _);
+  }, [d, r, e, n, h]);
+  return /* @__PURE__ */ l(
     "div",
     {
-      ref: sliderRef,
-      className: `ui-slider ui-slider-control ${disabled ? "ui-slider-control-disabled" : "ui-slider-control-interactive"}`,
+      ref: p,
+      className: `ui-slider ui-slider-control ${h ? "ui-slider-control-disabled" : "ui-slider-control-interactive"}`,
       style: {
         width: "100%",
         minWidth: 0,
-        ...style
+        ...c
       },
-      onMouseDown: handleMouseDown,
+      onMouseDown: y,
       children: [
-        /* @__PURE__ */ jsx(
+        /* @__PURE__ */ t(
           "div",
           {
             className: "ui-slider-track"
           }
         ),
-        /* @__PURE__ */ jsx(
+        /* @__PURE__ */ t(
           "div",
           {
             className: "ui-slider-progress",
             style: {
-              width: `${percentage}%`
+              width: `${u}%`
             }
           }
         ),
-        /* @__PURE__ */ jsx(
+        /* @__PURE__ */ t(
           "div",
           {
             className: "ui-slider-thumb",
             style: {
-              left: `${percentage}%`,
-              cursor: disabled ? "not-allowed" : "default"
+              left: `${u}%`,
+              cursor: h ? "not-allowed" : "default"
             }
           }
         )
       ]
     }
   );
-};
-
-const DualSlider = ({
-  min,
-  max,
-  value,
-  onChange,
-  theme,
-  disabled = false,
-  style
+}, Jr = ({
+  min: e,
+  max: n,
+  value: i,
+  onChange: a,
+  theme: r,
+  disabled: s = !1,
+  style: h
 }) => {
-  const sliderRef = useRef(null);
-  const percentage1 = (value[0] - min) / (max - min) * 100;
-  const percentage2 = (value[1] - min) / (max - min) * 100;
-  const calcValueFromX = useCallback((clientX) => {
-    if (!sliderRef.current) return min;
-    const rect = sliderRef.current.getBoundingClientRect();
-    const percent = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-    return min + percent * (max - min);
-  }, [min, max]);
-  const handleThumb1MouseDown = useCallback((e) => {
-    if (disabled) return;
-    e.preventDefault();
-    e.stopPropagation();
-    const handleMouseMove = (moveEvent) => {
-      const newValue = calcValueFromX(moveEvent.clientX);
-      onChange([Math.max(min, Math.min(value[1] - 1, Math.round(newValue))), value[1]]);
+  const c = ee(null), u = (i[0] - e) / (n - e) * 100, p = (i[1] - e) / (n - e) * 100, d = T((m) => {
+    if (!c.current) return e;
+    const _ = c.current.getBoundingClientRect(), o = Math.max(0, Math.min(1, (m - _.left) / _.width));
+    return e + o * (n - e);
+  }, [e, n]), y = T((m) => {
+    if (s) return;
+    m.preventDefault(), m.stopPropagation();
+    const _ = (b) => {
+      const k = d(b.clientX);
+      a([Math.max(e, Math.min(i[1] - 1, Math.round(k))), i[1]]);
+    }, o = () => {
+      document.removeEventListener("mousemove", _), document.removeEventListener("mouseup", o);
     };
-    const handleMouseUp = () => {
-      document.removeEventListener("mousemove", handleMouseMove);
-      document.removeEventListener("mouseup", handleMouseUp);
+    document.addEventListener("mousemove", _), document.addEventListener("mouseup", o);
+  }, [s, d, a, e, i]), f = T((m) => {
+    if (s) return;
+    m.preventDefault(), m.stopPropagation();
+    const _ = (b) => {
+      const k = d(b.clientX);
+      a([i[0], Math.min(n, Math.max(i[0] + 1, Math.round(k)))]);
+    }, o = () => {
+      document.removeEventListener("mousemove", _), document.removeEventListener("mouseup", o);
     };
-    document.addEventListener("mousemove", handleMouseMove);
-    document.addEventListener("mouseup", handleMouseUp);
-  }, [disabled, calcValueFromX, onChange, min, value]);
-  const handleThumb2MouseDown = useCallback((e) => {
-    if (disabled) return;
-    e.preventDefault();
-    e.stopPropagation();
-    const handleMouseMove = (moveEvent) => {
-      const newValue = calcValueFromX(moveEvent.clientX);
-      onChange([value[0], Math.min(max, Math.max(value[0] + 1, Math.round(newValue)))]);
-    };
-    const handleMouseUp = () => {
-      document.removeEventListener("mousemove", handleMouseMove);
-      document.removeEventListener("mouseup", handleMouseUp);
-    };
-    document.addEventListener("mousemove", handleMouseMove);
-    document.addEventListener("mouseup", handleMouseUp);
-  }, [disabled, calcValueFromX, onChange, max, value]);
-  const handleTrackClick = useCallback((e) => {
-    if (disabled) return;
-    e.preventDefault();
-    e.stopPropagation();
-    const clickValue = calcValueFromX(e.clientX);
-    const dist1 = Math.abs(clickValue - value[0]);
-    const dist2 = Math.abs(clickValue - value[1]);
-    if (dist1 <= dist2) {
-      onChange([Math.max(min, Math.min(value[1] - 1, Math.round(clickValue))), value[1]]);
-    } else {
-      onChange([value[0], Math.min(max, Math.max(value[0] + 1, Math.round(clickValue)))]);
-    }
-  }, [disabled, calcValueFromX, onChange, min, max, value]);
-  return /* @__PURE__ */ jsxs(
+    document.addEventListener("mousemove", _), document.addEventListener("mouseup", o);
+  }, [s, d, a, n, i]), v = T((m) => {
+    if (s) return;
+    m.preventDefault(), m.stopPropagation();
+    const _ = d(m.clientX), o = Math.abs(_ - i[0]), b = Math.abs(_ - i[1]);
+    o <= b ? a([Math.max(e, Math.min(i[1] - 1, Math.round(_))), i[1]]) : a([i[0], Math.min(n, Math.max(i[0] + 1, Math.round(_)))]);
+  }, [s, d, a, e, n, i]);
+  return /* @__PURE__ */ l(
     "div",
     {
-      ref: sliderRef,
+      ref: c,
       className: "ui-slider",
       style: {
-        opacity: disabled ? 0.5 : 1,
+        opacity: s ? 0.5 : 1,
         width: "100%",
         minWidth: 0,
         flex: 1,
         height: "24px",
         position: "relative",
-        cursor: disabled ? "not-allowed" : "pointer",
+        cursor: s ? "not-allowed" : "pointer",
         display: "flex",
         alignItems: "center",
-        ...style
+        ...h
       },
-      onClick: handleTrackClick,
+      onClick: v,
       children: [
-        /* @__PURE__ */ jsx(
+        /* @__PURE__ */ t(
           "div",
           {
             className: "ui-slider-track",
@@ -8021,297 +1633,257 @@ const DualSlider = ({
             }
           }
         ),
-        /* @__PURE__ */ jsx(
+        /* @__PURE__ */ t(
           "div",
           {
             className: "ui-slider-progress",
             style: {
               position: "absolute",
-              left: `${percentage1}%`,
-              width: `${percentage2 - percentage1}%`,
+              left: `${u}%`,
+              width: `${p - u}%`,
               height: "6px",
               backgroundColor: "var(--accent)",
               borderRadius: "3px"
             }
           }
         ),
-        /* @__PURE__ */ jsx(
+        /* @__PURE__ */ t(
           "div",
           {
             className: "ui-slider-thumb",
             style: {
-              left: `${percentage1}%`,
+              left: `${u}%`,
               width: "16px",
               height: "16px",
               backgroundColor: "var(--bg-primary)",
-              border: `2px solid var(--accent)`,
+              border: "2px solid var(--accent)",
               borderRadius: "50%",
-              cursor: disabled ? "not-allowed" : "default",
+              cursor: s ? "not-allowed" : "default",
               position: "absolute",
               transform: "translateX(-50%)",
               boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
               zIndex: 1
             },
-            onMouseDown: handleThumb1MouseDown
+            onMouseDown: y
           }
         ),
-        /* @__PURE__ */ jsx(
+        /* @__PURE__ */ t(
           "div",
           {
             className: "ui-slider-thumb",
             style: {
-              left: `${percentage2}%`,
+              left: `${p}%`,
               width: "16px",
               height: "16px",
               backgroundColor: "var(--bg-primary)",
-              border: `2px solid var(--accent)`,
+              border: "2px solid var(--accent)",
               borderRadius: "50%",
-              cursor: disabled ? "not-allowed" : "default",
+              cursor: s ? "not-allowed" : "default",
               position: "absolute",
               transform: "translateX(-50%)",
               boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
               zIndex: 1
             },
-            onMouseDown: handleThumb2MouseDown
+            onMouseDown: f
           }
         )
       ]
     }
   );
-};
-
-const Switch = ({ checked, onChange, disabled = false, className = "" }) => {
-  return /* @__PURE__ */ jsx(
-    "button",
-    {
-      className: `ui-switch ${checked ? "active" : ""} ${disabled ? "disabled" : ""} ${className}`,
-      onClick: () => !disabled && onChange(!checked),
-      role: "switch",
-      "aria-checked": checked,
-      disabled,
-      children: /* @__PURE__ */ jsx("div", { className: "ui-switch-thumb" })
-    }
-  );
-};
-
-const SegmentedControl = ({
-  options,
-  value,
-  onChange,
-  className = ""
-}) => /* @__PURE__ */ jsx("div", { className: `ui-segmented ${className}`, children: options.map((option) => /* @__PURE__ */ jsxs(
+}, gt = ({ checked: e, onChange: n, disabled: i = !1, className: a = "" }) => /* @__PURE__ */ t(
   "button",
   {
-    className: `ui-segmented-item ${value === option.value ? "active" : ""}`,
-    onClick: () => onChange(option.value),
+    className: `ui-switch ${e ? "active" : ""} ${i ? "disabled" : ""} ${a}`,
+    onClick: () => !i && n(!e),
+    role: "switch",
+    "aria-checked": e,
+    disabled: i,
+    children: /* @__PURE__ */ t("div", { className: "ui-switch-thumb" })
+  }
+), nn = ({
+  options: e,
+  value: n,
+  onChange: i,
+  className: a = ""
+}) => /* @__PURE__ */ t("div", { className: `ui-segmented ${a}`, children: e.map((r) => /* @__PURE__ */ l(
+  "button",
+  {
+    className: `ui-segmented-item ${n === r.value ? "active" : ""}`,
+    onClick: () => i(r.value),
     children: [
-      option.icon && /* @__PURE__ */ jsx("span", { children: option.icon }),
-      /* @__PURE__ */ jsx("span", { children: option.label })
+      r.icon && /* @__PURE__ */ t("span", { children: r.icon }),
+      /* @__PURE__ */ t("span", { children: r.label })
     ]
   },
-  option.value
-)) });
-
-const ColorPicker = ({ value, onChange, style }) => /* @__PURE__ */ jsxs("div", { className: "ui-color-picker", style, children: [
-  /* @__PURE__ */ jsx(
+  r.value
+)) }), Zr = ({ value: e, onChange: n, style: i }) => /* @__PURE__ */ l("div", { className: "ui-color-picker", style: i, children: [
+  /* @__PURE__ */ t(
     "input",
     {
       type: "color",
-      value,
-      onChange: (e) => onChange(e.target.value),
+      value: e,
+      onChange: (a) => n(a.target.value),
       className: "ui-color-picker-input"
     }
   ),
-  /* @__PURE__ */ jsx("span", { className: "ui-color-picker-value", children: value })
-] });
-
-const Select = ({ value, options, onChange, className = "", style, disabled }) => {
-  const [isOpen, setIsOpen] = useState(false);
-  const containerRef = useRef(null);
-  const selectedOption = options.find((opt) => opt.value === value) || options[0];
-  useEffect(() => {
-    const handleClickOutside = (e) => {
-      if (containerRef.current && !containerRef.current.contains(e.target)) {
-        setIsOpen(false);
-      }
+  /* @__PURE__ */ t("span", { className: "ui-color-picker-value", children: e })
+] }), Nt = ({ value: e, options: n, onChange: i, className: a = "", style: r, disabled: s }) => {
+  const [h, c] = O(!1), u = ee(null), p = n.find((d) => d.value === e) || n[0];
+  return q(() => {
+    const d = (y) => {
+      u.current && !u.current.contains(y.target) && c(!1);
     };
-    if (isOpen) {
-      document.addEventListener("mousedown", handleClickOutside);
-    }
-    return () => {
-      document.removeEventListener("mousedown", handleClickOutside);
+    return h && document.addEventListener("mousedown", d), () => {
+      document.removeEventListener("mousedown", d);
     };
-  }, [isOpen]);
-  return /* @__PURE__ */ jsxs(
+  }, [h]), /* @__PURE__ */ l(
     "div",
     {
-      ref: containerRef,
-      className: `ui-select-custom ${isOpen ? "open" : ""} ${disabled ? "disabled" : ""}`,
-      style,
+      ref: u,
+      className: `ui-select-custom ${h ? "open" : ""} ${s ? "disabled" : ""}`,
+      style: r,
       children: [
-        /* @__PURE__ */ jsxs(
+        /* @__PURE__ */ l(
           "div",
           {
-            className: `ui-select-selector ui-input ${className}`,
-            onClick: () => !disabled && setIsOpen(!isOpen),
+            className: `ui-select-selector ui-input ${a}`,
+            onClick: () => !s && c(!h),
             children: [
-              /* @__PURE__ */ jsx("span", { className: "ui-select-selection-item", children: selectedOption?.label }),
-              /* @__PURE__ */ jsx("span", { className: "ui-select-arrow", children: /* @__PURE__ */ jsx("svg", { viewBox: "64 64 896 896", width: "12", height: "12", fill: "currentColor", children: /* @__PURE__ */ jsx("path", { d: "M884 256h-75c-5.1 0-9.9 2.5-12.9 6.6L512 654.2 227.9 262.6c-3-4.1-7.8-6.6-12.9-6.6h-75c-6.5 0-10.3 7.4-6.5 12.7l352.6 486.1c12.8 17.6 39 17.6 51.7 0l352.6-486.1c3.9-5.3.1-12.7-6.4-12.7z" }) }) })
+              /* @__PURE__ */ t("span", { className: "ui-select-selection-item", children: p?.label }),
+              /* @__PURE__ */ t("span", { className: "ui-select-arrow", children: /* @__PURE__ */ t("svg", { viewBox: "64 64 896 896", width: "12", height: "12", fill: "currentColor", children: /* @__PURE__ */ t("path", { d: "M884 256h-75c-5.1 0-9.9 2.5-12.9 6.6L512 654.2 227.9 262.6c-3-4.1-7.8-6.6-12.9-6.6h-75c-6.5 0-10.3 7.4-6.5 12.7l352.6 486.1c12.8 17.6 39 17.6 51.7 0l352.6-486.1c3.9-5.3.1-12.7-6.4-12.7z" }) }) })
             ]
           }
         ),
-        isOpen && !disabled && /* @__PURE__ */ jsx("div", { className: "ui-select-dropdown", children: options.map((option) => /* @__PURE__ */ jsx(
+        h && !s && /* @__PURE__ */ t("div", { className: "ui-select-dropdown", children: n.map((d) => /* @__PURE__ */ t(
           "div",
           {
-            className: `ui-select-item ${option.value === value ? "selected" : ""}`,
+            className: `ui-select-item ${d.value === e ? "selected" : ""}`,
             onClick: () => {
-              onChange(option.value);
-              setIsOpen(false);
+              i(d.value), c(!1);
             },
-            children: option.label
+            children: d.label
           },
-          option.value
+          d.value
         )) })
       ]
     }
   );
-};
-
-const Checkbox = ({
-  label,
-  checked,
-  onChange,
-  disabled = false,
-  style,
-  labelStyle
+}, Xe = ({
+  label: e,
+  checked: n,
+  onChange: i,
+  disabled: a = !1,
+  style: r,
+  labelStyle: s
+}) => /* @__PURE__ */ l(
+  "label",
+  {
+    className: `ui-checkbox ${a ? "ui-checkbox-disabled" : ""}`,
+    style: r,
+    onClick: (h) => {
+      a || (h.preventDefault(), i(!n));
+    },
+    children: [
+      /* @__PURE__ */ t(
+        "div",
+        {
+          className: `ui-checkbox-box ${n ? "ui-checkbox-box-checked" : ""}`,
+          children: n && /* @__PURE__ */ t(
+            "svg",
+            {
+              viewBox: "0 0 24 24",
+              fill: "none",
+              stroke: "white",
+              strokeWidth: "3",
+              strokeLinecap: "round",
+              strokeLinejoin: "round",
+              className: "ui-checkbox-icon",
+              children: /* @__PURE__ */ t("polyline", { points: "20 6 9 17 4 12" })
+            }
+          )
+        }
+      ),
+      e && /* @__PURE__ */ t("span", { className: "ui-checkbox-label", style: s, children: e })
+    ]
+  }
+), Xt = ({
+  value: e,
+  onChange: n,
+  min: i,
+  max: a,
+  step: r = 1,
+  unit: s,
+  className: h = "",
+  style: c,
+  ...u
 }) => {
-  return /* @__PURE__ */ jsxs(
-    "label",
-    {
-      className: `ui-checkbox ${disabled ? "ui-checkbox-disabled" : ""}`,
-      style,
-      onClick: (e) => {
-        if (disabled) return;
-        e.preventDefault();
-        onChange(!checked);
-      },
-      children: [
-        /* @__PURE__ */ jsx(
-          "div",
-          {
-            className: `ui-checkbox-box ${checked ? "ui-checkbox-box-checked" : ""}`,
-            children: checked && /* @__PURE__ */ jsx(
-              "svg",
-              {
-                viewBox: "0 0 24 24",
-                fill: "none",
-                stroke: "white",
-                strokeWidth: "3",
-                strokeLinecap: "round",
-                strokeLinejoin: "round",
-                className: "ui-checkbox-icon",
-                children: /* @__PURE__ */ jsx("polyline", { points: "20 6 9 17 4 12" })
-              }
-            )
-          }
-        ),
-        label && /* @__PURE__ */ jsx("span", { className: "ui-checkbox-label", style: labelStyle, children: label })
-      ]
-    }
-  );
-};
-
-const InputNumber = ({
-  value,
-  onChange,
-  min,
-  max,
-  step = 1,
-  unit,
-  className = "",
-  style,
-  ...props
-}) => {
-  const [text, setText] = useState(() => String(value));
-  useEffect(() => {
-    setText(String(value));
-  }, [value]);
-  const clampValue = (nextValue) => {
-    let val = nextValue;
-    if (min !== void 0) val = Math.max(min, val);
-    if (max !== void 0) val = Math.min(max, val);
-    return val;
-  };
-  const handleChange = (e) => {
-    const nextText = e.target.value;
-    setText(nextText);
-    if (nextText.trim() === "") return;
-    const parsed = parseFloat(nextText);
-    if (isNaN(parsed)) return;
-    onChange(clampValue(parsed));
-  };
-  const handleBlur = () => {
-    if (text.trim() === "") {
-      setText(String(value));
+  const [p, d] = O(() => String(e));
+  q(() => {
+    d(String(e));
+  }, [e]);
+  const y = (o) => {
+    let b = o;
+    return i !== void 0 && (b = Math.max(i, b)), a !== void 0 && (b = Math.min(a, b)), b;
+  }, f = (o) => {
+    const b = o.target.value;
+    if (d(b), b.trim() === "") return;
+    const k = parseFloat(b);
+    isNaN(k) || n(y(k));
+  }, v = () => {
+    if (p.trim() === "") {
+      d(String(e));
       return;
     }
-    const parsed = parseFloat(text);
-    if (isNaN(parsed)) {
-      setText(String(value));
+    const o = parseFloat(p);
+    if (isNaN(o)) {
+      d(String(e));
       return;
     }
-    const clamped = clampValue(parsed);
-    setText(String(clamped));
-    if (clamped !== value) {
-      onChange(clamped);
-    }
+    const b = y(o);
+    d(String(b)), b !== e && n(b);
+  }, m = () => {
+    const o = y(e + r);
+    d(String(o)), n(o);
+  }, _ = () => {
+    const o = y(e - r);
+    d(String(o)), n(o);
   };
-  const stepUp = () => {
-    const nextValue = clampValue(value + step);
-    setText(String(nextValue));
-    onChange(nextValue);
-  };
-  const stepDown = () => {
-    const nextValue = clampValue(value - step);
-    setText(String(nextValue));
-    onChange(nextValue);
-  };
-  return /* @__PURE__ */ jsxs(
+  return /* @__PURE__ */ l(
     "div",
     {
-      className: `ui-input-number ui-input-number-root ${className}`,
-      style,
+      className: `ui-input-number ui-input-number-root ${h}`,
+      style: c,
       children: [
-        /* @__PURE__ */ jsx(
+        /* @__PURE__ */ t(
           "input",
           {
             type: "number",
-            value: text,
-            onChange: handleChange,
-            onBlur: handleBlur,
-            min,
-            max,
-            step,
-            className: `ui-input ui-input-number-input ${unit ? "ui-input-number-input-with-unit" : "ui-input-number-input-with-controls"}`,
-            ...props
+            value: p,
+            onChange: f,
+            onBlur: v,
+            min: i,
+            max: a,
+            step: r,
+            className: `ui-input ui-input-number-input ${s ? "ui-input-number-input-with-unit" : "ui-input-number-input-with-controls"}`,
+            ...u
           }
         ),
-        unit && /* @__PURE__ */ jsx("span", { className: "ui-input-number-unit", children: unit }),
-        /* @__PURE__ */ jsxs("div", { className: "ui-input-number-controls", children: [
-          /* @__PURE__ */ jsx(
+        s && /* @__PURE__ */ t("span", { className: "ui-input-number-unit", children: s }),
+        /* @__PURE__ */ l("div", { className: "ui-input-number-controls", children: [
+          /* @__PURE__ */ t(
             "button",
             {
-              onClick: stepUp,
+              onClick: m,
               className: "ui-input-number-btn",
               title: "Increase",
               style: { flex: 1 },
               children: "▲"
             }
           ),
-          /* @__PURE__ */ jsx(
+          /* @__PURE__ */ t(
             "button",
             {
-              onClick: stepDown,
+              onClick: _,
               className: "ui-input-number-btn",
               title: "Decrease",
               style: { flex: 1 },
@@ -8322,1877 +1894,1601 @@ const InputNumber = ({
       ]
     }
   );
-};
-
-const PaginationControls = ({
-  prevTitle,
-  nextTitle,
-  currentPage,
-  totalPages,
-  onPrev,
-  onNext,
-  rightContent
-}) => {
-  return /* @__PURE__ */ jsxs("div", { className: "ui-page-nav-wrap", children: [
-    /* @__PURE__ */ jsxs("div", { className: "ui-page-nav-group", children: [
-      /* @__PURE__ */ jsx(
-        Button,
-        {
-          variant: "ghost",
-          className: "ui-properties-action ui-icon-btn ui-page-nav-btn",
-          onClick: onPrev,
-          disabled: currentPage <= 1,
-          title: prevTitle,
-          children: /* @__PURE__ */ jsx(IconChevronLeft, { size: 20 })
-        }
-      ),
-      /* @__PURE__ */ jsxs("span", { className: "ui-page-nav-indicator", children: [
-        currentPage,
-        "/",
-        totalPages
-      ] }),
-      /* @__PURE__ */ jsx(
-        Button,
-        {
-          variant: "ghost",
-          className: "ui-properties-action ui-icon-btn ui-page-nav-btn",
-          onClick: onNext,
-          disabled: currentPage >= totalPages,
-          title: nextTitle,
-          children: /* @__PURE__ */ jsx(IconChevronRight, { size: 20 })
-        }
-      )
+}, Mn = ({
+  prevTitle: e,
+  nextTitle: n,
+  currentPage: i,
+  totalPages: a,
+  onPrev: r,
+  onNext: s,
+  rightContent: h
+}) => /* @__PURE__ */ l("div", { className: "ui-page-nav-wrap", children: [
+  /* @__PURE__ */ l("div", { className: "ui-page-nav-group", children: [
+    /* @__PURE__ */ t(
+      Ee,
+      {
+        variant: "ghost",
+        className: "ui-properties-action ui-icon-btn ui-page-nav-btn",
+        onClick: r,
+        disabled: i <= 1,
+        title: e,
+        children: /* @__PURE__ */ t(fr, { size: 20 })
+      }
+    ),
+    /* @__PURE__ */ l("span", { className: "ui-page-nav-indicator", children: [
+      i,
+      "/",
+      a
     ] }),
-    rightContent
-  ] });
-};
-
-const ContextMenu = ({ x, y, items, onClose, theme }) => {
-  const menuRef = useRef(null);
-  useEffect(() => {
-    const handleClickOutside = (e) => {
-      if (menuRef.current && !menuRef.current.contains(e.target)) {
-        onClose();
+    /* @__PURE__ */ t(
+      Ee,
+      {
+        variant: "ghost",
+        className: "ui-properties-action ui-icon-btn ui-page-nav-btn",
+        onClick: s,
+        disabled: i >= a,
+        title: n,
+        children: /* @__PURE__ */ t(It, { size: 20 })
       }
+    )
+  ] }),
+  h
+] }), Ln = ({ x: e, y: n, items: i, onClose: a, theme: r }) => {
+  const s = ee(null);
+  return q(() => {
+    const h = (u) => {
+      s.current && !s.current.contains(u.target) && a();
+    }, c = (u) => {
+      u.key === "Escape" && a();
     };
-    const handleEscape = (e) => {
-      if (e.key === "Escape") {
-        onClose();
-      }
+    return document.addEventListener("mousedown", h), document.addEventListener("keydown", c), () => {
+      document.removeEventListener("mousedown", h), document.removeEventListener("keydown", c);
     };
-    document.addEventListener("mousedown", handleClickOutside);
-    document.addEventListener("keydown", handleEscape);
-    return () => {
-      document.removeEventListener("mousedown", handleClickOutside);
-      document.removeEventListener("keydown", handleEscape);
-    };
-  }, [onClose]);
-  return /* @__PURE__ */ jsx(
+  }, [a]), /* @__PURE__ */ t(
     "div",
     {
-      ref: menuRef,
+      ref: s,
       className: "ui-context-menu",
-      style: { left: x, top: y },
-      children: items.map((item, index) => {
-        if (item.divider) {
-          return /* @__PURE__ */ jsx(
-            "div",
-            {
-              className: "ui-context-menu-divider"
-            },
-            index
-          );
-        }
-        if (item.slider) {
-          return /* @__PURE__ */ jsxs("div", { className: "ui-context-menu-item", style: { display: "flex", flexDirection: "column", gap: "4px", cursor: "default" }, children: [
-            /* @__PURE__ */ jsxs("div", { style: { display: "flex", justifyContent: "space-between", fontSize: "var(--font-size-secondary)" }, children: [
-              /* @__PURE__ */ jsx("span", { children: item.label }),
-              /* @__PURE__ */ jsxs("span", { children: [
-                Math.round((item.value || 0) * 100),
-                "%"
-              ] })
-            ] }),
-            /* @__PURE__ */ jsx(
-              "input",
-              {
-                type: "range",
-                min: "0",
-                max: "1",
-                step: "0.01",
-                value: item.value || 0,
-                onChange: (e) => item.onChange?.(parseFloat(e.target.value)),
-                style: { width: "100%", cursor: "pointer" }
-              }
-            )
-          ] }, index);
-        }
-        return /* @__PURE__ */ jsx(
-          "div",
+      style: { left: e, top: n },
+      children: i.map((h, c) => h.divider ? /* @__PURE__ */ t(
+        "div",
+        {
+          className: "ui-context-menu-divider"
+        },
+        c
+      ) : h.slider ? /* @__PURE__ */ l("div", { className: "ui-context-menu-item", style: { display: "flex", flexDirection: "column", gap: "4px", cursor: "default" }, children: [
+        /* @__PURE__ */ l("div", { style: { display: "flex", justifyContent: "space-between", fontSize: "var(--font-size-secondary)" }, children: [
+          /* @__PURE__ */ t("span", { children: h.label }),
+          /* @__PURE__ */ l("span", { children: [
+            Math.round((h.value || 0) * 100),
+            "%"
+          ] })
+        ] }),
+        /* @__PURE__ */ t(
+          "input",
           {
-            onClick: () => {
-              if (!item.disabled && item.onClick) {
-                item.onClick();
-                onClose();
-              }
-            },
-            className: `ui-context-menu-item ${item.disabled ? "disabled" : ""}`,
-            children: item.label
+            type: "range",
+            min: "0",
+            max: "1",
+            step: "0.01",
+            value: h.value || 0,
+            onChange: (u) => h.onChange?.(parseFloat(u.target.value)),
+            style: { width: "100%", cursor: "pointer" }
+          }
+        )
+      ] }, c) : /* @__PURE__ */ t(
+        "div",
+        {
+          onClick: () => {
+            !h.disabled && h.onClick && (h.onClick(), a());
           },
-          index
-        );
-      })
+          className: `ui-context-menu-item ${h.disabled ? "disabled" : ""}`,
+          children: h.label
+        },
+        c
+      ))
     }
   );
-};
-
-const INVALID_LABELS = /* @__PURE__ */ new Set(["", "n/a", "na", "undefined", "null", "-", "--"]);
-const sanitizeTreeLabel = (...candidates) => {
-  for (const candidate of candidates) {
-    if (typeof candidate !== "string") continue;
-    const trimmed = candidate.trim();
-    if (INVALID_LABELS.has(trimmed.toLowerCase())) continue;
-    return trimmed;
+}, ea = /* @__PURE__ */ new Set(["", "n/a", "na", "undefined", "null", "-", "--"]), ta = (...e) => {
+  for (const n of e) {
+    if (n == null) continue;
+    const i = String(n).trim();
+    if (!ea.has(i.toLowerCase()))
+      return i;
   }
   return "";
-};
-const flattenTree = (nodes, result = [], parentIsLast = []) => {
-  if (!nodes) return result;
-  for (let i = 0; i < nodes.length; i++) {
-    const node = nodes[i];
-    node.isLastChild = i === nodes.length - 1;
-    node.parentIsLast = [...parentIsLast];
-    result.push(node);
-    if (node.expanded && node.children && node.children.length > 0) {
-      flattenTree(node.children, result, [...parentIsLast, node.isLastChild]);
-    }
+}, En = (e, n = [], i = []) => {
+  if (!e) return n;
+  for (let a = 0; a < e.length; a++) {
+    const r = e[a];
+    r.isLastChild = a === e.length - 1, r.parentIsLast = [...i], n.push(r), r.expanded && r.children && r.children.length > 0 && En(r.children, n, [...i, r.isLastChild]);
   }
-  return result;
-};
-const collectExpandedState = (nodes) => {
-  const map = /* @__PURE__ */ new Map();
-  const walk = (list) => {
-    list.forEach((node) => {
-      map.set(node.uuid, node.expanded);
-      if (node.children.length > 0) walk(node.children);
+  return n;
+}, na = (e) => {
+  const n = /* @__PURE__ */ new Map(), i = (a) => {
+    a.forEach((r) => {
+      n.set(r.uuid, r.expanded), r.children.length > 0 && i(r.children);
     });
   };
-  walk(nodes);
-  return map;
-};
-const applyExpandedState = (nodes, expandedMap) => nodes.map((node) => ({
-  ...node,
-  expanded: expandedMap.get(node.uuid) ?? node.expanded,
-  children: applyExpandedState(node.children, expandedMap)
-}));
-const getRawChildren = (node) => {
-  const children = node?.object?.children ?? node?.children;
-  return Array.isArray(children) ? children : [];
-};
-const createTreeNodeFromRaw = (rawNode, depth, isFileNode = false) => {
-  const rawChildren = Array.isArray(rawNode?.children) ? rawNode.children : [];
-  const fallbackName = rawNode?.type === "Mesh" ? `Mesh_${rawNode?.id ?? "?"}` : `Group_${rawNode?.id ?? "?"}`;
+  return i(e), n;
+}, zn = (e, n) => e.map((i) => ({
+  ...i,
+  expanded: n.get(i.uuid) ?? i.expanded,
+  children: zn(i.children, n)
+})), pt = (e) => {
+  const n = e?.object?.children ?? e?.children;
+  return Array.isArray(n) ? n : [];
+}, Bt = (e, n, i = !1) => {
+  const a = Array.isArray(e?.children) ? e.children : [], r = e?.type === "Mesh" ? `Mesh_${e?.id ?? "?"}` : `Group_${e?.id ?? "?"}`;
   return {
-    uuid: rawNode?.id ?? rawNode?.uuid ?? String(Math.random()),
-    name: sanitizeTreeLabel(rawNode?.name, rawNode?.userData?.name) || fallbackName,
-    type: rawNode?.type === "Mesh" ? "MESH" : "GROUP",
-    depth,
+    uuid: e?.id ?? e?.uuid ?? String(Math.random()),
+    name: ta(e?.name, e?.userData?.name) || r,
+    type: e?.type === "Mesh" ? "MESH" : "GROUP",
+    depth: n,
     children: [],
-    expanded: false,
-    visible: rawNode?.visible !== false,
-    object: rawNode,
-    isFileNode,
-    hasChildren: rawChildren.length > 0,
-    childrenLoaded: false
+    expanded: !1,
+    visible: e?.visible !== !1,
+    object: e,
+    isFileNode: i,
+    hasChildren: a.length > 0,
+    childrenLoaded: !1
   };
-};
-const ensureNodeChildrenLoaded = (node) => {
-  if (node.childrenLoaded || !node.hasChildren) return node;
-  return {
-    ...node,
-    childrenLoaded: true,
-    children: getRawChildren(node).map((child) => createTreeNodeFromRaw(child, node.depth + 1))
-  };
-};
-const rawTreeContainsUuid = (rawNode, targetUuid) => {
-  if (!rawNode) return false;
-  if (rawNode.id === targetUuid || rawNode.uuid === targetUuid) return true;
-  const children = Array.isArray(rawNode.children) ? rawNode.children : [];
-  return children.some((child) => rawTreeContainsUuid(child, targetUuid));
-};
-const getNodeSearchText = (node) => {
-  const source = node?.object ?? node;
-  const meta = source?.userData?.ifcMetadata || {};
+}, Yt = (e) => e.childrenLoaded || !e.hasChildren ? e : {
+  ...e,
+  childrenLoaded: !0,
+  children: pt(e).map((n) => Bt(n, e.depth + 1))
+}, Dn = (e, n) => e ? e.id === n || e.uuid === n ? !0 : (Array.isArray(e.children) ? e.children : []).some((a) => Dn(a, n)) : !1, qt = (e) => {
+  const n = e?.object ?? e, i = n?.userData?.ifcMetadata || {};
   return [
-    source?.name,
-    source?.type,
-    source?.bimId,
-    source?.userData?.bimId,
-    source?.userData?.expressID,
-    source?.userData?.ifcType,
-    source?.userData?.globalId,
-    meta.storey,
-    meta.category,
-    meta.typeName,
-    meta.globalId,
-    ...meta.systems || [],
-    ...meta.materials || [],
-    ...meta.classifications || []
+    n?.name,
+    n?.type,
+    n?.bimId,
+    n?.userData?.bimId,
+    n?.userData?.expressID,
+    n?.userData?.ifcType,
+    n?.userData?.globalId,
+    i.storey,
+    i.category,
+    i.typeName,
+    i.globalId,
+    ...i.systems || [],
+    ...i.materials || [],
+    ...i.classifications || []
   ].filter(Boolean).join(" ").toLowerCase();
-};
-const SceneTree = ({
-  t,
-  treeRoot,
-  setTreeRoot,
-  selectedUuid,
-  locatedUuid,
-  onSelect,
-  onToggleVisibility,
-  onDelete,
-  onIsolate,
-  onHide,
-  onShowAll,
-  onLocate,
-  onClearLocate,
-  onLocateResultsChange,
-  locateResultUuids = [],
-  clashSummaryByUuid = {}
+}, ia = _t.memo(({
+  node: e,
+  isActive: n,
+  isMatched: i,
+  isLocated: a,
+  searchQuery: r,
+  clashBadge: s,
+  onSelect: h,
+  onToggleNode: c,
+  onToggleVisibility: u,
+  onContextMenu: p
+}) => /* @__PURE__ */ l(
+  "div",
+  {
+    className: `ui-tree-node ${n ? "selected" : ""} ${i ? "matched" : ""} ${a ? "located" : ""}`,
+    style: { paddingLeft: 8 + e.depth * 16 },
+    onClick: () => h(e),
+    onDoubleClick: (d) => {
+      e.hasChildren && (d.stopPropagation(), c(e.uuid));
+    },
+    onContextMenu: (d) => p(d, e),
+    children: [
+      /* @__PURE__ */ t(
+        "div",
+        {
+          className: "ui-tree-expander",
+          onClick: (d) => {
+            d.stopPropagation(), c(e.uuid);
+          },
+          children: e.hasChildren ? e.expanded ? /* @__PURE__ */ t(Ot, { size: 12 }) : /* @__PURE__ */ t(It, { size: 12 }) : null
+        }
+      ),
+      /* @__PURE__ */ t(
+        Xe,
+        {
+          checked: e.visible,
+          onChange: (d) => u(e.uuid, d),
+          style: { marginRight: 4, padding: 0, flexShrink: 0 }
+        }
+      ),
+      /* @__PURE__ */ l("div", { className: "ui-tree-label", children: [
+        r && e.name.toLowerCase().includes(r.toLowerCase()) ? /* @__PURE__ */ t("span", { children: e.name.split(new RegExp(`(${r})`, "gi")).map(
+          (d, y) => d.toLowerCase() === r.toLowerCase() ? /* @__PURE__ */ t("span", { className: "ui-search-hit", children: d }, y) : d
+        ) }) : e.name,
+        s && /* @__PURE__ */ t(
+          "span",
+          {
+            style: {
+              marginLeft: 6,
+              padding: "0 6px",
+              borderRadius: "var(--radius-xl)",
+              border: `1px solid ${s.color}`,
+              color: s.color,
+              fontSize: "var(--font-size-label)",
+              lineHeight: "16px",
+              display: "inline-flex",
+              alignItems: "center",
+              verticalAlign: "middle"
+            },
+            children: s.label
+          }
+        )
+      ] })
+    ]
+  }
+), (e, n) => e.isActive === n.isActive && e.isMatched === n.isMatched && e.isLocated === n.isLocated && e.node === n.node && e.node.visible === n.node.visible && e.node.expanded === n.node.expanded && e.searchQuery === n.searchQuery && e.clashBadge?.label === n.clashBadge?.label), ra = ({
+  t: e,
+  treeRoot: n,
+  setTreeRoot: i,
+  selectedUuid: a,
+  locatedUuid: r,
+  onSelect: s,
+  onToggleVisibility: h,
+  onDelete: c,
+  onIsolate: u,
+  onHide: p,
+  onShowAll: d,
+  onLocate: y,
+  onClearLocate: f,
+  onLocateResultsChange: v,
+  locateResultUuids: m = [],
+  clashSummaryByUuid: _ = {}
 }) => {
-  const [searchQuery, setSearchQuery] = useState("");
-  const [contextMenu, setContextMenu] = useState(null);
-  const [scrollTop, setScrollTop] = useState(0);
-  const [containerHeight, setContainerHeight] = useState(400);
-  const containerRef = useRef(null);
-  const selectionSourceRef = useRef(null);
-  const searchExpandedStateRef = useRef(null);
-  const previousSearchQueryRef = useRef("");
-  const [activeTreeUuid, setActiveTreeUuid] = useState(null);
-  useEffect(() => {
-    if (!containerRef.current) return;
-    const resizeObserver = new ResizeObserver((entries) => {
-      entries.forEach((entry) => setContainerHeight(entry.contentRect.height));
+  const [o, b] = O(""), [k, g] = O(null), [P, R] = O(0), [S, I] = O(400), C = ee(null), D = ee(null), N = ee(null), $ = ee(""), [E, F] = O(null);
+  q(() => {
+    if (!C.current) return;
+    const j = new ResizeObserver((B) => {
+      B.forEach((de) => I(de.contentRect.height));
     });
-    resizeObserver.observe(containerRef.current);
-    return () => resizeObserver.disconnect();
-  }, []);
-  useEffect(() => {
-    const prevQuery = previousSearchQueryRef.current;
-    if (!prevQuery && searchQuery) {
-      searchExpandedStateRef.current = collectExpandedState(treeRoot);
+    return j.observe(C.current), () => j.disconnect();
+  }, []), q(() => {
+    const j = $.current;
+    if (!j && o && (N.current = na(n)), j && !o && N.current) {
+      const B = N.current;
+      i((de) => zn(de, B)), N.current = null;
     }
-    if (prevQuery && !searchQuery && searchExpandedStateRef.current) {
-      const snapshot = searchExpandedStateRef.current;
-      setTreeRoot((prev) => applyExpandedState(prev, snapshot));
-      searchExpandedStateRef.current = null;
-    }
-    previousSearchQueryRef.current = searchQuery;
-  }, [searchQuery, setTreeRoot, treeRoot]);
-  useEffect(() => {
-    if (!activeTreeUuid) return;
-    if (selectionSourceRef.current !== "tree") return;
-    setTreeRoot((prev) => {
-      const expandSelectedPath = (nodes) => {
-        let found2 = false;
-        const nextNodes = nodes.map((node) => {
-          let workingNode = node;
-          if (node.uuid === activeTreeUuid) {
-            found2 = true;
-            return node;
-          }
-          if (!node.childrenLoaded && node.hasChildren) {
-            const rawChildren = getRawChildren(node);
-            const containsTarget = rawChildren.some((child) => rawTreeContainsUuid(child, activeTreeUuid));
-            if (containsTarget) {
-              workingNode = ensureNodeChildrenLoaded(node);
-            }
-          }
-          const [children, childFound] = expandSelectedPath(workingNode.children);
-          if (childFound) found2 = true;
-          return {
-            ...workingNode,
-            expanded: childFound ? true : workingNode.expanded,
-            children
+    $.current = o;
+  }, [o, i, n]), q(() => {
+    E && D.current === "tree" && i((j) => {
+      const B = (be) => {
+        let ke = !1;
+        return [be.map((Ne) => {
+          let Ie = Ne;
+          if (Ne.uuid === E)
+            return ke = !0, Ne;
+          !Ne.childrenLoaded && Ne.hasChildren && pt(Ne).some((Y) => Dn(Y, E)) && (Ie = Yt(Ne));
+          const [je, qe] = B(Ie.children);
+          return qe && (ke = !0), {
+            ...Ie,
+            expanded: qe ? !0 : Ie.expanded,
+            children: je
           };
-        });
-        return [nextNodes, found2];
-      };
-      const [nextTree, found] = expandSelectedPath(prev);
-      return found ? nextTree : prev;
+        }), ke];
+      }, [de, he] = B(j);
+      return he ? de : j;
     });
-  }, [activeTreeUuid, setTreeRoot]);
-  const filterTree = (nodes, query) => {
-    const lowercaseQuery = query.toLowerCase();
-    return nodes.reduce((acc, node) => {
-      const matchesQuery = !query || getNodeSearchText(node).includes(lowercaseQuery);
-      const sourceChildren = query ? getRawChildren(node).map((child) => createTreeNodeFromRaw(child, node.depth + 1)) : node.children;
-      const filteredChildren = filterTree(sourceChildren, query);
-      const includeByQuery = !query || matchesQuery || filteredChildren.length > 0;
-      if (includeByQuery) {
-        acc.push({
-          ...node,
-          childrenLoaded: query ? true : node.childrenLoaded,
-          hasChildren: node.hasChildren ?? getRawChildren(node).length > 0,
-          expanded: query ? true : node.expanded,
-          children: filteredChildren
-        });
-      }
-      return acc;
+  }, [E, i]);
+  const A = (j, B) => {
+    const de = B.toLowerCase();
+    return j.reduce((he, be) => {
+      const ke = !B || qt(be).includes(de), We = B ? pt(be).map((je) => Bt(je, be.depth + 1)) : be.children, Ne = A(We, B);
+      return (!B || ke || Ne.length > 0) && he.push({
+        ...be,
+        childrenLoaded: B ? !0 : be.childrenLoaded,
+        hasChildren: be.hasChildren ?? pt(be).length > 0,
+        expanded: B ? !0 : be.expanded,
+        children: Ne
+      }), he;
     }, []);
-  };
-  const filteredTree = useMemo(() => filterTree(treeRoot, searchQuery), [treeRoot, searchQuery]);
-  const flatData = useMemo(() => flattenTree(filteredTree), [filteredTree]);
-  const firstSearchMatch = useMemo(() => {
-    if (!searchQuery) return null;
-    const query = searchQuery.toLowerCase();
-    const stack = [...treeRoot];
-    while (stack.length > 0) {
-      const node = stack.shift();
-      if (getNodeSearchText(node).includes(query)) return node;
-      getRawChildren(node).map((child) => createTreeNodeFromRaw(child, (node.depth ?? 0) + 1)).forEach((child) => stack.push(child));
+  }, U = Se(() => A(n, o), [n, o]), G = Se(() => En(U), [U]), H = Se(() => {
+    if (!o) return null;
+    const j = o.toLowerCase(), B = [...n];
+    for (; B.length > 0; ) {
+      const de = B.shift();
+      if (qt(de).includes(j)) return de;
+      pt(de).map((he) => Bt(he, (de.depth ?? 0) + 1)).forEach((he) => B.push(he));
     }
     return null;
-  }, [searchQuery, treeRoot]);
-  const searchMatches = useMemo(() => {
-    if (!searchQuery.trim()) return [];
-    const query = searchQuery.trim().toLowerCase();
-    const results = [];
-    const stack = [...treeRoot];
-    while (stack.length > 0) {
-      const node = stack.shift();
-      if (getNodeSearchText(node).includes(query)) {
-        results.push(node);
-      }
-      getRawChildren(node).map((child) => createTreeNodeFromRaw(child, (node.depth ?? 0) + 1)).forEach((child) => stack.push(child));
+  }, [o, n]), x = Se(() => {
+    if (!o.trim()) return [];
+    const j = o.trim().toLowerCase(), B = [], de = [...n];
+    for (; de.length > 0; ) {
+      const he = de.shift();
+      qt(he).includes(j) && B.push(he), pt(he).map((be) => Bt(be, (he.depth ?? 0) + 1)).forEach((be) => de.push(be));
     }
-    return results;
-  }, [searchQuery, treeRoot]);
-  const rowHeight = 24;
-  const totalHeight = flatData.length * rowHeight;
-  const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight));
-  const visibleCount = Math.ceil(containerHeight / rowHeight);
-  const endIndex = Math.min(flatData.length, startIndex + visibleCount + 1);
-  const visibleItems = flatData.slice(startIndex, endIndex);
-  useEffect(() => {
-    if (selectionSourceRef.current === "tree") {
-      selectionSourceRef.current = null;
-    }
-  }, [selectedUuid]);
-  useEffect(() => {
-    const nextLocateResults = searchQuery.trim() ? searchMatches.map((item) => item.uuid) : [];
-    onLocateResultsChange?.(nextLocateResults);
-  }, [searchMatches, searchQuery, onLocateResultsChange]);
-  const toggleNode = (nodeUuid) => {
-    const toggle = (nodes) => nodes.map((node) => {
-      if (node.uuid === nodeUuid) {
-        const nextNode = ensureNodeChildrenLoaded(node);
-        return { ...nextNode, expanded: !node.expanded };
-      }
-      if (node.children.length > 0) return { ...node, children: toggle(node.children) };
-      return node;
-    });
-    setTreeRoot((prev) => toggle(prev));
-  };
-  const expandAll = () => {
-    const expand = (nodes) => nodes.map((node) => {
-      const expandedNode = ensureNodeChildrenLoaded(node);
+    return B;
+  }, [o, n]), V = 24, z = G.length * V, ce = Math.max(0, Math.floor(P / V)), re = Math.ceil(S / V), Z = Math.min(G.length, ce + re + 1), te = G.slice(ce, Z);
+  q(() => {
+    D.current === "tree" && (D.current = null);
+  }, [a]), q(() => {
+    const j = o.trim() ? x.map((B) => B.uuid) : [];
+    v?.(j);
+  }, [x, o, v]);
+  const ue = (j) => {
+    const B = (de) => de.map((he) => he.uuid === j ? { ...Yt(he), expanded: !he.expanded } : he.children.length > 0 ? { ...he, children: B(he.children) } : he);
+    i((de) => B(de));
+  }, ne = () => {
+    const j = (B) => B.map((de) => {
+      const he = Yt(de);
       return {
-        ...expandedNode,
-        expanded: expandedNode.hasChildren,
-        children: expand(expandedNode.children)
+        ...he,
+        expanded: he.hasChildren,
+        children: j(he.children)
       };
     });
-    setTreeRoot((prev) => expand(prev));
-  };
-  const collapseAll = () => {
-    const collapse = (nodes) => nodes.map((node) => ({
-      ...node,
-      expanded: false,
-      children: collapse(node.children)
+    i((B) => j(B));
+  }, ge = () => {
+    const j = (B) => B.map((de) => ({
+      ...de,
+      expanded: !1,
+      children: j(de.children)
     }));
-    setTreeRoot((prev) => collapse(prev));
-  };
-  const handleLocateFirstMatch = () => {
-    if (!firstSearchMatch) return;
-    onLocate?.(firstSearchMatch.object);
-  };
-  const getClashBadge = (uuid) => {
-    const summary = clashSummaryByUuid[uuid];
-    if (!summary) return null;
-    if (summary.worstStatus === "new") {
-      return {
-        label: `${t("clash_group_new")} ${summary.newCount}`,
-        color: "var(--error)"
-      };
-    }
-    if (summary.worstStatus === "confirmed") {
-      return {
-        label: `${t("clash_group_confirmed")} ${summary.confirmedCount}`,
-        color: "var(--warning, #f59e0b)"
-      };
-    }
-    return {
-      label: `${t("clash_group_resolved")} ${summary.resolvedCount}`,
+    i((B) => j(B));
+  }, _e = () => {
+    H && y?.(H.object);
+  }, ye = (j) => {
+    const B = _[j];
+    return B ? B.worstStatus === "new" ? {
+      label: `${e("clash_group_new")} ${B.newCount}`,
+      color: "var(--error)"
+    } : B.worstStatus === "confirmed" ? {
+      label: `${e("clash_group_confirmed")} ${B.confirmedCount}`,
+      color: "var(--warning, #f59e0b)"
+    } : {
+      label: `${e("clash_group_resolved")} ${B.resolvedCount}`,
       color: "var(--success)"
-    };
+    } : null;
   };
-  return /* @__PURE__ */ jsxs("div", { className: "ui-tree-panel", children: [
-    /* @__PURE__ */ jsxs("div", { className: "ui-search-bar", children: [
-      /* @__PURE__ */ jsxs("div", { className: "ui-search-input-wrap", children: [
-        /* @__PURE__ */ jsx(
+  return /* @__PURE__ */ l("div", { className: "ui-tree-panel", children: [
+    /* @__PURE__ */ l("div", { className: "ui-search-bar", children: [
+      /* @__PURE__ */ l("div", { className: "ui-search-input-wrap", children: [
+        /* @__PURE__ */ t(
           "input",
           {
             type: "text",
-            placeholder: t("search_nodes"),
-            value: searchQuery,
-            onChange: (e) => setSearchQuery(e.target.value),
-            onKeyDown: (e) => {
-              if (e.key === "Enter") {
-                e.preventDefault();
-                handleLocateFirstMatch();
-              }
+            placeholder: e("search_nodes"),
+            value: o,
+            onChange: (j) => b(j.target.value),
+            onKeyDown: (j) => {
+              j.key === "Enter" && (j.preventDefault(), _e());
             },
             className: "ui-input ui-input-compact"
           }
         ),
-        searchQuery && /* @__PURE__ */ jsx("button", { className: "ui-search-clear", onClick: () => setSearchQuery(""), children: /* @__PURE__ */ jsx(IconClose, { width: 14, height: 14 }) })
+        o && /* @__PURE__ */ t("button", { className: "ui-search-clear", onClick: () => b(""), children: /* @__PURE__ */ t(ot, { width: 14, height: 14 }) })
       ] }),
-      searchQuery && /* @__PURE__ */ jsxs("div", { className: "ui-tree-search-meta", children: [
-        /* @__PURE__ */ jsxs("span", { children: [
-          t("search_results"),
+      o && /* @__PURE__ */ l("div", { className: "ui-tree-search-meta", children: [
+        /* @__PURE__ */ l("span", { children: [
+          e("search_results"),
           ": ",
-          searchMatches.length
+          x.length
         ] }),
-        /* @__PURE__ */ jsx(
-          Button,
+        /* @__PURE__ */ t(
+          Ee,
           {
             variant: "ghost",
             className: "ui-properties-action",
-            onClick: handleLocateFirstMatch,
-            disabled: !firstSearchMatch,
-            children: t("locate_first_match")
+            onClick: _e,
+            disabled: !H,
+            children: e("locate_first_match")
           }
         )
       ] })
     ] }),
-    /* @__PURE__ */ jsx(
+    /* @__PURE__ */ t(
       "div",
       {
-        ref: containerRef,
-        className: "ui-tree-container flex-1 overflow-y-auto overflow-x-hidden",
-        onScroll: (e) => setScrollTop(e.currentTarget.scrollTop),
-        children: /* @__PURE__ */ jsx("div", { style: { height: totalHeight, position: "relative" }, children: /* @__PURE__ */ jsx("div", { style: { position: "absolute", top: startIndex * rowHeight, left: 0, right: 0 }, children: visibleItems.map((node) => /* @__PURE__ */ jsxs(
-          "div",
+        ref: C,
+        className: "ui-tree-container flex-1 overflow-auto",
+        onScroll: (j) => R(j.currentTarget.scrollTop),
+        children: /* @__PURE__ */ t("div", { style: { height: z, position: "relative", minWidth: "max-content" }, children: /* @__PURE__ */ t("div", { style: { position: "absolute", top: ce * V, left: 0, right: 0, minWidth: "max-content" }, children: te.map((j) => /* @__PURE__ */ t(
+          ia,
           {
-            className: `ui-tree-node ${node.uuid === activeTreeUuid ? "selected" : ""} ${locateResultUuids.includes(node.uuid) ? "matched" : ""} ${node.uuid === locatedUuid ? "located" : ""}`,
-            style: { paddingLeft: 8 + node.depth * 16 },
-            onClick: () => {
-              selectionSourceRef.current = "tree";
-              setActiveTreeUuid(node.uuid);
-              onSelect(node.uuid, node.object);
+            node: j,
+            isActive: j.uuid === E,
+            isMatched: m.includes(j.uuid),
+            isLocated: j.uuid === r,
+            searchQuery: o,
+            clashBadge: ye(j.uuid),
+            onSelect: (B) => {
+              D.current = "tree", F(B.uuid), s(B.uuid, B.object);
             },
-            onDoubleClick: (e) => {
-              if (node.hasChildren) {
-                e.stopPropagation();
-                toggleNode(node.uuid);
-              }
-            },
-            onContextMenu: (e) => {
-              e.preventDefault();
-              setContextMenu({ x: e.clientX, y: e.clientY, node });
-            },
-            children: [
-              /* @__PURE__ */ jsx(
-                "div",
-                {
-                  className: "ui-tree-expander",
-                  onClick: (e) => {
-                    e.stopPropagation();
-                    toggleNode(node.uuid);
-                  },
-                  children: node.hasChildren ? node.expanded ? /* @__PURE__ */ jsx(IconChevronDown, { size: 12 }) : /* @__PURE__ */ jsx(IconChevronRight, { size: 12 }) : null
-                }
-              ),
-              /* @__PURE__ */ jsx(
-                Checkbox,
-                {
-                  checked: node.visible,
-                  onChange: (val) => onToggleVisibility(node.uuid, val),
-                  style: { marginRight: 4, padding: 0, flexShrink: 0 }
-                }
-              ),
-              /* @__PURE__ */ jsxs("div", { className: "ui-tree-label", children: [
-                searchQuery && node.name.toLowerCase().includes(searchQuery.toLowerCase()) ? /* @__PURE__ */ jsx("span", { children: node.name.split(new RegExp(`(${searchQuery})`, "gi")).map(
-                  (part, index) => part.toLowerCase() === searchQuery.toLowerCase() ? /* @__PURE__ */ jsx("span", { className: "ui-search-hit", children: part }, index) : part
-                ) }) : node.name,
-                (() => {
-                  const badge = getClashBadge(node.uuid);
-                  if (!badge) return null;
-                  return /* @__PURE__ */ jsx(
-                    "span",
-                    {
-                      style: {
-                        marginLeft: 6,
-                        padding: "0 6px",
-                        borderRadius: "var(--radius-xl)",
-                        border: `1px solid ${badge.color}`,
-                        color: badge.color,
-                        fontSize: "var(--font-size-label)",
-                        lineHeight: "16px",
-                        display: "inline-flex",
-                        alignItems: "center",
-                        verticalAlign: "middle"
-                      },
-                      children: badge.label
-                    }
-                  );
-                })()
-              ] })
-            ]
+            onToggleNode: ue,
+            onToggleVisibility: h,
+            onContextMenu: (B, de) => {
+              B.preventDefault(), g({ x: B.clientX, y: B.clientY, node: de });
+            }
           },
-          node.uuid
+          j.uuid
         )) }) })
       }
     ),
-    contextMenu && /* @__PURE__ */ jsx(
-      ContextMenu,
+    k && /* @__PURE__ */ t(
+      Ln,
       {
-        x: contextMenu.x,
-        y: contextMenu.y,
-        onClose: () => setContextMenu(null),
+        x: k.x,
+        y: k.y,
+        onClose: () => g(null),
         items: [
           {
-            label: t("locate_in_view"),
-            onClick: () => onLocate?.(contextMenu.node.object)
+            label: e("locate_in_view"),
+            onClick: () => y?.(k.node.object)
           },
           {
-            divider: true
+            divider: !0
           },
           {
-            label: t("expand_all"),
-            onClick: expandAll
+            label: e("expand_all"),
+            onClick: ne
           },
           {
-            label: t("collapse_all"),
-            onClick: collapseAll
+            label: e("collapse_all"),
+            onClick: ge
           },
-          ...contextMenu.node.isFileNode ? [
-            { divider: true },
+          ...k.node.isFileNode ? [
+            { divider: !0 },
             {
-              label: t("delete_item"),
-              onClick: () => onDelete?.(contextMenu.node.object)
+              label: e("delete_item"),
+              onClick: () => c?.(k.node.object)
             }
           ] : []
         ]
       }
     )
   ] });
-};
-
-const FloatingPanel = ({
-  title,
-  onClose,
-  children,
-  width = 300,
-  height,
-  x = 100,
-  y = 100,
-  resizable = false,
-  movable = true,
-  storageId,
-  modal = false,
-  autoHeight = height === void 0,
-  closeLabel = "Close"
+}, Ye = ({
+  title: e,
+  onClose: n,
+  children: i,
+  width: a = 300,
+  height: r,
+  x: s = 100,
+  y: h = 100,
+  resizable: c = !1,
+  movable: u = !0,
+  storageId: p,
+  modal: d = !1,
+  autoHeight: y = r === void 0,
+  closeLabel: f = "Close"
 }) => {
-  const panelRef = useRef(null);
-  const minWidth = storageId === "tool_measure" ? 320 : 220;
-  const minHeight = storageId === "tool_measure" ? 400 : 120;
-  const getInitialPos = () => {
-    if (modal) {
+  const v = ee(null), m = p === "tool_measure" ? 320 : 220, _ = p === "tool_measure" ? 400 : 120, o = () => {
+    if (d)
       return {
-        x: Math.max(0, (window.innerWidth - width) / 2),
-        y: Math.max(0, (window.innerHeight - (height ?? minHeight)) / 2)
+        x: Math.max(0, (window.innerWidth - a) / 2),
+        y: Math.max(0, (window.innerHeight - (r ?? _)) / 2)
       };
-    }
-    if (storageId) {
+    if (p)
       try {
-        const saved = localStorage.getItem(`panel_${storageId}`);
-        if (saved) {
-          const parsed = JSON.parse(saved);
-          if (parsed.pos && typeof parsed.pos.x === "number" && typeof parsed.pos.y === "number") {
+        const x = localStorage.getItem(`panel_${p}`);
+        if (x) {
+          const V = JSON.parse(x);
+          if (V.pos && typeof V.pos.x == "number" && typeof V.pos.y == "number")
             return {
-              x: Math.min(Math.max(0, parsed.pos.x), window.innerWidth - 50),
-              y: Math.min(Math.max(0, parsed.pos.y), window.innerHeight - 50)
+              x: Math.min(Math.max(0, V.pos.x), window.innerWidth - 50),
+              y: Math.min(Math.max(0, V.pos.y), window.innerHeight - 50)
             };
-          }
         }
-      } catch (e) {
+      } catch {
       }
-    }
-    if (x === 100 && y === 100 && !storageId) {
-      return {
-        x: Math.max(0, (window.innerWidth - width) / 2),
-        y: Math.max(0, (window.innerHeight - (height ?? minHeight)) / 2)
-      };
-    }
-    return { x, y };
-  };
-  const getInitialSize = () => {
-    if (storageId && resizable) {
+    return s === 100 && h === 100 && !p ? {
+      x: Math.max(0, (window.innerWidth - a) / 2),
+      y: Math.max(0, (window.innerHeight - (r ?? _)) / 2)
+    } : { x: s, y: h };
+  }, b = () => {
+    if (p && c)
       try {
-        const saved = localStorage.getItem(`panel_${storageId}`);
-        if (saved) {
-          const parsed = JSON.parse(saved);
-          if (parsed.size && typeof parsed.size.w === "number" && typeof parsed.size.h === "number") {
+        const x = localStorage.getItem(`panel_${p}`);
+        if (x) {
+          const V = JSON.parse(x);
+          if (V.size && typeof V.size.w == "number" && typeof V.size.h == "number")
             return {
-              w: Math.max(minWidth, parsed.size.w),
-              h: Math.max(minHeight, parsed.size.h)
+              w: Math.max(m, V.size.w),
+              h: Math.max(_, V.size.h)
             };
-          }
         }
-      } catch (e) {
+      } catch {
       }
+    return { w: a, h: r ?? _ };
+  }, k = ee(o()), g = ee(b()), P = ee(!1), R = ee(!1), S = ee(null), I = ee({ x: 0, y: 0 }), C = ee({ x: 0, y: 0 }), D = ee({ w: 0, h: 0 }), N = T(() => {
+    const x = v.current;
+    if (!x) return;
+    const V = k.current, z = g.current;
+    x.style.transform = `translate(${V.x}px, ${V.y}px)`, x.style.width = `${z.w}px`, y || (x.style.height = `${z.h}px`);
+  }, [y]), $ = T((x) => {
+    if (!P.current && !R.current) return;
+    x.preventDefault();
+    const V = x.clientX - I.current.x, z = x.clientY - I.current.y, ce = v.current;
+    if (P.current) {
+      let re = window.innerWidth, Z = window.innerHeight;
+      ce?.parentElement && (re = ce.parentElement.clientWidth, Z = ce.parentElement.clientHeight);
+      const te = y && ce?.offsetHeight || g.current.h, ue = re - g.current.w, ne = Z - te;
+      k.current = {
+        x: Math.max(0, Math.min(C.current.x + V, ue)),
+        y: Math.max(0, Math.min(C.current.y + z, ne))
+      }, N();
+    } else if (R.current && S.current) {
+      const re = S.current;
+      let Z = D.current.w, te = D.current.h, ue = C.current.x, ne = C.current.y;
+      if (re.includes("e") && (Z = Math.max(m, D.current.w + V)), re.includes("w")) {
+        const ge = D.current.w - m, _e = Math.min(V, ge);
+        Z = D.current.w - _e, ue = C.current.x + _e;
+      }
+      if (re.includes("s") && (te = Math.max(_, D.current.h + z)), re.includes("n")) {
+        const ge = D.current.h - _, _e = Math.min(z, ge);
+        te = D.current.h - _e, ne = C.current.y + _e;
+      }
+      g.current = { w: Z, h: te }, (re.includes("w") || re.includes("n")) && (k.current = { x: ue, y: ne }), N();
     }
-    return { w: width, h: height ?? minHeight };
-  };
-  const posRef = useRef(getInitialPos());
-  const sizeRef = useRef(getInitialSize());
-  const isDragging = useRef(false);
-  const isResizing = useRef(false);
-  const resizeDirection = useRef(null);
-  const dragStart = useRef({ x: 0, y: 0 });
-  const startPos = useRef({ x: 0, y: 0 });
-  const startSize = useRef({ w: 0, h: 0 });
-  const applyStyle = useCallback(() => {
-    const panel = panelRef.current;
-    if (!panel) return;
-    const pos2 = posRef.current;
-    const size2 = sizeRef.current;
-    panel.style.transform = `translate(${pos2.x}px, ${pos2.y}px)`;
-    panel.style.width = `${size2.w}px`;
-    if (!autoHeight) {
-      panel.style.height = `${size2.h}px`;
-    }
-  }, [autoHeight]);
-  const handleMouseMove = useCallback((e) => {
-    if (!isDragging.current && !isResizing.current) return;
-    e.preventDefault();
-    const dx = e.clientX - dragStart.current.x;
-    const dy = e.clientY - dragStart.current.y;
-    const panel = panelRef.current;
-    if (isDragging.current) {
-      let limitW = window.innerWidth;
-      let limitH = window.innerHeight;
-      if (panel?.parentElement) {
-        limitW = panel.parentElement.clientWidth;
-        limitH = panel.parentElement.clientHeight;
+  }, [m, _, y, N]), E = T(() => {
+    if ((P.current || R.current) && p)
+      try {
+        localStorage.setItem(`panel_${p}`, JSON.stringify({
+          pos: k.current,
+          size: g.current
+        }));
+      } catch {
       }
-      const panelHeight = autoHeight ? panel?.offsetHeight || sizeRef.current.h : sizeRef.current.h;
-      const maxX = limitW - sizeRef.current.w;
-      const maxY = limitH - panelHeight;
-      posRef.current = {
-        x: Math.max(0, Math.min(startPos.current.x + dx, maxX)),
-        y: Math.max(0, Math.min(startPos.current.y + dy, maxY))
-      };
-      applyStyle();
-    } else if (isResizing.current && resizeDirection.current) {
-      const dir = resizeDirection.current;
-      let newW = startSize.current.w;
-      let newH = startSize.current.h;
-      let newX = startPos.current.x;
-      let newY = startPos.current.y;
-      if (dir.includes("e")) {
-        newW = Math.max(minWidth, startSize.current.w + dx);
-      }
-      if (dir.includes("w")) {
-        const maxDx = startSize.current.w - minWidth;
-        const actualDx = Math.min(dx, maxDx);
-        newW = startSize.current.w - actualDx;
-        newX = startPos.current.x + actualDx;
-      }
-      if (dir.includes("s")) {
-        newH = Math.max(minHeight, startSize.current.h + dy);
-      }
-      if (dir.includes("n")) {
-        const maxDy = startSize.current.h - minHeight;
-        const actualDy = Math.min(dy, maxDy);
-        newH = startSize.current.h - actualDy;
-        newY = startPos.current.y + actualDy;
-      }
-      sizeRef.current = { w: newW, h: newH };
-      if (dir.includes("w") || dir.includes("n")) {
-        posRef.current = { x: newX, y: newY };
-      }
-      applyStyle();
-    }
-  }, [minWidth, minHeight, autoHeight, applyStyle]);
-  const handleMouseUp = useCallback(() => {
-    if (isDragging.current || isResizing.current) {
-      if (storageId) {
-        try {
-          localStorage.setItem(`panel_${storageId}`, JSON.stringify({
-            pos: posRef.current,
-            size: sizeRef.current
-          }));
-        } catch (e) {
-        }
-      }
-    }
-    isDragging.current = false;
-    isResizing.current = false;
-    resizeDirection.current = null;
-    document.body.style.cursor = "";
-  }, [storageId]);
-  useEffect(() => {
-    document.addEventListener("mousemove", handleMouseMove);
-    document.addEventListener("mouseup", handleMouseUp);
-    return () => {
-      document.removeEventListener("mousemove", handleMouseMove);
-      document.removeEventListener("mouseup", handleMouseUp);
+    P.current = !1, R.current = !1, S.current = null, document.body.style.cursor = "";
+  }, [p]);
+  q(() => (document.addEventListener("mousemove", $), document.addEventListener("mouseup", E), () => {
+    document.removeEventListener("mousemove", $), document.removeEventListener("mouseup", E);
+  }), [$, E]), q(() => {
+    if (!d) return;
+    const x = () => {
+      const V = y ? Math.min(window.innerHeight - 64, v.current?.offsetHeight || g.current.h) : g.current.h;
+      k.current = {
+        x: Math.max(0, (window.innerWidth - g.current.w) / 2),
+        y: Math.max(0, (window.innerHeight - V) / 2)
+      }, N();
     };
-  }, [handleMouseMove, handleMouseUp]);
-  useEffect(() => {
-    if (!modal) return;
-    const centerPanel = () => {
-      const measuredHeight = autoHeight ? Math.min(window.innerHeight - 64, panelRef.current?.offsetHeight || sizeRef.current.h) : sizeRef.current.h;
-      posRef.current = {
-        x: Math.max(0, (window.innerWidth - sizeRef.current.w) / 2),
-        y: Math.max(0, (window.innerHeight - measuredHeight) / 2)
-      };
-      applyStyle();
+    return window.addEventListener("resize", x), x(), () => window.removeEventListener("resize", x);
+  }, [y, d, N]);
+  const F = (x) => {
+    d || x.button !== 0 || !u || (x.preventDefault(), x.stopPropagation(), P.current = !0, I.current = { x: x.clientX, y: x.clientY }, C.current = { ...k.current }, document.body.style.cursor = "grabbing");
+  }, A = (x) => (V) => {
+    if (d || V.button !== 0 || !c) return;
+    V.preventDefault(), V.stopPropagation(), R.current = !0, S.current = x, I.current = { x: V.clientX, y: V.clientY }, D.current = { ...g.current }, C.current = { ...k.current };
+    const z = {
+      n: "ns-resize",
+      s: "ns-resize",
+      e: "ew-resize",
+      w: "ew-resize",
+      ne: "nesw-resize",
+      sw: "nesw-resize",
+      nw: "nwse-resize",
+      se: "nwse-resize"
     };
-    window.addEventListener("resize", centerPanel);
-    centerPanel();
-    return () => window.removeEventListener("resize", centerPanel);
-  }, [autoHeight, modal, applyStyle]);
-  const onHeaderDown = (e) => {
-    if (modal || e.button !== 0 || !movable) return;
-    e.preventDefault();
-    e.stopPropagation();
-    isDragging.current = true;
-    dragStart.current = { x: e.clientX, y: e.clientY };
-    startPos.current = { ...posRef.current };
-    document.body.style.cursor = "grabbing";
-  };
-  const onResizeDown = (direction) => (e) => {
-    if (modal || e.button !== 0 || !resizable) return;
-    e.preventDefault();
-    e.stopPropagation();
-    isResizing.current = true;
-    resizeDirection.current = direction;
-    dragStart.current = { x: e.clientX, y: e.clientY };
-    startSize.current = { ...sizeRef.current };
-    startPos.current = { ...posRef.current };
-    const cursors = {
-      "n": "ns-resize",
-      "s": "ns-resize",
-      "e": "ew-resize",
-      "w": "ew-resize",
-      "ne": "nesw-resize",
-      "sw": "nesw-resize",
-      "nw": "nwse-resize",
-      "se": "nwse-resize"
-    };
-    document.body.style.cursor = cursors[direction];
-  };
-  const onCloseClick = (e) => {
-    e.stopPropagation();
-    onClose?.();
-  };
-  const pos = posRef.current;
-  const size = sizeRef.current;
-  return /* @__PURE__ */ jsxs(Fragment, { children: [
-    modal && /* @__PURE__ */ jsx(
+    document.body.style.cursor = z[x];
+  }, U = (x) => {
+    x.stopPropagation(), n?.();
+  }, G = k.current, H = g.current;
+  return /* @__PURE__ */ l(ae, { children: [
+    d && /* @__PURE__ */ t(
       "div",
       {
         className: "ui-modal-scrim"
       }
     ),
-    /* @__PURE__ */ jsxs(
+    /* @__PURE__ */ l(
       "div",
       {
-        ref: panelRef,
-        className: `ui-panel${modal ? " ui-panel-modal" : ""}`,
+        ref: v,
+        className: `ui-panel${d ? " ui-panel-modal" : ""}`,
         style: {
-          position: modal ? "fixed" : "absolute",
+          position: d ? "fixed" : "absolute",
           left: 0,
           top: 0,
-          transform: `translate(${pos.x}px, ${pos.y}px)`,
-          width: size.w,
-          height: autoHeight ? "auto" : size.h,
-          maxHeight: autoHeight ? "calc(100vh - 64px)" : void 0,
-          zIndex: modal ? 2e3 : 200,
-          willChange: isDragging.current || isResizing.current ? "transform, width, height" : "auto"
+          transform: `translate(${G.x}px, ${G.y}px)`,
+          width: H.w,
+          height: y ? "auto" : H.h,
+          maxHeight: y ? "calc(100vh - 64px)" : void 0,
+          zIndex: d ? 2e3 : 200,
+          willChange: P.current || R.current ? "transform, width, height" : "auto"
         },
         children: [
-          /* @__PURE__ */ jsxs(
+          /* @__PURE__ */ l(
             "div",
             {
-              className: `ui-panel-header ${!movable || modal ? "ui-panel-header-static" : ""}`,
-              onMouseDown: onHeaderDown,
+              className: `ui-panel-header ${!u || d ? "ui-panel-header-static" : ""}`,
+              onMouseDown: F,
               children: [
-                /* @__PURE__ */ jsx("span", { className: "ui-panel-title", children: title }),
-                onClose && /* @__PURE__ */ jsx(
+                /* @__PURE__ */ t("span", { className: "ui-panel-title", children: e }),
+                n && /* @__PURE__ */ t(
                   "button",
                   {
                     className: "ui-panel-close",
-                    onClick: onCloseClick,
-                    title: closeLabel,
-                    children: /* @__PURE__ */ jsx(IconClose, { width: 14, height: 14 })
+                    onClick: U,
+                    title: f,
+                    children: /* @__PURE__ */ t(ot, { width: 14, height: 14 })
                   }
                 )
               ]
             }
           ),
-          /* @__PURE__ */ jsx("div", { className: "ui-panel-content", children }),
-          resizable && !modal && /* @__PURE__ */ jsxs(Fragment, { children: [
-            /* @__PURE__ */ jsx("div", { className: "ui-panel-resize-handle ui-panel-resize-e", onMouseDown: onResizeDown("e") }),
-            /* @__PURE__ */ jsx("div", { className: "ui-panel-resize-handle ui-panel-resize-s", onMouseDown: onResizeDown("s") }),
-            /* @__PURE__ */ jsx("div", { className: "ui-panel-resize-handle ui-panel-resize-w", onMouseDown: onResizeDown("w") }),
-            /* @__PURE__ */ jsx("div", { className: "ui-panel-resize-handle ui-panel-resize-se", onMouseDown: onResizeDown("se") }),
-            /* @__PURE__ */ jsx("div", { className: "ui-panel-resize-handle ui-panel-resize-sw", onMouseDown: onResizeDown("sw") })
+          /* @__PURE__ */ t("div", { className: "ui-panel-content", children: i }),
+          c && !d && /* @__PURE__ */ l(ae, { children: [
+            /* @__PURE__ */ t("div", { className: "ui-panel-resize-handle ui-panel-resize-e", onMouseDown: A("e") }),
+            /* @__PURE__ */ t("div", { className: "ui-panel-resize-handle ui-panel-resize-s", onMouseDown: A("s") }),
+            /* @__PURE__ */ t("div", { className: "ui-panel-resize-handle ui-panel-resize-w", onMouseDown: A("w") }),
+            /* @__PURE__ */ t("div", { className: "ui-panel-resize-handle ui-panel-resize-se", onMouseDown: A("se") }),
+            /* @__PURE__ */ t("div", { className: "ui-panel-resize-handle ui-panel-resize-sw", onMouseDown: A("sw") })
           ] })
         ]
       }
     )
   ] });
-};
-
-const Row$1 = ({ label, children, labelWidth = "80px", stretch = false }) => /* @__PURE__ */ jsxs(
+}, Ze = ({ label: e, children: n, labelWidth: i = "80px", stretch: a = !1 }) => /* @__PURE__ */ l(
   "div",
   {
     className: "ui-form-row ui-form-row-tight",
     children: [
-      /* @__PURE__ */ jsx(
+      /* @__PURE__ */ t(
         "span",
         {
           className: "ui-form-label ui-form-label-dynamic",
-          style: { ["--label-width"]: labelWidth },
-          children: label
+          style: { "--label-width": i },
+          children: e
         }
       ),
-      /* @__PURE__ */ jsx(
+      /* @__PURE__ */ t(
         "div",
         {
-          className: `ui-form-value ${stretch ? "ui-form-value-stretch" : ""} ${stretch ? "" : "ui-form-value-end"}`,
-          children
+          className: `ui-form-value ${a ? "ui-form-value-stretch" : ""} ${a ? "" : "ui-form-value-end"}`,
+          children: n
         }
       )
     ]
   }
-);
-const SettingsPanel = ({
-  t,
+), aa = ({
+  t: e,
   // 翻译函数
-  onClose,
+  onClose: n,
   // 关闭回调
-  settings,
+  settings: i,
   // 场景设置
-  onUpdate,
+  onUpdate: a,
   // 设置更新回调
-  currentLang,
+  currentLang: r,
   // 当前语言
-  setLang,
+  setLang: s,
   // 设置语言回调
-  showStats,
+  showStats: h,
   // 是否显示统计
-  setShowStats,
+  setShowStats: c,
   // 设置统计显示回调
   // 样式配置
-  theme
+  theme: u
   // 主题配置
 }) => {
-  const [activeTab, setActiveTab] = useState("general");
-  const tabOptions = [
-    { value: "general", label: t("setting_general") || "通用" },
-    { value: "lighting", label: t("st_lighting") || "光照" },
-    { value: "viewport", label: t("st_viewport") || "视口" },
-    { value: "highlight", label: t("st_highlight") || "高亮" }
+  const [p, d] = O("general"), y = [
+    { value: "general", label: e("setting_general") || "通用" },
+    { value: "lighting", label: e("st_lighting") || "光照" },
+    { value: "viewport", label: e("st_viewport") || "视口" },
+    { value: "highlight", label: e("st_highlight") || "高亮" }
   ];
-  return /* @__PURE__ */ jsx(
-    FloatingPanel,
+  return /* @__PURE__ */ t(
+    Ye,
     {
-      title: t("settings"),
-      closeLabel: t("panel_close") || "关闭",
-      onClose,
+      title: e("settings"),
+      closeLabel: e("panel_close") || "关闭",
+      onClose: n,
       width: 360,
       height: 400,
-      modal: true,
-      movable: false,
-      theme,
-      children: /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-body", style: { flex: 1, minHeight: 0 }, children: [
-        /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-sticky-tabs", children: /* @__PURE__ */ jsx(
-          SegmentedControl,
+      modal: !0,
+      movable: !1,
+      theme: u,
+      children: /* @__PURE__ */ l("div", { className: "ui-toolpanel-body", style: { flex: 1, minHeight: 0 }, children: [
+        /* @__PURE__ */ t("div", { className: "ui-toolpanel-sticky-tabs", children: /* @__PURE__ */ t(
+          nn,
           {
-            options: tabOptions,
-            value: activeTab,
-            onChange: (value) => setActiveTab(value)
+            options: y,
+            value: p,
+            onChange: (f) => d(f)
           }
         ) }),
-        activeTab === "general" && /* @__PURE__ */ jsxs("div", { className: "ui-panel-stack", children: [
-          /* @__PURE__ */ jsx(Row$1, { label: t("st_lang"), labelWidth: "70px", stretch: true, children: /* @__PURE__ */ jsx(
-            Select,
+        p === "general" && /* @__PURE__ */ l("div", { className: "ui-panel-stack", children: [
+          /* @__PURE__ */ t(Ze, { label: e("st_lang"), labelWidth: "70px", stretch: !0, children: /* @__PURE__ */ t(
+            Nt,
             {
-              value: currentLang,
+              value: r,
               options: [
                 { value: "zh", label: "简体中文" },
                 { value: "en", label: "English" }
               ],
-              onChange: (v) => setLang(v)
+              onChange: (f) => s(f)
             }
           ) }),
-          /* @__PURE__ */ jsx(Row$1, { label: t("st_monitor"), labelWidth: "70px", children: /* @__PURE__ */ jsx(
-            Switch,
+          /* @__PURE__ */ t(Ze, { label: e("st_monitor"), labelWidth: "70px", children: /* @__PURE__ */ t(
+            gt,
             {
-              checked: showStats,
-              onChange: (v) => setShowStats(v)
+              checked: h,
+              onChange: (f) => c(f)
             }
           ) })
         ] }),
-        activeTab === "lighting" && /* @__PURE__ */ jsxs("div", { className: "ui-panel-stack", children: [
-          /* @__PURE__ */ jsx(Row$1, { label: t("st_ambient") || "环境光", labelWidth: "90px", stretch: true, children: /* @__PURE__ */ jsxs("div", { className: "ui-slider-field", children: [
-            /* @__PURE__ */ jsx("div", { className: "ui-inline-actions-stretch", children: /* @__PURE__ */ jsx(
-              Slider,
+        p === "lighting" && /* @__PURE__ */ l("div", { className: "ui-panel-stack", children: [
+          /* @__PURE__ */ t(Ze, { label: e("st_ambient") || "环境光", labelWidth: "90px", stretch: !0, children: /* @__PURE__ */ l("div", { className: "ui-slider-field", children: [
+            /* @__PURE__ */ t("div", { className: "ui-inline-actions-stretch", children: /* @__PURE__ */ t(
+              mt,
               {
                 min: 0,
                 max: 4,
                 step: 0.05,
-                value: settings.ambientInt || 0,
-                onChange: (value) => onUpdate({ ambientInt: value })
+                value: i.ambientInt || 0,
+                onChange: (f) => a({ ambientInt: f })
               }
             ) }),
-            /* @__PURE__ */ jsx("div", { className: "ui-result-item-secondary-value", children: (settings.ambientInt || 0).toFixed(2) })
+            /* @__PURE__ */ t("div", { className: "ui-result-item-secondary-value", children: (i.ambientInt || 0).toFixed(2) })
           ] }) }),
-          /* @__PURE__ */ jsx(Row$1, { label: t("st_dir") || "主光", labelWidth: "90px", stretch: true, children: /* @__PURE__ */ jsxs("div", { className: "ui-slider-field", children: [
-            /* @__PURE__ */ jsx("div", { className: "ui-inline-actions-stretch", children: /* @__PURE__ */ jsx(
-              Slider,
+          /* @__PURE__ */ t(Ze, { label: e("st_dir") || "主光", labelWidth: "90px", stretch: !0, children: /* @__PURE__ */ l("div", { className: "ui-slider-field", children: [
+            /* @__PURE__ */ t("div", { className: "ui-inline-actions-stretch", children: /* @__PURE__ */ t(
+              mt,
               {
                 min: 0,
                 max: 4,
                 step: 0.05,
-                value: settings.dirInt || 0,
-                onChange: (value) => onUpdate({ dirInt: value })
+                value: i.dirInt || 0,
+                onChange: (f) => a({ dirInt: f })
               }
             ) }),
-            /* @__PURE__ */ jsx("div", { className: "ui-result-item-secondary-value", children: (settings.dirInt || 0).toFixed(2) })
+            /* @__PURE__ */ t("div", { className: "ui-result-item-secondary-value", children: (i.dirInt || 0).toFixed(2) })
           ] }) }),
-          /* @__PURE__ */ jsx(Row$1, { label: t("st_back") || "背光", labelWidth: "90px", stretch: true, children: /* @__PURE__ */ jsxs("div", { className: "ui-slider-field", children: [
-            /* @__PURE__ */ jsx("div", { className: "ui-inline-actions-stretch", children: /* @__PURE__ */ jsx(
-              Slider,
+          /* @__PURE__ */ t(Ze, { label: e("st_back") || "背光", labelWidth: "90px", stretch: !0, children: /* @__PURE__ */ l("div", { className: "ui-slider-field", children: [
+            /* @__PURE__ */ t("div", { className: "ui-inline-actions-stretch", children: /* @__PURE__ */ t(
+              mt,
               {
                 min: 0,
                 max: 2,
                 step: 0.05,
-                value: settings.backLightInt ?? 0.5,
-                onChange: (value) => onUpdate({ backLightInt: value })
+                value: i.backLightInt ?? 0.5,
+                onChange: (f) => a({ backLightInt: f })
               }
             ) }),
-            /* @__PURE__ */ jsx("div", { className: "ui-result-item-secondary-value", children: (settings.backLightInt ?? 0.5).toFixed(2) })
+            /* @__PURE__ */ t("div", { className: "ui-result-item-secondary-value", children: (i.backLightInt ?? 0.5).toFixed(2) })
           ] }) })
         ] }),
-        activeTab === "viewport" && /* @__PURE__ */ jsxs("div", { className: "ui-panel-stack", children: [
-          /* @__PURE__ */ jsx(Row$1, { label: t("st_viewcube_size"), labelWidth: "90px", stretch: true, children: /* @__PURE__ */ jsxs("div", { className: "ui-slider-field", children: [
-            /* @__PURE__ */ jsx("div", { className: "ui-inline-actions-stretch", children: /* @__PURE__ */ jsx(
-              Slider,
+        p === "viewport" && /* @__PURE__ */ l("div", { className: "ui-panel-stack", children: [
+          /* @__PURE__ */ t(Ze, { label: e("st_viewcube_size"), labelWidth: "90px", stretch: !0, children: /* @__PURE__ */ l("div", { className: "ui-slider-field", children: [
+            /* @__PURE__ */ t("div", { className: "ui-inline-actions-stretch", children: /* @__PURE__ */ t(
+              mt,
               {
                 min: 120,
                 max: 180,
                 step: 5,
-                value: settings.viewCubeSize || 120,
-                onChange: (value) => onUpdate({ viewCubeSize: value })
+                value: i.viewCubeSize || 120,
+                onChange: (f) => a({ viewCubeSize: f })
               }
             ) }),
-            /* @__PURE__ */ jsxs("div", { className: "ui-result-item-secondary-value ui-result-item-secondary-value-wide", children: [
-              settings.viewCubeSize || 120,
+            /* @__PURE__ */ l("div", { className: "ui-result-item-secondary-value ui-result-item-secondary-value-wide", children: [
+              i.viewCubeSize || 120,
               "px"
             ] })
           ] }) }),
-          /* @__PURE__ */ jsx(Row$1, { label: t("st_adaptive_quality") || "Adaptive", labelWidth: "90px", children: /* @__PURE__ */ jsx(
-            Switch,
+          /* @__PURE__ */ t(Ze, { label: e("st_adaptive_quality") || "Adaptive", labelWidth: "90px", children: /* @__PURE__ */ t(
+            gt,
             {
-              checked: settings.adaptiveQuality !== false,
-              onChange: (v) => onUpdate({ adaptiveQuality: v })
+              checked: i.adaptiveQuality !== !1,
+              onChange: (f) => a({ adaptiveQuality: f })
             }
           ) }),
-          /* @__PURE__ */ jsx(Row$1, { label: t("st_performance_profile") || "性能策略", labelWidth: "90px", children: /* @__PURE__ */ jsx("div", { className: "ui-inline-actions ui-inline-actions-end", children: /* @__PURE__ */ jsx(
-            SegmentedControl,
+          /* @__PURE__ */ t(Ze, { label: e("st_performance_profile") || "性能策略", labelWidth: "90px", children: /* @__PURE__ */ t("div", { className: "ui-inline-actions ui-inline-actions-end", children: /* @__PURE__ */ t(
+            nn,
             {
               options: [
-                { value: "smooth", label: t("st_perf_smooth") || "流畅优先" },
-                { value: "balanced", label: t("st_perf_balanced") || "平衡" },
-                { value: "quality", label: t("st_perf_quality") || "画质优先" }
+                { value: "smooth", label: e("st_perf_smooth") || "流畅优先" },
+                { value: "balanced", label: e("st_perf_balanced") || "平衡" },
+                { value: "quality", label: e("st_perf_quality") || "画质优先" }
               ],
-              value: settings.performanceMode || "balanced",
-              onChange: (v) => onUpdate({ performanceMode: v })
+              value: i.performanceMode || "balanced",
+              onChange: (f) => a({ performanceMode: f })
             }
           ) }) })
         ] }),
-        activeTab === "highlight" && /* @__PURE__ */ jsxs("div", { className: "ui-panel-stack", children: [
-          /* @__PURE__ */ jsx(Row$1, { label: t("st_highlight_color") || "高亮颜色", labelWidth: "90px", stretch: true, children: /* @__PURE__ */ jsx(
-            ColorPicker,
+        p === "highlight" && /* @__PURE__ */ l("div", { className: "ui-panel-stack", children: [
+          /* @__PURE__ */ t(Ze, { label: e("st_highlight_color") || "高亮颜色", labelWidth: "90px", stretch: !0, children: /* @__PURE__ */ t(
+            Zr,
             {
-              value: settings.highlightColor || "#ff9f1c",
-              onChange: (value) => onUpdate({ highlightColor: value })
+              value: i.highlightColor || "#ff9f1c",
+              onChange: (f) => a({ highlightColor: f })
             }
           ) }),
-          /* @__PURE__ */ jsx(Row$1, { label: t("st_highlight_box") || "显示包围盒", labelWidth: "90px", children: /* @__PURE__ */ jsx(
-            Switch,
+          /* @__PURE__ */ t(Ze, { label: e("st_highlight_box") || "显示包围盒", labelWidth: "90px", children: /* @__PURE__ */ t(
+            gt,
             {
-              checked: settings.highlightShowBox === true,
-              onChange: (value) => onUpdate({ highlightShowBox: value })
+              checked: i.highlightShowBox === !0,
+              onChange: (f) => a({ highlightShowBox: f })
             }
           ) })
         ] })
       ] })
     }
   );
-};
-
-const Icons = {
-  Trash: () => /* @__PURE__ */ jsx("svg", { width: "14", height: "14", viewBox: "0 0 16 16", fill: "none", stroke: "currentColor", strokeWidth: "1.5", children: /* @__PURE__ */ jsx("path", { d: "M2 4h12M5 4V3a1 1 0 011-1h4a1 1 0 011 1v1M6 7v5M10 7v5M3 4l1 9a1 1 0 001 1h6a1 1 0 001-1l1-9", strokeLinecap: "round", strokeLinejoin: "round" }) }),
-  Close: () => /* @__PURE__ */ jsx("svg", { width: "12", height: "12", viewBox: "0 0 14 14", fill: "none", stroke: "currentColor", strokeWidth: "1.5", children: /* @__PURE__ */ jsx("path", { d: "M2 2L12 12M12 2L2 12", strokeLinecap: "round" }) })
-};
-const ClearButton = ({ onClick, disabled }) => {
-  return /* @__PURE__ */ jsx(
-    Button,
-    {
-      onClick,
-      disabled,
-      variant: "ghost",
-      size: "sm",
-      className: "ui-btn-icon",
-      title: "Clear All",
-      children: /* @__PURE__ */ jsx(Icons.Trash, {})
-    }
-  );
-};
-const DataPanel = ({ children, empty, emptyText }) => {
-  return /* @__PURE__ */ jsx("div", { className: "ui-data-panel ui-measure-results", children: empty ? /* @__PURE__ */ jsx("div", { className: "ui-measure-empty", children: emptyText }) : children });
-};
-const MeasureItem = ({ item, isHighlighted, onHighlight, onDelete }) => {
-  return /* @__PURE__ */ jsxs(
-    "div",
-    {
-      onClick: onHighlight,
-      className: `ui-list-item ui-measure-item ${isHighlighted ? "selected" : ""}`,
-      children: [
-        /* @__PURE__ */ jsx("span", { className: "ui-measure-item-value", children: item.val }),
-        /* @__PURE__ */ jsx(
-          "button",
-          {
-            onClick: (e) => {
-              e.stopPropagation();
-              onDelete();
-            },
-            className: "ui-btn ui-btn-icon-sm ui-btn-ghost",
-            style: { opacity: 0.6, marginLeft: "8px" },
-            onMouseEnter: (e) => e.currentTarget.style.opacity = "1",
-            onMouseLeave: (e) => e.currentTarget.style.opacity = "0.6",
-            children: /* @__PURE__ */ jsx(Icons.Close, {})
-          }
-        )
-      ]
-    }
-  );
-};
-const TypeHeader = ({ label }) => {
-  return /* @__PURE__ */ jsx("div", { className: "ui-group-title", children: label });
-};
-const MeasurePanel = ({
-  t,
-  sceneMgr,
-  measureType,
-  setMeasureType,
-  measureHistory,
-  onDelete,
-  onClear,
-  onClose,
-  highlightedId,
-  onHighlight
+}, Vn = {
+  Trash: () => /* @__PURE__ */ t("svg", { width: "14", height: "14", viewBox: "0 0 16 16", fill: "none", stroke: "currentColor", strokeWidth: "1.5", children: /* @__PURE__ */ t("path", { d: "M2 4h12M5 4V3a1 1 0 011-1h4a1 1 0 011 1v1M6 7v5M10 7v5M3 4l1 9a1 1 0 001 1h6a1 1 0 001-1l1-9", strokeLinecap: "round", strokeLinejoin: "round" }) }),
+  Close: () => /* @__PURE__ */ t("svg", { width: "12", height: "12", viewBox: "0 0 14 14", fill: "none", stroke: "currentColor", strokeWidth: "1.5", children: /* @__PURE__ */ t("path", { d: "M2 2L12 12M12 2L2 12", strokeLinecap: "round" }) })
+}, oa = ({ onClick: e, disabled: n }) => /* @__PURE__ */ t(
+  Ee,
+  {
+    onClick: e,
+    disabled: n,
+    variant: "ghost",
+    size: "sm",
+    className: "ui-btn-icon",
+    title: "Clear All",
+    children: /* @__PURE__ */ t(Vn.Trash, {})
+  }
+), sa = ({ children: e, empty: n, emptyText: i }) => /* @__PURE__ */ t("div", { className: "ui-data-panel ui-measure-results", children: n ? /* @__PURE__ */ t("div", { className: "ui-measure-empty", children: i }) : e }), la = ({ item: e, isHighlighted: n, onHighlight: i, onDelete: a }) => /* @__PURE__ */ l(
+  "div",
+  {
+    onClick: i,
+    className: `ui-list-item ui-measure-item ${n ? "selected" : ""}`,
+    children: [
+      /* @__PURE__ */ t("span", { className: "ui-measure-item-value", children: e.val }),
+      /* @__PURE__ */ t(
+        "button",
+        {
+          onClick: (r) => {
+            r.stopPropagation(), a();
+          },
+          className: "ui-btn ui-btn-icon-sm ui-btn-ghost",
+          style: { opacity: 0.6, marginLeft: "8px" },
+          onMouseEnter: (r) => r.currentTarget.style.opacity = "1",
+          onMouseLeave: (r) => r.currentTarget.style.opacity = "0.6",
+          children: /* @__PURE__ */ t(Vn.Close, {})
+        }
+      )
+    ]
+  }
+), ca = ({ label: e }) => /* @__PURE__ */ t("div", { className: "ui-group-title", children: e }), ua = ({
+  t: e,
+  sceneMgr: n,
+  measureType: i,
+  setMeasureType: a,
+  measureHistory: r,
+  onDelete: s,
+  onClear: h,
+  onClose: c,
+  highlightedId: u,
+  onHighlight: p
 }) => {
-  const groupedHistory = useMemo(() => {
-    const groups = {
-      "dist": [],
-      "angle": [],
-      "coord": []
+  const d = Se(() => {
+    const m = {
+      dist: [],
+      angle: [],
+      coord: []
     };
-    measureHistory.forEach((item) => {
-      if (groups[item.type]) groups[item.type].push(item);
-    });
-    return groups;
-  }, [measureHistory]);
-  const handleTypeChange = (type) => {
-    setMeasureType(type);
-    sceneMgr?.startMeasurement(type);
-  };
-  const getInstructionText = () => {
-    switch (measureType) {
+    return r.forEach((_) => {
+      m[_.type] && m[_.type].push(_);
+    }), m;
+  }, [r]), y = (m) => {
+    a(m), n?.startMeasurement(m);
+  }, f = () => {
+    switch (i) {
       case "dist":
-        return t("measure_instruct_dist");
+        return e("measure_instruct_dist");
       case "angle":
-        return t("measure_instruct_angle");
+        return e("measure_instruct_angle");
       case "coord":
-        return t("measure_instruct_coord");
+        return e("measure_instruct_coord");
       default:
         return "";
     }
-  };
-  const getTypeLabel = (type) => {
-    switch (type) {
+  }, v = (m) => {
+    switch (m) {
       case "dist":
-        return t("measure_dist") || "Distance";
+        return e("measure_dist") || "Distance";
       case "angle":
-        return t("measure_angle") || "Angle";
+        return e("measure_angle") || "Angle";
       case "coord":
-        return t("measure_coord") || "Coordinate";
+        return e("measure_coord") || "Coordinate";
       default:
-        return type;
+        return m;
     }
   };
-  return /* @__PURE__ */ jsx(
-    FloatingPanel,
+  return /* @__PURE__ */ t(
+    Ye,
     {
-      title: t("measure_title"),
-      closeLabel: t("panel_close") || "关闭",
-      onClose,
+      title: e("measure_title"),
+      closeLabel: e("panel_close") || "关闭",
+      onClose: c,
       width: 300,
       height: 400,
-      resizable: true,
+      resizable: !0,
       storageId: "tool_measure",
-      children: /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-body", children: [
-        /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-row-between", children: [
-          /* @__PURE__ */ jsxs("div", { className: "ui-segmented ui-measure-types", children: [
-            /* @__PURE__ */ jsx(
+      children: /* @__PURE__ */ l("div", { className: "ui-toolpanel-body", children: [
+        /* @__PURE__ */ l("div", { className: "ui-toolpanel-row-between", children: [
+          /* @__PURE__ */ l("div", { className: "ui-segmented ui-measure-types", children: [
+            /* @__PURE__ */ t(
               "button",
               {
-                className: `ui-segmented-item ${measureType === "none" ? "active" : ""}`,
-                onClick: () => handleTypeChange("none"),
-                children: /* @__PURE__ */ jsx("span", { children: t("measure_none") || "None" })
+                className: `ui-segmented-item ${i === "none" ? "active" : ""}`,
+                onClick: () => y("none"),
+                children: /* @__PURE__ */ t("span", { children: e("measure_none") || "None" })
               }
             ),
-            /* @__PURE__ */ jsx(
+            /* @__PURE__ */ t(
               "button",
               {
-                className: `ui-segmented-item ${measureType === "dist" ? "active" : ""}`,
-                onClick: () => handleTypeChange("dist"),
-                children: /* @__PURE__ */ jsx("span", { children: t("measure_dist") || "Distance" })
+                className: `ui-segmented-item ${i === "dist" ? "active" : ""}`,
+                onClick: () => y("dist"),
+                children: /* @__PURE__ */ t("span", { children: e("measure_dist") || "Distance" })
               }
             ),
-            /* @__PURE__ */ jsx(
+            /* @__PURE__ */ t(
               "button",
               {
-                className: `ui-segmented-item ${measureType === "angle" ? "active" : ""}`,
-                onClick: () => handleTypeChange("angle"),
-                children: /* @__PURE__ */ jsx("span", { children: t("measure_angle") || "Angle" })
+                className: `ui-segmented-item ${i === "angle" ? "active" : ""}`,
+                onClick: () => y("angle"),
+                children: /* @__PURE__ */ t("span", { children: e("measure_angle") || "Angle" })
               }
             ),
-            /* @__PURE__ */ jsx(
+            /* @__PURE__ */ t(
               "button",
               {
-                className: `ui-segmented-item ${measureType === "coord" ? "active" : ""}`,
-                onClick: () => handleTypeChange("coord"),
-                children: /* @__PURE__ */ jsx("span", { children: t("measure_coord") || "Coord" })
+                className: `ui-segmented-item ${i === "coord" ? "active" : ""}`,
+                onClick: () => y("coord"),
+                children: /* @__PURE__ */ t("span", { children: e("measure_coord") || "Coord" })
               }
             )
           ] }),
-          /* @__PURE__ */ jsx(ClearButton, { onClick: onClear, disabled: measureHistory.length === 0 })
+          /* @__PURE__ */ t(oa, { onClick: h, disabled: r.length === 0 })
         ] }),
-        /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-row-between ui-toolpanel-caption", children: [
-          /* @__PURE__ */ jsx("span", { children: getInstructionText() }),
-          measureType !== "none" && /* @__PURE__ */ jsx("span", { className: "ui-toolpanel-caption-muted", children: "[ESC] Exit" })
+        /* @__PURE__ */ l("div", { className: "ui-toolpanel-row-between ui-toolpanel-caption", children: [
+          /* @__PURE__ */ t("span", { children: f() }),
+          i !== "none" && /* @__PURE__ */ t("span", { className: "ui-toolpanel-caption-muted", children: "[ESC] Exit" })
         ] }),
-        /* @__PURE__ */ jsx(DataPanel, { empty: measureHistory.length === 0, emptyText: t("no_measurements") || "No measurements", children: measureHistory.length > 0 && /* @__PURE__ */ jsx("div", { className: "ui-measure-results-scroll", children: Object.entries(groupedHistory).map(([type, items]) => {
-          if (items.length === 0) return null;
-          return /* @__PURE__ */ jsxs("div", { children: [
-            /* @__PURE__ */ jsx(TypeHeader, { label: getTypeLabel(type) }),
-            items.map((item) => /* @__PURE__ */ jsx(
-              MeasureItem,
-              {
-                item,
-                isHighlighted: highlightedId === item.id,
-                onHighlight: () => onHighlight?.(item.id),
-                onDelete: () => onDelete(item.id)
-              },
-              item.id
-            ))
-          ] }, type);
-        }) }) })
+        /* @__PURE__ */ t(sa, { empty: r.length === 0, emptyText: e("no_measurements") || "No measurements", children: r.length > 0 && /* @__PURE__ */ t("div", { className: "ui-measure-results-scroll", children: Object.entries(d).map(([m, _]) => _.length === 0 ? null : /* @__PURE__ */ l("div", { children: [
+          /* @__PURE__ */ t(ca, { label: v(m) }),
+          _.map((o) => /* @__PURE__ */ t(
+            la,
+            {
+              item: o,
+              isHighlighted: u === o.id,
+              onHighlight: () => p?.(o.id),
+              onDelete: () => s(o.id)
+            },
+            o.id
+          ))
+        ] }, m)) }) })
       ] })
     }
   );
-};
-
-const AxisSliderRow = ({ axis, label, active, value, onToggle, onChange, disabled = false }) => {
-  return /* @__PURE__ */ jsxs(
-    "div",
-    {
-      className: `ui-clip-axis-row${disabled ? " ui-is-disabled" : ""}`,
-      children: [
-        /* @__PURE__ */ jsx(
-          Checkbox,
-          {
-            checked: active,
-            onChange: (e) => onToggle(e),
-            style: {
-              width: "16px",
-              height: "16px",
-              cursor: "pointer",
-              flexShrink: 0
-            }
+}, Qt = ({ axis: e, label: n, active: i, value: a, onToggle: r, onChange: s, disabled: h = !1 }) => /* @__PURE__ */ l(
+  "div",
+  {
+    className: `ui-clip-axis-row${h ? " ui-is-disabled" : ""}`,
+    children: [
+      /* @__PURE__ */ t(
+        Xe,
+        {
+          checked: i,
+          onChange: (c) => r(c),
+          style: {
+            width: "16px",
+            height: "16px",
+            cursor: "pointer",
+            flexShrink: 0
           }
-        ),
-        /* @__PURE__ */ jsx(
-          "span",
-          {
-            className: `ui-clip-axis-label${active ? " is-active" : ""}`,
-            children: axis.toUpperCase()
-          }
-        ),
-        /* @__PURE__ */ jsx("div", { className: "ui-inline-actions-stretch", children: /* @__PURE__ */ jsx(
-          DualSlider,
-          {
-            min: 0,
-            max: 100,
-            value,
-            onChange,
-            disabled: disabled || !active
-          }
-        ) }),
-        /* @__PURE__ */ jsxs(
-          "span",
-          {
-            className: "ui-clip-axis-value",
-            children: [
-              String(Math.round(value[0])).padStart(2, "0"),
-              "-",
-              String(Math.round(value[1])).padStart(2, "0"),
-              "%"
-            ]
-          }
-        )
-      ]
-    }
-  );
-};
-const ClipPanel = ({
-  t,
-  onClose,
-  clipEnabled,
-  setClipEnabled,
-  clipValues,
-  setClipValues,
-  clipActive,
-  setClipActive,
-  clipHelperVisible,
-  setClipHelperVisible,
-  clipHelperOpacity,
-  setClipHelperOpacity
+        }
+      ),
+      /* @__PURE__ */ t(
+        "span",
+        {
+          className: `ui-clip-axis-label${i ? " is-active" : ""}`,
+          children: e.toUpperCase()
+        }
+      ),
+      /* @__PURE__ */ t("div", { className: "ui-inline-actions-stretch", children: /* @__PURE__ */ t(
+        Jr,
+        {
+          min: 0,
+          max: 100,
+          value: a,
+          onChange: s,
+          disabled: h || !i
+        }
+      ) }),
+      /* @__PURE__ */ l(
+        "span",
+        {
+          className: "ui-clip-axis-value",
+          children: [
+            String(Math.round(a[0])).padStart(2, "0"),
+            "-",
+            String(Math.round(a[1])).padStart(2, "0"),
+            "%"
+          ]
+        }
+      )
+    ]
+  }
+), da = ({
+  t: e,
+  onClose: n,
+  clipEnabled: i,
+  setClipEnabled: a,
+  clipValues: r,
+  setClipValues: s,
+  clipActive: h,
+  setClipActive: c,
+  clipHelperVisible: u,
+  setClipHelperVisible: p,
+  clipHelperOpacity: d,
+  setClipHelperOpacity: y
 }) => {
-  const handleReset = () => {
-    setClipValues({ x: [0, 100], y: [0, 100], z: [0, 100] });
+  const f = () => {
+    s({ x: [0, 100], y: [0, 100], z: [0, 100] });
   };
-  return /* @__PURE__ */ jsx(
-    FloatingPanel,
+  return /* @__PURE__ */ t(
+    Ye,
     {
-      title: t("clip_title"),
-      closeLabel: t("panel_close") || "关闭",
-      onClose,
+      title: e("clip_title"),
+      closeLabel: e("panel_close") || "关闭",
+      onClose: n,
       width: 320,
       height: 420,
-      resizable: false,
+      resizable: !1,
       storageId: "tool_clip",
-      children: /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-body", children: [
-        /* @__PURE__ */ jsxs("div", { className: "ui-panel-section", children: [
-          /* @__PURE__ */ jsxs("div", { className: "ui-form-row", children: [
-            /* @__PURE__ */ jsx("span", { className: "ui-form-label", children: t("clip_enable") }),
-            /* @__PURE__ */ jsx("div", { className: "ui-form-value", children: /* @__PURE__ */ jsx(Switch, { checked: clipEnabled, onChange: (v) => setClipEnabled(v) }) })
+      children: /* @__PURE__ */ l("div", { className: "ui-toolpanel-body", children: [
+        /* @__PURE__ */ l("div", { className: "ui-panel-section", children: [
+          /* @__PURE__ */ l("div", { className: "ui-form-row", children: [
+            /* @__PURE__ */ t("span", { className: "ui-form-label", children: e("clip_enable") }),
+            /* @__PURE__ */ t("div", { className: "ui-form-value", children: /* @__PURE__ */ t(gt, { checked: i, onChange: (v) => a(v) }) })
           ] }),
-          /* @__PURE__ */ jsxs("div", { className: "ui-form-row", children: [
-            /* @__PURE__ */ jsx("span", { className: "ui-form-label", children: t("clip_helper_visible") }),
-            /* @__PURE__ */ jsx("div", { className: "ui-form-value", children: /* @__PURE__ */ jsx(
-              Switch,
+          /* @__PURE__ */ l("div", { className: "ui-form-row", children: [
+            /* @__PURE__ */ t("span", { className: "ui-form-label", children: e("clip_helper_visible") }),
+            /* @__PURE__ */ t("div", { className: "ui-form-value", children: /* @__PURE__ */ t(
+              gt,
               {
-                checked: clipHelperVisible,
-                onChange: (v) => setClipHelperVisible(v),
-                disabled: !clipEnabled
+                checked: u,
+                onChange: (v) => p(v),
+                disabled: !i
               }
             ) })
           ] }),
-          /* @__PURE__ */ jsxs("div", { className: "ui-form-row", children: [
-            /* @__PURE__ */ jsx("span", { className: "ui-form-label", children: t("clip_helper_opacity") }),
-            /* @__PURE__ */ jsx("div", { className: "ui-form-value ui-form-value-stretch", children: /* @__PURE__ */ jsxs("div", { className: "ui-slider-field", children: [
-              /* @__PURE__ */ jsx(
-                Slider,
+          /* @__PURE__ */ l("div", { className: "ui-form-row", children: [
+            /* @__PURE__ */ t("span", { className: "ui-form-label", children: e("clip_helper_opacity") }),
+            /* @__PURE__ */ t("div", { className: "ui-form-value ui-form-value-stretch", children: /* @__PURE__ */ l("div", { className: "ui-slider-field", children: [
+              /* @__PURE__ */ t(
+                mt,
                 {
                   min: 0.05,
                   max: 0.35,
                   step: 0.01,
-                  value: clipHelperOpacity,
-                  onChange: (value) => setClipHelperOpacity(value),
-                  disabled: !clipEnabled || !clipHelperVisible
+                  value: d,
+                  onChange: (v) => y(v),
+                  disabled: !i || !u
                 }
               ),
-              /* @__PURE__ */ jsxs("span", { className: "ui-slider-value", children: [
-                Math.round(clipHelperOpacity * 100),
+              /* @__PURE__ */ l("span", { className: "ui-slider-value", children: [
+                Math.round(d * 100),
                 "%"
               ] })
             ] }) })
           ] })
         ] }),
-        /* @__PURE__ */ jsxs(
+        /* @__PURE__ */ l(
           "div",
           {
-            className: `ui-panel-section ui-panel-section-fill${clipEnabled ? "" : " ui-is-disabled"}`,
+            className: `ui-panel-section ui-panel-section-fill${i ? "" : " ui-is-disabled"}`,
             children: [
-              /* @__PURE__ */ jsx(
-                AxisSliderRow,
+              /* @__PURE__ */ t(
+                Qt,
                 {
                   axis: "x",
-                  label: t("clip_x"),
-                  active: clipActive.x,
-                  value: clipValues.x,
-                  onToggle: (v) => setClipActive({ ...clipActive, x: v }),
-                  onChange: (val) => setClipValues({ ...clipValues, x: val }),
-                  disabled: !clipEnabled
+                  label: e("clip_x"),
+                  active: h.x,
+                  value: r.x,
+                  onToggle: (v) => c({ ...h, x: v }),
+                  onChange: (v) => s({ ...r, x: v }),
+                  disabled: !i
                 }
               ),
-              /* @__PURE__ */ jsx(
-                AxisSliderRow,
+              /* @__PURE__ */ t(
+                Qt,
                 {
                   axis: "y",
-                  label: t("clip_y"),
-                  active: clipActive.y,
-                  value: clipValues.y,
-                  onToggle: (v) => setClipActive({ ...clipActive, y: v }),
-                  onChange: (val) => setClipValues({ ...clipValues, y: val }),
-                  disabled: !clipEnabled
+                  label: e("clip_y"),
+                  active: h.y,
+                  value: r.y,
+                  onToggle: (v) => c({ ...h, y: v }),
+                  onChange: (v) => s({ ...r, y: v }),
+                  disabled: !i
                 }
               ),
-              /* @__PURE__ */ jsx(
-                AxisSliderRow,
+              /* @__PURE__ */ t(
+                Qt,
                 {
                   axis: "z",
-                  label: t("clip_z"),
-                  active: clipActive.z,
-                  value: clipValues.z,
-                  onToggle: (v) => setClipActive({ ...clipActive, z: v }),
-                  onChange: (val) => setClipValues({ ...clipValues, z: val }),
-                  disabled: !clipEnabled
+                  label: e("clip_z"),
+                  active: h.z,
+                  value: r.z,
+                  onToggle: (v) => c({ ...h, z: v }),
+                  onChange: (v) => s({ ...r, z: v }),
+                  disabled: !i
                 }
               )
             ]
           }
         ),
-        /* @__PURE__ */ jsx("div", { className: "ui-panel-footer", children: /* @__PURE__ */ jsx(Button, { variant: "default", onClick: handleReset, disabled: !clipEnabled, children: t("clip_reset") || "重置范围" }) })
+        /* @__PURE__ */ t("div", { className: "ui-panel-footer", children: /* @__PURE__ */ t(Ee, { variant: "default", onClick: f, disabled: !i, children: e("clip_reset") || "重置范围" }) })
       ] })
     }
   );
-};
-
-const ExportPanel = ({ t, onClose, onExport, getDefaultFileName, theme }) => {
-  const [format, setFormat] = useState("glb");
-  const [fileName, setFileName] = useState(() => getDefaultFileName("glb"));
-  useEffect(() => {
-    setFileName(getDefaultFileName(format));
-  }, [format, getDefaultFileName]);
-  return /* @__PURE__ */ jsx(FloatingPanel, { title: t("export_title"), closeLabel: t("panel_close") || "关闭", onClose, width: 320, height: 520, resizable: false, theme, storageId: "tool_export", children: /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-body", children: [
-    /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-caption", children: [
-      t("export_format"),
+}, ha = ({ t: e, onClose: n, onExport: i, getDefaultFileName: a, theme: r }) => {
+  const [s, h] = O("glb"), [c, u] = O(() => a("glb"));
+  return q(() => {
+    u(a(s));
+  }, [s, a]), /* @__PURE__ */ t(Ye, { title: e("export_title"), closeLabel: e("panel_close") || "关闭", onClose: n, width: 320, height: 520, resizable: !1, theme: r, storageId: "tool_export", children: /* @__PURE__ */ l("div", { className: "ui-toolpanel-body", children: [
+    /* @__PURE__ */ l("div", { className: "ui-toolpanel-caption", children: [
+      e("export_format"),
       ":"
     ] }),
     [
-      { id: "glb", label: "GLB", desc: t("export_glb") },
-      { id: "lmb", label: "LMB", desc: t("export_lmb") },
-      { id: "nbim", label: "NBIM", desc: t("export_nbim") }
-    ].map((opt) => /* @__PURE__ */ jsxs("label", { className: `ui-choice-card ${format === opt.id ? "active" : ""}`, children: [
-      /* @__PURE__ */ jsx(
+      { id: "glb", label: "GLB", desc: e("export_glb") },
+      { id: "lmb", label: "LMB", desc: e("export_lmb") },
+      { id: "nbim", label: "NBIM", desc: e("export_nbim") }
+    ].map((p) => /* @__PURE__ */ l("label", { className: `ui-choice-card ${s === p.id ? "active" : ""}`, children: [
+      /* @__PURE__ */ t(
         "input",
         {
           type: "radio",
           name: "exportFmt",
-          checked: format === opt.id,
-          onChange: () => setFormat(opt.id),
+          checked: s === p.id,
+          onChange: () => h(p.id),
           className: "ui-choice-card-radio"
         }
       ),
-      /* @__PURE__ */ jsxs("div", { className: "ui-choice-card-content", children: [
-        /* @__PURE__ */ jsx("div", { className: "ui-choice-card-title", children: opt.label }),
-        /* @__PURE__ */ jsx("div", { className: "ui-choice-card-desc", children: opt.desc })
+      /* @__PURE__ */ l("div", { className: "ui-choice-card-content", children: [
+        /* @__PURE__ */ t("div", { className: "ui-choice-card-title", children: p.label }),
+        /* @__PURE__ */ t("div", { className: "ui-choice-card-desc", children: p.desc })
       ] })
-    ] }, opt.id)),
-    /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-spaced", children: [
-      t("export_filename") || "文件名",
+    ] }, p.id)),
+    /* @__PURE__ */ l("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-spaced", children: [
+      e("export_filename") || "文件名",
       ":"
     ] }),
-    /* @__PURE__ */ jsx(
+    /* @__PURE__ */ t(
       "input",
       {
         type: "text",
-        value: fileName,
-        onChange: (e) => setFileName(e.target.value),
-        placeholder: t("export_filename_placeholder") || "请输入文件名",
+        value: c,
+        onChange: (p) => u(p.target.value),
+        placeholder: e("export_filename_placeholder") || "请输入文件名",
         className: "ui-input ui-input-compact"
       }
     ),
-    /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-muted", children: t("export_filename_hint") || "留空时自动按模型名生成" }),
-    /* @__PURE__ */ jsx(
-      Button,
+    /* @__PURE__ */ t("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-muted", children: e("export_filename_hint") || "留空时自动按模型名生成" }),
+    /* @__PURE__ */ t(
+      Ee,
       {
-        theme,
-        onClick: () => onExport(format, fileName),
+        theme: r,
+        onClick: () => i(s, c),
         className: "ui-toolpanel-submit",
-        children: t("export_btn")
+        children: e("export_btn")
       }
     )
   ] }) });
-};
-
-const ScreenshotPanel = ({ t, onClose, onCapture, theme }) => {
-  const [mode, setMode] = useState("scene");
-  const options = [
+}, pa = ({ t: e, onClose: n, onCapture: i, theme: a }) => {
+  const [r, s] = O("scene"), h = [
     {
       id: "scene",
-      label: t("op_screenshot") || "场景截图",
-      desc: t("screenshot_scene_desc") || "保留当前背景色和界面里的场景效果"
+      label: e("op_screenshot") || "场景截图",
+      desc: e("screenshot_scene_desc") || "保留当前背景色和界面里的场景效果"
     },
     {
       id: "transparent",
-      label: t("op_screenshot_transparent") || "透明背景截图",
-      desc: t("screenshot_transparent_desc") || "导出透明背景 PNG，便于汇报和排版"
+      label: e("op_screenshot_transparent") || "透明背景截图",
+      desc: e("screenshot_transparent_desc") || "导出透明背景 PNG，便于汇报和排版"
     }
   ];
-  return /* @__PURE__ */ jsx(
-    FloatingPanel,
+  return /* @__PURE__ */ t(
+    Ye,
     {
-      title: t("op_screenshot") || "场景截图",
-      closeLabel: t("panel_close") || "关闭",
-      onClose,
+      title: e("op_screenshot") || "场景截图",
+      closeLabel: e("panel_close") || "关闭",
+      onClose: n,
       width: 320,
       height: 340,
-      resizable: false,
-      theme,
+      resizable: !1,
+      theme: a,
       storageId: "tool_screenshot",
-      children: /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-body", children: [
-        /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-caption", children: [
-          t("screenshot_mode") || "截图方式",
+      children: /* @__PURE__ */ l("div", { className: "ui-toolpanel-body", children: [
+        /* @__PURE__ */ l("div", { className: "ui-toolpanel-caption", children: [
+          e("screenshot_mode") || "截图方式",
           ":"
         ] }),
-        options.map((opt) => /* @__PURE__ */ jsxs("label", { className: `ui-choice-card ${mode === opt.id ? "active" : ""}`, children: [
-          /* @__PURE__ */ jsx(
+        h.map((c) => /* @__PURE__ */ l("label", { className: `ui-choice-card ${r === c.id ? "active" : ""}`, children: [
+          /* @__PURE__ */ t(
             "input",
             {
               type: "radio",
               name: "screenshotMode",
-              checked: mode === opt.id,
-              onChange: () => setMode(opt.id),
+              checked: r === c.id,
+              onChange: () => s(c.id),
               className: "ui-choice-card-radio"
             }
           ),
-          /* @__PURE__ */ jsxs("div", { className: "ui-choice-card-content", children: [
-            /* @__PURE__ */ jsx("div", { className: "ui-choice-card-title", children: opt.label }),
-            /* @__PURE__ */ jsx("div", { className: "ui-choice-card-desc", children: opt.desc })
+          /* @__PURE__ */ l("div", { className: "ui-choice-card-content", children: [
+            /* @__PURE__ */ t("div", { className: "ui-choice-card-title", children: c.label }),
+            /* @__PURE__ */ t("div", { className: "ui-choice-card-desc", children: c.desc })
           ] })
-        ] }, opt.id)),
-        /* @__PURE__ */ jsx(
-          Button,
+        ] }, c.id)),
+        /* @__PURE__ */ t(
+          Ee,
           {
-            theme,
-            onClick: () => onCapture(mode),
+            theme: a,
+            onClick: () => i(r),
             className: "ui-toolpanel-submit",
-            children: t("btn_confirm") || "确定"
+            children: e("btn_confirm") || "确定"
           }
         )
       ] })
     }
   );
-};
-
-const DEFAULT_SAVE_OPTIONS = {
-  visibility: true,
-  selection: true,
-  clip: true,
-  explode: true
-};
-const ViewpointPanel = ({
-  t,
-  onClose,
-  viewpoints,
-  onSave,
-  onUpdateName,
-  onLoad,
-  onDelete,
-  theme
+}, ma = {
+  visibility: !0,
+  selection: !0,
+  clip: !0,
+  explode: !0
+}, fa = ({
+  t: e,
+  onClose: n,
+  viewpoints: i,
+  onSave: a,
+  onUpdateName: r,
+  onLoad: s,
+  onDelete: h,
+  theme: c
 }) => {
-  const [newName, setNewName] = useState("");
-  const [editingNames, setEditingNames] = useState({});
-  const [saveOptions, setSaveOptions] = useState(DEFAULT_SAVE_OPTIONS);
-  useEffect(() => {
-    setNewName(`${t("viewpoint_title") || "视点"} ${viewpoints.length + 1}`);
-  }, [viewpoints.length, t]);
-  useEffect(() => {
-    setEditingNames(
-      viewpoints.reduce((acc, vp) => {
-        acc[vp.id] = vp.name;
-        return acc;
-      }, {})
+  const [u, p] = O(""), [d, y] = O({}), [f, v] = O(ma);
+  q(() => {
+    p(`${e("viewpoint_title") || "视点"} ${i.length + 1}`);
+  }, [i.length, e]), q(() => {
+    y(
+      i.reduce((o, b) => (o[b.id] = b.name, o), {})
     );
-  }, [viewpoints]);
-  const handleSave = () => {
-    const normalized = newName.trim();
-    if (!normalized) return;
-    onSave(normalized, saveOptions);
-    setNewName(`${t("viewpoint_title") || "视点"} ${viewpoints.length + 1}`);
-  };
-  const handleRenameCommit = (id) => {
-    const nextName = (editingNames[id] || "").trim();
-    if (!nextName) {
-      setEditingNames((prev) => ({
-        ...prev,
-        [id]: viewpoints.find((vp) => vp.id === id)?.name || ""
+  }, [i]);
+  const m = () => {
+    const o = u.trim();
+    o && (a(o, f), p(`${e("viewpoint_title") || "视点"} ${i.length + 1}`));
+  }, _ = (o) => {
+    const b = (d[o] || "").trim();
+    if (!b) {
+      y((k) => ({
+        ...k,
+        [o]: i.find((g) => g.id === o)?.name || ""
       }));
       return;
     }
-    onUpdateName(id, nextName);
+    r(o, b);
   };
-  return /* @__PURE__ */ jsx(
-    FloatingPanel,
+  return /* @__PURE__ */ t(
+    Ye,
     {
-      title: t("viewpoint_title") || "视点管理",
-      closeLabel: t("panel_close") || "关闭",
-      onClose,
+      title: e("viewpoint_title") || "视点管理",
+      closeLabel: e("panel_close") || "关闭",
+      onClose: n,
       width: 320,
       height: 470,
-      resizable: true,
-      theme,
+      resizable: !0,
+      theme: c,
       storageId: "tool_viewpoint",
-      children: /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-body ui-toolpanel-body-dense", children: [
-        /* @__PURE__ */ jsxs("div", { className: "ui-inline-actions", children: [
-          /* @__PURE__ */ jsx(
+      children: /* @__PURE__ */ l("div", { className: "ui-toolpanel-body ui-toolpanel-body-dense", children: [
+        /* @__PURE__ */ l("div", { className: "ui-inline-actions", children: [
+          /* @__PURE__ */ t(
             "input",
             {
-              autoFocus: true,
-              value: newName,
-              onChange: (e) => setNewName(e.target.value),
-              onKeyDown: (e) => {
-                if (e.key === "Enter") handleSave();
+              autoFocus: !0,
+              value: u,
+              onChange: (o) => p(o.target.value),
+              onKeyDown: (o) => {
+                o.key === "Enter" && m();
               },
               className: "ui-input",
-              placeholder: t("viewpoint_title") || "视点名称"
+              placeholder: e("viewpoint_title") || "视点名称"
             }
           ),
-          /* @__PURE__ */ jsx(Button, { variant: "primary", onClick: handleSave, children: t("btn_confirm") || "保存" })
+          /* @__PURE__ */ t(Ee, { variant: "primary", onClick: m, children: e("btn_confirm") || "保存" })
         ] }),
-        /* @__PURE__ */ jsxs("div", { className: "ui-viewpoint-options", children: [
-          /* @__PURE__ */ jsx(
-            Checkbox,
+        /* @__PURE__ */ l("div", { className: "ui-viewpoint-options", children: [
+          /* @__PURE__ */ t(
+            Xe,
             {
-              label: t("viewpoint_save_visibility") || "保存可见性",
-              checked: saveOptions.visibility,
-              onChange: (checked) => setSaveOptions((prev) => ({ ...prev, visibility: checked }))
+              label: e("viewpoint_save_visibility") || "保存可见性",
+              checked: f.visibility,
+              onChange: (o) => v((b) => ({ ...b, visibility: o }))
             }
           ),
-          /* @__PURE__ */ jsx(
-            Checkbox,
+          /* @__PURE__ */ t(
+            Xe,
             {
-              label: t("viewpoint_save_selection") || "保存选择",
-              checked: saveOptions.selection,
-              onChange: (checked) => setSaveOptions((prev) => ({ ...prev, selection: checked }))
+              label: e("viewpoint_save_selection") || "保存选择",
+              checked: f.selection,
+              onChange: (o) => v((b) => ({ ...b, selection: o }))
             }
           ),
-          /* @__PURE__ */ jsx(
-            Checkbox,
+          /* @__PURE__ */ t(
+            Xe,
             {
-              label: t("viewpoint_save_clip") || "保存剖切",
-              checked: saveOptions.clip,
-              onChange: (checked) => setSaveOptions((prev) => ({ ...prev, clip: checked }))
+              label: e("viewpoint_save_clip") || "保存剖切",
+              checked: f.clip,
+              onChange: (o) => v((b) => ({ ...b, clip: o }))
             }
           ),
-          /* @__PURE__ */ jsx(
-            Checkbox,
+          /* @__PURE__ */ t(
+            Xe,
             {
-              label: t("viewpoint_save_explode") || "保存爆炸图",
-              checked: saveOptions.explode,
-              onChange: (checked) => setSaveOptions((prev) => ({ ...prev, explode: checked }))
+              label: e("viewpoint_save_explode") || "保存爆炸图",
+              checked: f.explode,
+              onChange: (o) => v((b) => ({ ...b, explode: o }))
             }
           )
         ] }),
-        /* @__PURE__ */ jsx("div", { className: "ui-viewpoint-list-wrap", children: viewpoints.length === 0 ? /* @__PURE__ */ jsx("div", { className: "ui-empty-state", children: t("viewpoint_empty") || "暂无保存的视点" }) : /* @__PURE__ */ jsx("div", { className: "ui-viewpoint-grid", children: viewpoints.map((vp) => /* @__PURE__ */ jsxs("div", { className: "ui-viewpoint-card-v2", children: [
-          /* @__PURE__ */ jsxs(
+        /* @__PURE__ */ t("div", { className: "ui-viewpoint-list-wrap", children: i.length === 0 ? /* @__PURE__ */ t("div", { className: "ui-empty-state", children: e("viewpoint_empty") || "暂无保存的视点" }) : /* @__PURE__ */ t("div", { className: "ui-viewpoint-grid", children: i.map((o) => /* @__PURE__ */ l("div", { className: "ui-viewpoint-card-v2", children: [
+          /* @__PURE__ */ l(
             "div",
             {
               className: "ui-viewpoint-image",
-              onDoubleClick: () => onLoad(vp),
-              title: t("viewpoint_load") || "双击恢复视点",
+              onDoubleClick: () => s(o),
+              title: e("viewpoint_load") || "双击恢复视点",
               children: [
-                vp.image ? /* @__PURE__ */ jsx(
+                o.image ? /* @__PURE__ */ t(
                   "img",
                   {
-                    src: vp.image,
-                    alt: vp.name
+                    src: o.image,
+                    alt: o.name
                   }
-                ) : /* @__PURE__ */ jsx("div", { className: "ui-viewpoint-no-preview", children: t("viewpoint_no_preview") || "无预览" }),
-                /* @__PURE__ */ jsx(
+                ) : /* @__PURE__ */ t("div", { className: "ui-viewpoint-no-preview", children: e("viewpoint_no_preview") || "无预览" }),
+                /* @__PURE__ */ t(
                   "button",
                   {
                     className: "ui-viewpoint-delete",
-                    onClick: (e) => {
-                      e.stopPropagation();
-                      onDelete(vp.id);
+                    onClick: (b) => {
+                      b.stopPropagation(), h(o.id);
                     },
-                    title: t("delete_item") || "删除",
-                    children: /* @__PURE__ */ jsx(IconTrash2, { size: 12 })
+                    title: e("delete_item") || "删除",
+                    children: /* @__PURE__ */ t(Sr, { size: 12 })
                   }
                 )
               ]
             }
           ),
-          /* @__PURE__ */ jsx(
+          /* @__PURE__ */ t(
             "input",
             {
               className: "ui-viewpoint-name",
-              value: editingNames[vp.id] || "",
-              onChange: (e) => setEditingNames((prev) => ({
-                ...prev,
-                [vp.id]: e.target.value
+              value: d[o.id] || "",
+              onChange: (b) => y((k) => ({
+                ...k,
+                [o.id]: b.target.value
               })),
-              onBlur: () => handleRenameCommit(vp.id),
-              onKeyDown: (e) => {
-                if (e.key === "Enter") {
-                  e.currentTarget.blur();
-                }
+              onBlur: () => _(o.id),
+              onKeyDown: (b) => {
+                b.key === "Enter" && b.currentTarget.blur();
               }
             }
           ),
-          /* @__PURE__ */ jsxs("div", { className: "ui-viewpoint-flags", children: [
-            vp.saveOptions?.visibility !== false && /* @__PURE__ */ jsx("span", { children: t("viewpoint_flag_visibility") || "可见性" }),
-            vp.saveOptions?.selection !== false && /* @__PURE__ */ jsx("span", { children: t("viewpoint_flag_selection") || "选择" }),
-            vp.saveOptions?.clip !== false && /* @__PURE__ */ jsx("span", { children: t("viewpoint_flag_clip") || "剖切" }),
-            vp.saveOptions?.explode !== false && /* @__PURE__ */ jsx("span", { children: t("viewpoint_flag_explode") || "爆炸图" })
+          /* @__PURE__ */ l("div", { className: "ui-viewpoint-flags", children: [
+            o.saveOptions?.visibility !== !1 && /* @__PURE__ */ t("span", { children: e("viewpoint_flag_visibility") || "可见性" }),
+            o.saveOptions?.selection !== !1 && /* @__PURE__ */ t("span", { children: e("viewpoint_flag_selection") || "选择" }),
+            o.saveOptions?.clip !== !1 && /* @__PURE__ */ t("span", { children: e("viewpoint_flag_clip") || "剖切" }),
+            o.saveOptions?.explode !== !1 && /* @__PURE__ */ t("span", { children: e("viewpoint_flag_explode") || "爆炸图" })
           ] })
-        ] }, vp.id)) }) })
+        ] }, o.id)) }) })
       ] })
     }
   );
-};
-
-const Row = ({ label, children, stretch = false }) => /* @__PURE__ */ jsxs(
+}, Jt = ({ label: e, children: n, stretch: i = !1 }) => /* @__PURE__ */ l(
   "div",
   {
     className: "ui-form-row ui-form-row-tight",
     children: [
-      /* @__PURE__ */ jsx("span", { className: "ui-form-label", children: label }),
-      /* @__PURE__ */ jsx(
+      /* @__PURE__ */ t("span", { className: "ui-form-label", children: e }),
+      /* @__PURE__ */ t(
         "div",
         {
-          className: `ui-form-value${stretch ? " ui-form-value-stretch ui-form-value-start" : ""}`,
-          children
+          className: `ui-form-value${i ? " ui-form-value-stretch ui-form-value-start" : ""}`,
+          children: n
         }
       )
     ]
   }
-);
-const ExplodePanel = ({
-  t,
-  onClose,
-  enabled,
-  strength,
-  mode,
-  onEnabledChange,
-  onStrengthChange,
-  onModeChange,
-  onReset,
-  theme
-}) => {
-  return /* @__PURE__ */ jsx(
-    FloatingPanel,
-    {
-      title: t("explode_title") || "爆炸图",
-      closeLabel: t("panel_close") || "关闭",
-      onClose,
-      width: 340,
-      storageId: "tool_explode",
-      modal: false,
-      autoHeight: true,
-      theme,
-      children: /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-body ui-toolpanel-body-compact", children: [
-        /* @__PURE__ */ jsx(Row, { label: t("explode_enable") || "启用", children: /* @__PURE__ */ jsx(Switch, { checked: enabled, onChange: onEnabledChange }) }),
-        /* @__PURE__ */ jsx(Row, { label: t("explode_strength") || "强度", stretch: true, children: /* @__PURE__ */ jsxs("div", { className: "ui-slider-field", children: [
-          /* @__PURE__ */ jsx("div", { className: "ui-inline-actions-stretch", children: /* @__PURE__ */ jsx(
-            Slider,
-            {
-              min: 0,
-              max: 100,
-              step: 1,
-              value: strength,
-              onChange: onStrengthChange
-            }
-          ) }),
-          /* @__PURE__ */ jsxs("div", { className: "ui-slider-value ui-slider-value-strong", children: [
-            strength,
-            "%"
-          ] })
-        ] }) }),
-        /* @__PURE__ */ jsx(Row, { label: t("explode_mode") || "方向", stretch: true, children: /* @__PURE__ */ jsx(
-          SegmentedControl,
+), _a = ({
+  t: e,
+  onClose: n,
+  enabled: i,
+  strength: a,
+  mode: r,
+  onEnabledChange: s,
+  onStrengthChange: h,
+  onModeChange: c,
+  onReset: u,
+  theme: p
+}) => /* @__PURE__ */ t(
+  Ye,
+  {
+    title: e("explode_title") || "爆炸图",
+    closeLabel: e("panel_close") || "关闭",
+    onClose: n,
+    width: 340,
+    storageId: "tool_explode",
+    modal: !1,
+    autoHeight: !0,
+    theme: p,
+    children: /* @__PURE__ */ l("div", { className: "ui-toolpanel-body ui-toolpanel-body-compact", children: [
+      /* @__PURE__ */ t(Jt, { label: e("explode_enable") || "启用", children: /* @__PURE__ */ t(gt, { checked: i, onChange: s }) }),
+      /* @__PURE__ */ t(Jt, { label: e("explode_strength") || "强度", stretch: !0, children: /* @__PURE__ */ l("div", { className: "ui-slider-field", children: [
+        /* @__PURE__ */ t("div", { className: "ui-inline-actions-stretch", children: /* @__PURE__ */ t(
+          mt,
           {
-            options: [
-              { value: "radial", label: t("explode_mode_radial") || "四周" },
-              { value: "horizontal", label: t("explode_mode_horizontal") || "横向" },
-              { value: "vertical", label: t("explode_mode_vertical") || "纵向" }
-            ],
-            value: mode,
-            onChange: (value) => onModeChange(value)
+            min: 0,
+            max: 100,
+            step: 1,
+            value: a,
+            onChange: h
           }
         ) }),
-        /* @__PURE__ */ jsx("div", { className: "ui-panel-footer ui-panel-footer-spaced", children: /* @__PURE__ */ jsx(Button, { className: "ui-properties-action", onClick: onReset, children: t("explode_reset") || "重置" }) })
-      ] })
-    }
-  );
-};
-
-const operatorOptions = [
+        /* @__PURE__ */ l("div", { className: "ui-slider-value ui-slider-value-strong", children: [
+          a,
+          "%"
+        ] })
+      ] }) }),
+      /* @__PURE__ */ t(Jt, { label: e("explode_mode") || "方向", stretch: !0, children: /* @__PURE__ */ t(
+        nn,
+        {
+          options: [
+            { value: "radial", label: e("explode_mode_radial") || "四周" },
+            { value: "horizontal", label: e("explode_mode_horizontal") || "横向" },
+            { value: "vertical", label: e("explode_mode_vertical") || "纵向" }
+          ],
+          value: r,
+          onChange: (d) => c(d)
+        }
+      ) }),
+      /* @__PURE__ */ t("div", { className: "ui-panel-footer ui-panel-footer-spaced", children: /* @__PURE__ */ t(Ee, { className: "ui-properties-action", onClick: u, children: e("explode_reset") || "重置" }) })
+    ] })
+  }
+), ga = [
   { value: "equals", labelKey: "search_op_equals", fallback: "等于" },
   { value: "contains", labelKey: "search_op_contains", fallback: "包含" },
   { value: "notContains", labelKey: "search_op_not_contains", fallback: "不包含" },
   { value: "startsWith", labelKey: "search_op_starts_with", fallback: "开头" },
   { value: "endsWith", labelKey: "search_op_ends_with", fallback: "结尾" }
-];
-const connectorOptions = [
+], ya = [
   { value: "AND", labelKey: "search_connector_and", fallback: "且" },
   { value: "OR", labelKey: "search_connector_or", fallback: "或" }
-];
-const SearchPanel = ({
-  t,
-  onClose,
-  conditions,
-  results,
-  searching,
-  searchProgress,
-  searchStatus,
-  onConditionsChange,
-  onSearch,
-  onCancelSearch,
-  onApplyResultHighlight,
-  onClearResult,
-  theme
+], ba = ({
+  t: e,
+  onClose: n,
+  conditions: i,
+  results: a,
+  searching: r,
+  searchProgress: s,
+  searchStatus: h,
+  onConditionsChange: c,
+  onSearch: u,
+  onCancelSearch: p,
+  onApplyResultHighlight: d,
+  onClearResult: y,
+  theme: f
 }) => {
-  const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(50);
-  useEffect(() => {
-    setPage(1);
-  }, [results.length, pageSize]);
-  const totalPages = Math.max(1, Math.ceil(results.length / pageSize));
-  const currentPage = Math.min(page, totalPages);
-  const pageStart = (currentPage - 1) * pageSize;
-  const pageItems = useMemo(() => results.slice(pageStart, pageStart + pageSize), [results, pageStart, pageSize]);
-  const updateCondition = (id, patch) => {
-    onConditionsChange(conditions.map((item) => item.id === id ? { ...item, ...patch } : item));
-  };
-  const addCondition = () => {
-    const nextId = `cond_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
-    onConditionsChange([
-      ...conditions,
+  const [v, m] = O(1), [_, o] = O(50);
+  q(() => {
+    m(1);
+  }, [a.length, _]);
+  const b = Math.max(1, Math.ceil(a.length / _)), k = Math.min(v, b), g = (k - 1) * _, P = Se(() => a.slice(g, g + _), [a, g, _]), R = (C, D) => {
+    c(i.map((N) => N.id === C ? { ...N, ...D } : N));
+  }, S = () => {
+    const C = `cond_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+    c([
+      ...i,
       {
-        id: nextId,
+        id: C,
         propertyName: "",
         operator: "contains",
         value: "",
         connector: "AND"
       }
     ]);
+  }, I = (C) => {
+    const D = i.filter((N) => N.id !== C);
+    c(D.length > 0 ? D : [{ id: "cond_init", propertyName: "", operator: "contains", value: "" }]);
   };
-  const removeCondition = (id) => {
-    const next = conditions.filter((item) => item.id !== id);
-    onConditionsChange(next.length > 0 ? next : [{ id: "cond_init", propertyName: "", operator: "contains", value: "" }]);
-  };
-  return /* @__PURE__ */ jsx(
-    FloatingPanel,
+  return /* @__PURE__ */ t(
+    Ye,
     {
-      title: t("tb_search") || "属性搜索",
-      closeLabel: t("panel_close") || "关闭",
-      onClose,
+      title: e("tb_search") || "属性搜索",
+      closeLabel: e("panel_close") || "关闭",
+      onClose: n,
       width: 420,
       storageId: "tool_search",
-      autoHeight: true,
-      theme,
-      children: /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-body", children: [
-        /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-row-between", children: [
-          /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-caption", children: t("search_conditions") || "搜索条件" }),
-          /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-row", children: [
-            /* @__PURE__ */ jsx(Button, { className: "ui-properties-action", onClick: addCondition, children: t("search_add_condition") || "添加条件" }),
-            /* @__PURE__ */ jsx(Button, { className: "ui-properties-action", onClick: onSearch, disabled: searching, children: searching ? t("searching") || "搜索中..." : t("search_run") || "搜索" })
+      autoHeight: !0,
+      theme: f,
+      children: /* @__PURE__ */ l("div", { className: "ui-toolpanel-body", children: [
+        /* @__PURE__ */ l("div", { className: "ui-toolpanel-row-between", children: [
+          /* @__PURE__ */ t("div", { className: "ui-toolpanel-caption", children: e("search_conditions") || "搜索条件" }),
+          /* @__PURE__ */ l("div", { className: "ui-toolpanel-row", children: [
+            /* @__PURE__ */ t(Ee, { className: "ui-properties-action", onClick: S, children: e("search_add_condition") || "添加条件" }),
+            /* @__PURE__ */ t(Ee, { className: "ui-properties-action", onClick: u, disabled: r, children: r ? e("searching") || "搜索中..." : e("search_run") || "搜索" })
           ] })
         ] }),
-        conditions.map((condition, index) => /* @__PURE__ */ jsxs(
+        i.map((C, D) => /* @__PURE__ */ l(
           "div",
           {
-            className: `ui-toolpanel-grid ui-toolpanel-grid-condition ${index > 0 ? "ui-toolpanel-grid-condition-linked" : "ui-toolpanel-grid-condition-first"}`,
+            className: `ui-toolpanel-grid ui-toolpanel-grid-condition ${D > 0 ? "ui-toolpanel-grid-condition-linked" : "ui-toolpanel-grid-condition-first"}`,
             children: [
-              index > 0 && /* @__PURE__ */ jsx(
-                Select,
+              D > 0 && /* @__PURE__ */ t(
+                Nt,
                 {
-                  value: condition.connector || "AND",
-                  options: connectorOptions.map((item) => ({ value: item.value, label: t(item.labelKey) || item.fallback })),
-                  onChange: (value) => updateCondition(condition.id, { connector: value }),
+                  value: C.connector || "AND",
+                  options: ya.map((N) => ({ value: N.value, label: e(N.labelKey) || N.fallback })),
+                  onChange: (N) => R(C.id, { connector: N }),
                   className: "ui-input-compact",
                   style: { width: "64px", flexShrink: 0 }
                 }
               ),
-              /* @__PURE__ */ jsx(
+              /* @__PURE__ */ t(
                 "input",
                 {
                   className: "ui-input ui-input-compact",
-                  placeholder: t("search_field_name") || "属性名",
-                  value: condition.propertyName,
-                  onChange: (e) => updateCondition(condition.id, { propertyName: e.target.value }),
+                  placeholder: e("search_field_name") || "属性名",
+                  value: C.propertyName,
+                  onChange: (N) => R(C.id, { propertyName: N.target.value }),
                   style: { flex: 1, minWidth: 0 }
                 }
               ),
-              /* @__PURE__ */ jsx(
-                Select,
+              /* @__PURE__ */ t(
+                Nt,
                 {
-                  value: condition.operator,
-                  options: operatorOptions.map((item) => ({ value: item.value, label: t(item.labelKey) || item.fallback })),
-                  onChange: (value) => updateCondition(condition.id, { operator: value }),
+                  value: C.operator,
+                  options: ga.map((N) => ({ value: N.value, label: e(N.labelKey) || N.fallback })),
+                  onChange: (N) => R(C.id, { operator: N }),
                   className: "ui-input-compact",
                   style: { width: "92px" }
                 }
               ),
-              /* @__PURE__ */ jsx(
+              /* @__PURE__ */ t(
                 "input",
                 {
                   className: "ui-input ui-input-compact",
-                  placeholder: t("search_field_value") || "属性值",
-                  value: condition.value,
-                  onChange: (e) => updateCondition(condition.id, { value: e.target.value }),
+                  placeholder: e("search_field_value") || "属性值",
+                  value: C.value,
+                  onChange: (N) => R(C.id, { value: N.target.value }),
                   style: { flex: 1, minWidth: 0 }
                 }
               ),
-              index > 0 ? /* @__PURE__ */ jsx(
+              D > 0 ? /* @__PURE__ */ t(
                 "button",
                 {
                   className: "ui-search-clear ui-search-clear-static",
-                  onClick: () => removeCondition(condition.id),
-                  title: t("remove_condition") || "移除条件",
+                  onClick: () => I(C.id),
+                  title: e("remove_condition") || "移除条件",
                   style: { flexShrink: 0, width: "24px" },
-                  children: /* @__PURE__ */ jsx(IconClose, { width: 14, height: 14 })
+                  children: /* @__PURE__ */ t(ot, { width: 14, height: 14 })
                 }
-              ) : /* @__PURE__ */ jsx("div", { style: { width: "24px", flexShrink: 0 } })
+              ) : /* @__PURE__ */ t("div", { style: { width: "24px", flexShrink: 0 } })
             ]
           },
-          condition.id
+          C.id
         )),
-        /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-row-between ui-toolpanel-caption", children: [
-          /* @__PURE__ */ jsxs("span", { children: [
-            t("search_results") || "搜索结果",
+        /* @__PURE__ */ l("div", { className: "ui-toolpanel-row-between ui-toolpanel-caption", children: [
+          /* @__PURE__ */ l("span", { children: [
+            e("search_results") || "搜索结果",
             ": ",
-            results.length
+            a.length
           ] }),
-          /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-row", children: [
-            /* @__PURE__ */ jsx("span", { children: t("search_page_size") || "每页" }),
-            /* @__PURE__ */ jsx(
-              Select,
+          /* @__PURE__ */ l("div", { className: "ui-toolpanel-row", children: [
+            /* @__PURE__ */ t("span", { children: e("search_page_size") || "每页" }),
+            /* @__PURE__ */ t(
+              Nt,
               {
-                value: String(pageSize),
-                onChange: (value) => setPageSize(Number(value) || 50),
+                value: String(_),
+                onChange: (C) => o(Number(C) || 50),
                 options: [
                   { value: "20", label: "20" },
                   { value: "50", label: "50" },
@@ -10204,298 +3500,283 @@ const SearchPanel = ({
             )
           ] })
         ] }),
-        /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-results-box ui-search-results-box", children: results.length === 0 ? /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-results-empty", children: t("search_no_results") || "暂无结果" }) : pageItems.map((item) => /* @__PURE__ */ jsx(
+        /* @__PURE__ */ t("div", { className: "ui-toolpanel-results-box ui-search-results-box", children: a.length === 0 ? /* @__PURE__ */ t("div", { className: "ui-toolpanel-results-empty", children: e("search_no_results") || "暂无结果" }) : P.map((C) => /* @__PURE__ */ t(
           "div",
           {
             className: "ui-search-result-item ui-search-result-item-simple",
-            title: `${item.uuid}
-${item.matchedBy.join("\n")}`,
-            children: /* @__PURE__ */ jsxs(
+            title: `${C.uuid}
+${C.matchedBy.join(`
+`)}`,
+            children: /* @__PURE__ */ l(
               "button",
               {
                 className: "ui-search-result-main",
-                onClick: () => onApplyResultHighlight(item.uuid),
+                onClick: () => d(C.uuid),
                 children: [
-                  /* @__PURE__ */ jsx("span", { children: item.name || item.uuid }),
-                  /* @__PURE__ */ jsx("span", { className: "ui-result-item-secondary", children: [item.type, item.modelId, ...item.matchedBy].filter(Boolean).join(" · ") })
+                  /* @__PURE__ */ t("span", { children: C.name || C.uuid }),
+                  /* @__PURE__ */ t("span", { className: "ui-result-item-secondary", children: [C.type, C.modelId, ...C.matchedBy].filter(Boolean).join(" · ") })
                 ]
               }
             )
           },
-          item.uuid
+          C.uuid
         )) }),
-        results.length > 0 && /* @__PURE__ */ jsx(
-          PaginationControls,
+        a.length > 0 && /* @__PURE__ */ t(
+          Mn,
           {
-            prevTitle: t("search_page_prev") || "上一页",
-            nextTitle: t("search_page_next") || "下一页",
-            currentPage,
-            totalPages,
-            onPrev: () => setPage((prev) => Math.max(1, prev - 1)),
-            onNext: () => setPage((prev) => Math.min(totalPages, prev + 1)),
-            rightContent: /* @__PURE__ */ jsx(Button, { className: "ui-properties-action", onClick: onClearResult, children: t("search_clear") || "清除结果" })
+            prevTitle: e("search_page_prev") || "上一页",
+            nextTitle: e("search_page_next") || "下一页",
+            currentPage: k,
+            totalPages: b,
+            onPrev: () => m((C) => Math.max(1, C - 1)),
+            onNext: () => m((C) => Math.min(b, C + 1)),
+            rightContent: /* @__PURE__ */ t(Ee, { className: "ui-properties-action", onClick: y, children: e("search_clear") || "清除结果" })
           }
         ),
-        searching && /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-overlay", children: /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-overlay-card", children: [
-          /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-overlay-title", children: searchStatus || (t("searching") || "搜索中...") }),
-          /* @__PURE__ */ jsx("div", { className: "ui-progress-bar ui-progress-bar-full", children: /* @__PURE__ */ jsx("div", { className: "ui-progress-fill", style: { width: `${Math.max(0, Math.min(100, searchProgress))}%` } }) }),
-          /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-row-between ui-toolpanel-caption ui-toolpanel-caption-spaced", children: [
-            /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-muted", children: [
-              Math.round(searchProgress),
+        r && /* @__PURE__ */ t("div", { className: "ui-toolpanel-overlay", children: /* @__PURE__ */ l("div", { className: "ui-toolpanel-overlay-card", children: [
+          /* @__PURE__ */ t("div", { className: "ui-toolpanel-overlay-title", children: h || e("searching") || "搜索中..." }),
+          /* @__PURE__ */ t("div", { className: "ui-progress-bar ui-progress-bar-full", children: /* @__PURE__ */ t("div", { className: "ui-progress-fill", style: { width: `${Math.max(0, Math.min(100, s))}%` } }) }),
+          /* @__PURE__ */ l("div", { className: "ui-toolpanel-row-between ui-toolpanel-caption ui-toolpanel-caption-spaced", children: [
+            /* @__PURE__ */ l("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-muted", children: [
+              Math.round(s),
               "%"
             ] }),
-            /* @__PURE__ */ jsx(Button, { className: "ui-properties-action", onClick: onCancelSearch, children: t("search_cancel") || "取消搜索" })
+            /* @__PURE__ */ t(Ee, { className: "ui-properties-action", onClick: p, children: e("search_cancel") || "取消搜索" })
           ] })
         ] }) })
       ] })
     }
   );
-};
-
-const ClashPanel = ({
-  t,
-  onClose,
-  running,
-  progress,
-  status,
-  scannedCount,
-  pairsScanned,
-  results,
-  resultFilter,
-  modelOptions,
-  setA,
-  setB,
-  tolerance,
-  minOverlapVolume,
-  clearanceDistance,
-  useNarrowPhase,
-  useTrianglePhase,
-  includeSameModel,
-  onSetAChange,
-  onSetBChange,
-  onToleranceChange,
-  onMinOverlapVolumeChange,
-  onClearanceDistanceChange,
-  onUseNarrowPhaseChange,
-  onUseTrianglePhaseChange,
-  onIncludeSameModelChange,
-  onRun,
-  onCancel,
-  onClear,
-  onExportCsv,
-  onIsolateByStatus,
-  onRestoreVisibility,
-  onResultFilterChange,
-  typeFilter,
-  onTypeFilterChange,
-  onUpdateResultStatus,
-  onMarkFilteredStatus,
-  onSetASelectAll,
-  onSetAClear,
-  onSetBSelectAll,
-  onSetBClear,
-  onFocusResult,
-  theme
+}, va = ({
+  t: e,
+  onClose: n,
+  running: i,
+  progress: a,
+  status: r,
+  scannedCount: s,
+  pairsScanned: h,
+  results: c,
+  resultFilter: u,
+  modelOptions: p,
+  setA: d,
+  setB: y,
+  tolerance: f,
+  minOverlapVolume: v,
+  clearanceDistance: m,
+  useNarrowPhase: _,
+  useTrianglePhase: o,
+  includeSameModel: b,
+  onSetAChange: k,
+  onSetBChange: g,
+  onToleranceChange: P,
+  onMinOverlapVolumeChange: R,
+  onClearanceDistanceChange: S,
+  onUseNarrowPhaseChange: I,
+  onUseTrianglePhaseChange: C,
+  onIncludeSameModelChange: D,
+  onRun: N,
+  onCancel: $,
+  onClear: E,
+  onExportCsv: F,
+  onIsolateByStatus: A,
+  onRestoreVisibility: U,
+  onResultFilterChange: G,
+  typeFilter: H,
+  onTypeFilterChange: x,
+  onUpdateResultStatus: V,
+  onMarkFilteredStatus: z,
+  onSetASelectAll: ce,
+  onSetAClear: re,
+  onSetBSelectAll: Z,
+  onSetBClear: te,
+  onFocusResult: ue,
+  theme: ne
 }) => {
-  const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(50);
-  const [scopeExpanded, setScopeExpanded] = useState(modelOptions.length <= 4);
-  const [advancedExpanded, setAdvancedExpanded] = useState(false);
-  useEffect(() => {
-    setPage(1);
-  }, [results.length, pageSize]);
-  const filteredResults = results;
-  const totalPages = Math.max(1, Math.ceil(filteredResults.length / pageSize));
-  const currentPage = Math.min(page, totalPages);
-  const pageStart = (currentPage - 1) * pageSize;
-  const pageItems = useMemo(() => filteredResults.slice(pageStart, pageStart + pageSize), [filteredResults, pageStart, pageSize]);
-  const setAIds = useMemo(() => new Set(setA), [setA]);
-  const setBIds = useMemo(() => new Set(setB), [setB]);
-  const readyText = status || (running ? t("clash_running") || "正在执行碰撞检查..." : t("clash_ready") || "准备就绪");
-  const scopeSummary = `${t("clash_set_a") || "模型集 A"} ${setA.length} · ${t("clash_set_b") || "模型集 B"} ${setB.length}`;
-  const toggleFromSet = (source, id, onChange) => {
-    const nextSet = new Set(source);
-    if (nextSet.has(id)) nextSet.delete(id);
-    else nextSet.add(id);
-    onChange(Array.from(nextSet));
+  const [ge, _e] = O(1), [ye, j] = O(50), [B, de] = O(p.length <= 4), [he, be] = O(!1);
+  q(() => {
+    _e(1);
+  }, [c.length, ye]);
+  const ke = c, We = Math.max(1, Math.ceil(ke.length / ye)), Ne = Math.min(ge, We), Ie = (Ne - 1) * ye, je = Se(() => ke.slice(Ie, Ie + ye), [ke, Ie, ye]), qe = Se(() => new Set(d), [d]), st = Se(() => new Set(y), [y]), K = r || (i ? e("clash_running") || "正在执行碰撞检查..." : e("clash_ready") || "准备就绪"), Y = `${e("clash_set_a") || "模型集 A"} ${d.length} · ${e("clash_set_b") || "模型集 B"} ${y.length}`, Q = (M, ie, pe) => {
+    const le = new Set(M);
+    le.has(ie) ? le.delete(ie) : le.add(ie), pe(Array.from(le));
   };
-  return /* @__PURE__ */ jsx(
-    FloatingPanel,
+  return /* @__PURE__ */ t(
+    Ye,
     {
-      title: t("tb_clash") || "碰撞检查",
-      closeLabel: t("panel_close") || "关闭",
-      onClose,
+      title: e("tb_clash") || "碰撞检查",
+      closeLabel: e("panel_close") || "关闭",
+      onClose: n,
       width: 500,
       storageId: "tool_clash",
-      autoHeight: true,
-      theme,
-      children: /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-body ui-clash-panel", children: [
-        /* @__PURE__ */ jsxs("div", { className: "ui-clash-hero", children: [
-          /* @__PURE__ */ jsxs("div", { className: "ui-clash-hero-main", children: [
-            /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-caption-strong ui-clash-hero-title", children: readyText }),
-            /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-caption ui-clash-hero-meta", children: [
-              t("clash_scope_visible") || "范围：当前可见构件",
+      autoHeight: !0,
+      theme: ne,
+      children: /* @__PURE__ */ l("div", { className: "ui-toolpanel-body ui-clash-panel", children: [
+        /* @__PURE__ */ l("div", { className: "ui-clash-hero", children: [
+          /* @__PURE__ */ l("div", { className: "ui-clash-hero-main", children: [
+            /* @__PURE__ */ t("div", { className: "ui-toolpanel-caption-strong ui-clash-hero-title", children: K }),
+            /* @__PURE__ */ l("div", { className: "ui-toolpanel-caption ui-clash-hero-meta", children: [
+              e("clash_scope_visible") || "范围：当前可见构件",
               " · ",
-              t("clash_candidates") || "候选",
+              e("clash_candidates") || "候选",
               " ",
-              scannedCount,
+              s,
               " · ",
-              t("clash_pairs_scanned") || "已扫描对数",
+              e("clash_pairs_scanned") || "已扫描对数",
               " ",
-              pairsScanned
+              h
             ] })
           ] }),
-          /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-row ui-toolpanel-wrap ui-clash-hero-actions", children: [
-            !running ? /* @__PURE__ */ jsx(Button, { className: "ui-properties-action", onClick: onRun, variant: "primary", children: t("clash_run") || "开始检查" }) : /* @__PURE__ */ jsx(Button, { className: "ui-properties-action", onClick: onCancel, children: t("search_cancel") || "取消搜索" }),
-            /* @__PURE__ */ jsx(Button, { className: "ui-properties-action", onClick: onClear, children: t("clash_clear") || "清空结果" }),
-            /* @__PURE__ */ jsx(Button, { className: "ui-properties-action", onClick: onExportCsv, disabled: results.length === 0, children: t("clash_export_csv") || "导出 CSV" })
+          /* @__PURE__ */ l("div", { className: "ui-toolpanel-row ui-toolpanel-wrap ui-clash-hero-actions", children: [
+            i ? /* @__PURE__ */ t(Ee, { className: "ui-properties-action", onClick: $, children: e("search_cancel") || "取消搜索" }) : /* @__PURE__ */ t(Ee, { className: "ui-properties-action", onClick: N, variant: "primary", children: e("clash_run") || "开始检查" }),
+            /* @__PURE__ */ t(Ee, { className: "ui-properties-action", onClick: E, children: e("clash_clear") || "清空结果" }),
+            /* @__PURE__ */ t(Ee, { className: "ui-properties-action", onClick: F, disabled: c.length === 0, children: e("clash_export_csv") || "导出 CSV" })
           ] }),
-          /* @__PURE__ */ jsx("div", { className: "ui-progress-bar ui-progress-bar-full ui-clash-progress", children: /* @__PURE__ */ jsx("div", { className: "ui-progress-fill", style: { width: `${Math.max(0, Math.min(100, progress))}%` } }) })
+          /* @__PURE__ */ t("div", { className: "ui-progress-bar ui-progress-bar-full ui-clash-progress", children: /* @__PURE__ */ t("div", { className: "ui-progress-fill", style: { width: `${Math.max(0, Math.min(100, a))}%` } }) })
         ] }),
-        /* @__PURE__ */ jsxs("div", { className: "ui-clash-section", children: [
-          /* @__PURE__ */ jsxs(
+        /* @__PURE__ */ l("div", { className: "ui-clash-section", children: [
+          /* @__PURE__ */ l(
             "button",
             {
               type: "button",
               className: "ui-clash-section-toggle",
-              onClick: () => setScopeExpanded((prev) => !prev),
+              onClick: () => de((M) => !M),
               children: [
-                /* @__PURE__ */ jsx("span", { className: "ui-toolpanel-caption-strong ui-clash-section-title", children: t("clash_scope_visible") || "检测范围" }),
-                /* @__PURE__ */ jsx("span", { className: "ui-toolpanel-caption ui-clash-section-summary", children: scopeSummary })
+                /* @__PURE__ */ t("span", { className: "ui-toolpanel-caption-strong ui-clash-section-title", children: e("clash_scope_visible") || "检测范围" }),
+                /* @__PURE__ */ t("span", { className: "ui-toolpanel-caption ui-clash-section-summary", children: Y })
               ]
             }
           ),
-          scopeExpanded && /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-grid ui-toolpanel-grid-2", children: [
-            /* @__PURE__ */ jsxs("div", { className: "ui-selection-box", children: [
-              /* @__PURE__ */ jsxs("div", { className: "ui-selection-box-header", children: [
-                /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-caption-strong", children: t("clash_set_a") || "模型集 A" }),
-                /* @__PURE__ */ jsxs("div", { className: "ui-selection-box-actions", children: [
-                  /* @__PURE__ */ jsx("button", { className: "ui-statusbar-tag ui-statusbar-tag-compact", onClick: onSetASelectAll, children: t("select_all") || "全选" }),
-                  /* @__PURE__ */ jsx("button", { className: "ui-statusbar-tag ui-statusbar-tag-compact", onClick: onSetAClear, children: t("search_clear") || "清空" })
+          B && /* @__PURE__ */ l("div", { className: "ui-toolpanel-grid ui-toolpanel-grid-2", children: [
+            /* @__PURE__ */ l("div", { className: "ui-selection-box", children: [
+              /* @__PURE__ */ l("div", { className: "ui-selection-box-header", children: [
+                /* @__PURE__ */ t("div", { className: "ui-toolpanel-caption-strong", children: e("clash_set_a") || "模型集 A" }),
+                /* @__PURE__ */ l("div", { className: "ui-selection-box-actions", children: [
+                  /* @__PURE__ */ t("button", { className: "ui-statusbar-tag ui-statusbar-tag-compact", onClick: ce, children: e("select_all") || "全选" }),
+                  /* @__PURE__ */ t("button", { className: "ui-statusbar-tag ui-statusbar-tag-compact", onClick: re, children: e("search_clear") || "清空" })
                 ] })
               ] }),
-              /* @__PURE__ */ jsx("div", { className: "ui-selection-box-list ui-clash-selection-list", children: modelOptions.length === 0 ? /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-muted", children: t("clash_no_models") || "暂无模型" }) : modelOptions.map((item) => /* @__PURE__ */ jsx(
-                Checkbox,
+              /* @__PURE__ */ t("div", { className: "ui-selection-box-list ui-clash-selection-list", children: p.length === 0 ? /* @__PURE__ */ t("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-muted", children: e("clash_no_models") || "暂无模型" }) : p.map((M) => /* @__PURE__ */ t(
+                Xe,
                 {
-                  checked: setAIds.has(item.id),
-                  onChange: () => toggleFromSet(setA, item.id, onSetAChange),
-                  label: item.name,
+                  checked: qe.has(M.id),
+                  onChange: () => Q(d, M.id, k),
+                  label: M.name,
                   labelStyle: { fontSize: 11 }
                 },
-                `a_${item.id}`
+                `a_${M.id}`
               )) })
             ] }),
-            /* @__PURE__ */ jsxs("div", { className: "ui-selection-box", children: [
-              /* @__PURE__ */ jsxs("div", { className: "ui-selection-box-header", children: [
-                /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-caption-strong", children: t("clash_set_b") || "模型集 B" }),
-                /* @__PURE__ */ jsxs("div", { className: "ui-selection-box-actions", children: [
-                  /* @__PURE__ */ jsx("button", { className: "ui-statusbar-tag ui-statusbar-tag-compact", onClick: onSetBSelectAll, children: t("select_all") || "全选" }),
-                  /* @__PURE__ */ jsx("button", { className: "ui-statusbar-tag ui-statusbar-tag-compact", onClick: onSetBClear, children: t("search_clear") || "清空" })
+            /* @__PURE__ */ l("div", { className: "ui-selection-box", children: [
+              /* @__PURE__ */ l("div", { className: "ui-selection-box-header", children: [
+                /* @__PURE__ */ t("div", { className: "ui-toolpanel-caption-strong", children: e("clash_set_b") || "模型集 B" }),
+                /* @__PURE__ */ l("div", { className: "ui-selection-box-actions", children: [
+                  /* @__PURE__ */ t("button", { className: "ui-statusbar-tag ui-statusbar-tag-compact", onClick: Z, children: e("select_all") || "全选" }),
+                  /* @__PURE__ */ t("button", { className: "ui-statusbar-tag ui-statusbar-tag-compact", onClick: te, children: e("search_clear") || "清空" })
                 ] })
               ] }),
-              /* @__PURE__ */ jsx("div", { className: "ui-selection-box-list ui-clash-selection-list", children: modelOptions.length === 0 ? /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-muted", children: t("clash_no_models") || "暂无模型" }) : modelOptions.map((item) => /* @__PURE__ */ jsx(
-                Checkbox,
+              /* @__PURE__ */ t("div", { className: "ui-selection-box-list ui-clash-selection-list", children: p.length === 0 ? /* @__PURE__ */ t("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-muted", children: e("clash_no_models") || "暂无模型" }) : p.map((M) => /* @__PURE__ */ t(
+                Xe,
                 {
-                  checked: setBIds.has(item.id),
-                  onChange: () => toggleFromSet(setB, item.id, onSetBChange),
-                  label: item.name,
+                  checked: st.has(M.id),
+                  onChange: () => Q(y, M.id, g),
+                  label: M.name,
                   labelStyle: { fontSize: 11 }
                 },
-                `b_${item.id}`
+                `b_${M.id}`
               )) })
             ] })
           ] })
         ] }),
-        /* @__PURE__ */ jsxs("div", { className: "ui-clash-section", children: [
-          /* @__PURE__ */ jsxs(
+        /* @__PURE__ */ l("div", { className: "ui-clash-section", children: [
+          /* @__PURE__ */ l(
             "button",
             {
               type: "button",
               className: "ui-clash-section-toggle",
-              onClick: () => setAdvancedExpanded((prev) => !prev),
+              onClick: () => be((M) => !M),
               children: [
-                /* @__PURE__ */ jsx("span", { className: "ui-toolpanel-caption-strong ui-clash-section-title", children: t("settings_more") || "高级设置" }),
-                /* @__PURE__ */ jsxs("span", { className: "ui-toolpanel-caption ui-clash-section-summary", children: [
-                  t("clash_tolerance") || "容差",
+                /* @__PURE__ */ t("span", { className: "ui-toolpanel-caption-strong ui-clash-section-title", children: e("settings_more") || "高级设置" }),
+                /* @__PURE__ */ l("span", { className: "ui-toolpanel-caption ui-clash-section-summary", children: [
+                  e("clash_tolerance") || "容差",
                   " / ",
-                  t("clash_min_overlap") || "最小重叠体积",
+                  e("clash_min_overlap") || "最小重叠体积",
                   " / ",
-                  t("clash_clearance_distance") || "最小净空距离"
+                  e("clash_clearance_distance") || "最小净空距离"
                 ] })
               ]
             }
           ),
-          advancedExpanded && /* @__PURE__ */ jsxs(Fragment, { children: [
-            /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-grid ui-toolpanel-grid-2", children: [
-              /* @__PURE__ */ jsxs("div", { children: [
-                /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-spaced", children: t("clash_tolerance") || "容差" }),
-                /* @__PURE__ */ jsx(
-                  InputNumber,
+          he && /* @__PURE__ */ l(ae, { children: [
+            /* @__PURE__ */ l("div", { className: "ui-toolpanel-grid ui-toolpanel-grid-2", children: [
+              /* @__PURE__ */ l("div", { children: [
+                /* @__PURE__ */ t("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-spaced", children: e("clash_tolerance") || "容差" }),
+                /* @__PURE__ */ t(
+                  Xt,
                   {
                     className: "ui-input-compact",
-                    value: Number.isFinite(tolerance) ? tolerance : 0,
+                    value: Number.isFinite(f) ? f : 0,
                     min: 0,
                     step: 1e-3,
-                    onChange: (value) => onToleranceChange(Math.max(0, value || 0)),
+                    onChange: (M) => P(Math.max(0, M || 0)),
                     style: { width: "100%" }
                   }
                 )
               ] }),
-              /* @__PURE__ */ jsxs("div", { children: [
-                /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-spaced", children: t("clash_min_overlap") || "最小重叠体积" }),
-                /* @__PURE__ */ jsx(
-                  InputNumber,
+              /* @__PURE__ */ l("div", { children: [
+                /* @__PURE__ */ t("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-spaced", children: e("clash_min_overlap") || "最小重叠体积" }),
+                /* @__PURE__ */ t(
+                  Xt,
                   {
                     className: "ui-input-compact",
-                    value: Number.isFinite(minOverlapVolume) ? minOverlapVolume : 0,
+                    value: Number.isFinite(v) ? v : 0,
                     min: 0,
                     step: 1e-6,
-                    onChange: (value) => onMinOverlapVolumeChange(Math.max(0, value || 0)),
+                    onChange: (M) => R(Math.max(0, M || 0)),
                     style: { width: "100%" }
                   }
                 )
               ] })
             ] }),
-            /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-grid ui-toolpanel-grid-2", children: [
-              /* @__PURE__ */ jsxs("div", { children: [
-                /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-spaced", children: t("clash_clearance_distance") || "最小净空距离" }),
-                /* @__PURE__ */ jsx(
-                  InputNumber,
+            /* @__PURE__ */ l("div", { className: "ui-toolpanel-grid ui-toolpanel-grid-2", children: [
+              /* @__PURE__ */ l("div", { children: [
+                /* @__PURE__ */ t("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-spaced", children: e("clash_clearance_distance") || "最小净空距离" }),
+                /* @__PURE__ */ t(
+                  Xt,
                   {
                     className: "ui-input-compact",
-                    value: Number.isFinite(clearanceDistance) ? clearanceDistance : 0,
+                    value: Number.isFinite(m) ? m : 0,
                     min: 0,
                     step: 1e-3,
-                    onChange: (value) => onClearanceDistanceChange(Math.max(0, value || 0)),
+                    onChange: (M) => S(Math.max(0, M || 0)),
                     style: { width: "100%" }
                   }
                 )
               ] }),
-              /* @__PURE__ */ jsxs("div", { className: "ui-clash-option-stack", children: [
-                /* @__PURE__ */ jsx(
-                  Checkbox,
+              /* @__PURE__ */ l("div", { className: "ui-clash-option-stack", children: [
+                /* @__PURE__ */ t(
+                  Xe,
                   {
-                    checked: useNarrowPhase,
-                    onChange: onUseNarrowPhaseChange,
-                    label: t("clash_narrow_phase") || "启用精筛（OBB）",
+                    checked: _,
+                    onChange: I,
+                    label: e("clash_narrow_phase") || "启用精筛（OBB）",
                     labelStyle: { fontSize: 12 }
                   }
                 ),
-                /* @__PURE__ */ jsx(
-                  Checkbox,
+                /* @__PURE__ */ t(
+                  Xe,
                   {
-                    checked: useTrianglePhase,
-                    onChange: onUseTrianglePhaseChange,
-                    label: t("clash_triangle_phase") || "启用三角面复核",
+                    checked: o,
+                    onChange: C,
+                    label: e("clash_triangle_phase") || "启用三角面复核",
                     labelStyle: { fontSize: 12 }
                   }
                 ),
-                /* @__PURE__ */ jsx(
-                  Checkbox,
+                /* @__PURE__ */ t(
+                  Xe,
                   {
-                    checked: includeSameModel,
-                    onChange: onIncludeSameModelChange,
-                    label: t("clash_include_same_model") || "包含同模型内检测",
+                    checked: b,
+                    onChange: D,
+                    label: e("clash_include_same_model") || "包含同模型内检测",
                     labelStyle: { fontSize: 12 }
                   }
                 )
@@ -10503,20 +3784,20 @@ const ClashPanel = ({
             ] })
           ] })
         ] }),
-        /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-row-between ui-clash-results-header", children: [
-          /* @__PURE__ */ jsxs("div", { children: [
-            /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-caption-strong ui-clash-results-title", children: [
-              t("clash_results") || "碰撞结果",
+        /* @__PURE__ */ l("div", { className: "ui-toolpanel-row-between ui-clash-results-header", children: [
+          /* @__PURE__ */ l("div", { children: [
+            /* @__PURE__ */ l("div", { className: "ui-toolpanel-caption-strong ui-clash-results-title", children: [
+              e("clash_results") || "碰撞结果",
               " ",
-              filteredResults.length
+              ke.length
             ] }),
-            /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-muted", children: t("locate_in_view") || "点击条目定位到视图" })
+            /* @__PURE__ */ t("div", { className: "ui-toolpanel-caption ui-toolpanel-caption-muted", children: e("locate_in_view") || "点击条目定位到视图" })
           ] }),
-          /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-row", children: /* @__PURE__ */ jsx(
-            Select,
+          /* @__PURE__ */ t("div", { className: "ui-toolpanel-row", children: /* @__PURE__ */ t(
+            Nt,
             {
-              value: String(pageSize),
-              onChange: (value) => setPageSize(Number(value) || 50),
+              value: String(ye),
+              onChange: (M) => j(Number(M) || 50),
               options: [
                 { value: "20", label: "20" },
                 { value: "50", label: "50" },
@@ -10527,662 +3808,545 @@ const ClashPanel = ({
             }
           ) })
         ] }),
-        /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-results-box ui-clash-results-box", children: filteredResults.length === 0 ? /* @__PURE__ */ jsx("div", { className: "ui-toolpanel-results-empty", children: t("clash_no_results") || "暂无碰撞结果" }) : pageItems.map((item) => /* @__PURE__ */ jsxs(
+        /* @__PURE__ */ t("div", { className: "ui-toolpanel-results-box ui-clash-results-box", children: ke.length === 0 ? /* @__PURE__ */ t("div", { className: "ui-toolpanel-results-empty", children: e("clash_no_results") || "暂无碰撞结果" }) : je.map((M) => /* @__PURE__ */ l(
           "button",
           {
             className: "ui-search-result-item ui-clash-result-item",
-            onClick: () => onFocusResult(item),
-            title: `${item.aUuid} <> ${item.bUuid}`,
+            onClick: () => ue(M),
+            title: `${M.aUuid} <> ${M.bUuid}`,
             children: [
-              /* @__PURE__ */ jsx("div", { className: "ui-clash-result-top", children: /* @__PURE__ */ jsxs("span", { className: "ui-clash-result-title", children: [
-                item.aName || item.aUuid,
+              /* @__PURE__ */ t("div", { className: "ui-clash-result-top", children: /* @__PURE__ */ l("span", { className: "ui-clash-result-title", children: [
+                M.aName || M.aUuid,
                 " ",
                 " <> ",
                 " ",
-                item.bName || item.bUuid
+                M.bName || M.bUuid
               ] }) }),
-              /* @__PURE__ */ jsxs("div", { className: "ui-toolpanel-row-between ui-clash-result-meta", children: [
-                /* @__PURE__ */ jsxs("span", { className: "ui-result-item-secondary", children: [
-                  item.aUuid,
+              /* @__PURE__ */ l("div", { className: "ui-toolpanel-row-between ui-clash-result-meta", children: [
+                /* @__PURE__ */ l("span", { className: "ui-result-item-secondary", children: [
+                  M.aUuid,
                   " ",
                   " <> ",
                   " ",
-                  item.bUuid
+                  M.bUuid
                 ] }),
-                /* @__PURE__ */ jsx("span", { className: "ui-result-item-secondary", children: item.type === "hard" ? `${t("clash_overlap_volume") || "重叠体积"}: ${item.overlapVolume.toFixed(6)}` : `${t("clash_clearance_value") || "净空距离"}: ${item.distance.toFixed(6)}` })
+                /* @__PURE__ */ t("span", { className: "ui-result-item-secondary", children: M.type === "hard" ? `${e("clash_overlap_volume") || "重叠体积"}: ${M.overlapVolume.toFixed(6)}` : `${e("clash_clearance_value") || "净空距离"}: ${M.distance.toFixed(6)}` })
               ] })
             ]
           },
-          item.id
+          M.id
         )) }),
-        filteredResults.length > 0 && /* @__PURE__ */ jsx(
-          PaginationControls,
+        ke.length > 0 && /* @__PURE__ */ t(
+          Mn,
           {
-            prevTitle: t("search_page_prev") || "上一页",
-            nextTitle: t("search_page_next") || "下一页",
-            currentPage,
-            totalPages,
-            onPrev: () => setPage((prev) => Math.max(1, prev - 1)),
-            onNext: () => setPage((prev) => Math.min(totalPages, prev + 1))
+            prevTitle: e("search_page_prev") || "上一页",
+            nextTitle: e("search_page_next") || "下一页",
+            currentPage: Ne,
+            totalPages: We,
+            onPrev: () => _e((M) => Math.max(1, M - 1)),
+            onNext: () => _e((M) => Math.min(We, M + 1))
           }
         )
       ] })
     }
   );
-};
-
-const LoadingOverlay = ({ t, loading, status, progress, theme }) => {
-  if (!loading) return null;
-  return /* @__PURE__ */ jsx("div", { className: "ui-loading-overlay", children: /* @__PURE__ */ jsxs("div", { className: "ui-loading-box", children: [
-    /* @__PURE__ */ jsxs("div", { className: "ui-loading-header", children: [
-      /* @__PURE__ */ jsx("div", { className: "ui-loading-title", children: status }),
-      /* @__PURE__ */ jsxs("div", { className: "ui-loading-percent", children: [
-        Math.round(progress),
-        "%"
-      ] })
-    ] }),
-    /* @__PURE__ */ jsx("div", { className: "ui-progress-bar ui-loading-progress", children: /* @__PURE__ */ jsx(
-      "div",
-      {
-        className: "ui-progress-fill",
-        style: {
-          width: `${progress}%`,
-          transition: "width 0.3s ease-out"
-        }
-      }
-    ) }),
-    /* @__PURE__ */ jsxs("div", { className: "ui-loading-meta", children: [
-      /* @__PURE__ */ jsxs("svg", { className: "ui-loading-spinner", viewBox: "0 0 24 24", children: [
-        /* @__PURE__ */ jsx("circle", { className: "ui-loading-spinner-track", cx: "12", cy: "12", r: "10", stroke: "currentColor", strokeWidth: "4", fill: "none" }),
-        /* @__PURE__ */ jsx("path", { className: "ui-loading-spinner-head", fill: "currentColor", d: "M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" })
-      ] }),
-      /* @__PURE__ */ jsx("span", { children: progress === 100 ? t("processing") : t("loading_resources") })
+}, wa = ({ t: e, loading: n, status: i, progress: a, theme: r }) => n ? /* @__PURE__ */ t("div", { className: "ui-loading-overlay", children: /* @__PURE__ */ l("div", { className: "ui-loading-box", children: [
+  /* @__PURE__ */ l("div", { className: "ui-loading-header", children: [
+    /* @__PURE__ */ t("div", { className: "ui-loading-title", children: i }),
+    /* @__PURE__ */ l("div", { className: "ui-loading-percent", children: [
+      Math.round(a),
+      "%"
     ] })
-  ] }) });
-};
-
-function normalizePropertyToken(value) {
-  return String(value ?? "").normalize("NFKC").trim().replace(/\s+/g, " ").toLocaleLowerCase();
-}
-function stringifyPropertyValue(value) {
-  if (value === null || value === void 0) return "";
-  if (typeof value === "string") return value;
-  if (typeof value === "number" || typeof value === "boolean") return String(value);
-  if (Array.isArray(value)) return value.map((item) => stringifyPropertyValue(item)).filter(Boolean).join(", ");
-  if (typeof value === "object") {
-    try {
-      return JSON.stringify(value);
-    } catch {
-      return String(value);
+  ] }),
+  /* @__PURE__ */ t("div", { className: "ui-progress-bar ui-loading-progress", children: /* @__PURE__ */ t(
+    "div",
+    {
+      className: "ui-progress-fill",
+      style: {
+        width: `${a}%`,
+        transition: "width 0.3s ease-out"
+      }
     }
-  }
-  return String(value);
+  ) }),
+  /* @__PURE__ */ l("div", { className: "ui-loading-meta", children: [
+    /* @__PURE__ */ l("svg", { className: "ui-loading-spinner", viewBox: "0 0 24 24", children: [
+      /* @__PURE__ */ t("circle", { className: "ui-loading-spinner-track", cx: "12", cy: "12", r: "10", stroke: "currentColor", strokeWidth: "4", fill: "none" }),
+      /* @__PURE__ */ t("path", { className: "ui-loading-spinner-head", fill: "currentColor", d: "M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" })
+    ] }),
+    /* @__PURE__ */ t("span", { children: e(a === 100 ? "processing" : "loading_resources") })
+  ] })
+] }) }) : null;
+function rt(e) {
+  return String(e ?? "").normalize("NFKC").trim().replace(/\s+/g, " ").toLocaleLowerCase();
 }
-function toListItems(input) {
-  if (Array.isArray(input)) return input;
-  return Object.entries(input).map(([key, value]) => ({ key, value }));
+function An(e) {
+  if (e == null) return "";
+  if (typeof e == "string") return e;
+  if (typeof e == "number" || typeof e == "boolean") return String(e);
+  if (Array.isArray(e)) return e.map((n) => An(n)).filter(Boolean).join(", ");
+  if (typeof e == "object")
+    try {
+      return JSON.stringify(e);
+    } catch {
+      return String(e);
+    }
+  return String(e);
 }
-function createPropertyEntries(groupName, input, fallbackSource) {
-  return toListItems(input).map((item, index) => {
-    const key = String(item.key ?? "").trim();
-    const value = stringifyPropertyValue(item.value);
-    if (!key || !value) return null;
-    const path = `${groupName}.${key}`;
+function xa(e) {
+  return Array.isArray(e) ? e : Object.entries(e).map(([n, i]) => ({ key: n, value: i }));
+}
+function yt(e, n, i) {
+  return xa(n).map((a, r) => {
+    const s = String(a.key ?? "").trim(), h = An(a.value);
+    if (!s || !h) return null;
+    const c = `${e}.${s}`;
     return {
-      id: item.id || `${groupName}::${key}::${index}`,
-      group: groupName,
-      key,
-      value,
-      path,
-      rawKey: item.rawKey,
-      source: item.source || fallbackSource,
-      normalizedGroup: normalizePropertyToken(groupName),
-      normalizedKey: normalizePropertyToken(key),
-      normalizedPath: normalizePropertyToken(path),
-      normalizedValue: normalizePropertyToken(value)
+      id: a.id || `${e}::${s}::${r}`,
+      group: e,
+      key: s,
+      value: h,
+      path: c,
+      rawKey: a.rawKey,
+      source: a.source || i,
+      normalizedGroup: rt(e),
+      normalizedKey: rt(s),
+      normalizedPath: rt(c),
+      normalizedValue: rt(h)
     };
   }).filter(Boolean);
 }
-function buildPropertyGroupsFromRecord(groups, fallbackSource) {
-  if (!groups) return [];
-  return Object.entries(groups).map(([groupName, input]) => ({
-    name: groupName,
-    items: createPropertyEntries(groupName, input, fallbackSource)
-  })).filter((group) => group.items.length > 0);
+function Ca(e, n) {
+  return e ? Object.entries(e).map(([i, a]) => ({
+    name: i,
+    items: yt(i, a, n)
+  })).filter((i) => i.items.length > 0) : [];
 }
-function filterPropertyGroups(groups, query) {
-  const normalizedQuery = normalizePropertyToken(query);
-  if (!normalizedQuery) return groups;
-  return groups.map((group) => ({
-    ...group,
-    items: group.items.filter(
-      (item) => item.normalizedGroup.includes(normalizedQuery) || item.normalizedKey.includes(normalizedQuery) || item.normalizedPath.includes(normalizedQuery) || item.normalizedValue.includes(normalizedQuery)
+function Na(e, n) {
+  const i = rt(n);
+  return i ? e.map((a) => ({
+    ...a,
+    items: a.items.filter(
+      (r) => r.normalizedGroup.includes(i) || r.normalizedKey.includes(i) || r.normalizedPath.includes(i) || r.normalizedValue.includes(i)
     )
-  })).filter((group) => group.items.length > 0);
+  })).filter((a) => a.items.length > 0) : e.filter((a) => a.items.length > 0);
 }
-function serializePropertyGroups(groups) {
-  return groups.map((group) => [`[${group.name}]`, ...group.items.map((item) => `${item.key}: ${item.value}`)].join("\n")).join("\n\n");
-}
+function Sa(e) {
+  return e.map((n) => [`[${n.name}]`, ...n.items.map((i) => `${i.key}: ${i.value}`)].join(`
+`)).join(`
 
-const PropertiesPanel = ({ t, selectedProps }) => {
-  const [collapsed, setCollapsed] = useState(/* @__PURE__ */ new Set());
-  const [searchQuery, setSearchQuery] = useState("");
-  const [copiedText, setCopiedText] = useState(null);
-  const currentGroups = useMemo(() => {
-    return selectedProps;
-  }, [selectedProps]);
-  const toggleGroup = (group) => {
-    const next = new Set(collapsed);
-    if (next.has(group)) next.delete(group);
-    else next.add(group);
-    setCollapsed(next);
-  };
-  const handleCopy = async (text) => {
+`);
+}
+const ka = _t.memo(({ item: e, handleCopy: n, t: i }) => /* @__PURE__ */ l("div", { className: "ui-prop-row", children: [
+  /* @__PURE__ */ t(
+    "div",
+    {
+      className: "ui-prop-key",
+      title: `${e.path} (${i("click_to_copy")})`,
+      onClick: () => n(e.key),
+      children: e.key
+    }
+  ),
+  /* @__PURE__ */ t(
+    "div",
+    {
+      className: "ui-prop-value",
+      title: `${e.value}
+${e.path}`,
+      onClick: () => n(e.value),
+      children: e.value
+    }
+  )
+] }));
+_t.memo(({ group: e, isCollapsed: n, toggleGroup: i, handleCopy: a, t: r }) => /* @__PURE__ */ l("div", { children: [
+  /* @__PURE__ */ l("div", { className: `ui-prop-group${n ? " collapsed" : ""}`, onClick: () => i(e.name), children: [
+    /* @__PURE__ */ t("span", { children: e.name }),
+    /* @__PURE__ */ l("div", { className: "ui-prop-group-actions", children: [
+      /* @__PURE__ */ t(
+        "button",
+        {
+          className: "ui-prop-copy",
+          onClick: (s) => {
+            s.stopPropagation(), a([`[${e.name}]`, ...e.items.map((h) => `${h.key}: ${h.value}`)].join(`
+`));
+          },
+          title: r("copy_group_props"),
+          children: /* @__PURE__ */ t(tn, { size: 12 })
+        }
+      ),
+      /* @__PURE__ */ t("span", { className: "ui-prop-group-chevron", children: n ? /* @__PURE__ */ t(It, { width: 14, height: 14 }) : /* @__PURE__ */ t(Ot, { width: 14, height: 14 }) })
+    ] })
+  ] }),
+  !n && e.items.map((s) => /* @__PURE__ */ t(ka, { item: s, handleCopy: a, t: r }, s.id))
+] }));
+const Ma = ({ t: e, selectedProps: n }) => {
+  const [i, a] = O(/* @__PURE__ */ new Set()), [r, s] = O(""), [h, c] = O(null), u = Se(() => n, [n]), p = (m) => {
+    const _ = new Set(i);
+    _.has(m) ? _.delete(m) : _.add(m), a(_);
+  }, d = async (m) => {
     try {
-      await navigator.clipboard.writeText(text);
-      setCopiedText(text);
-      setTimeout(() => setCopiedText(null), 1500);
-    } catch (e) {
+      await navigator.clipboard.writeText(m), c(m), setTimeout(() => c(null), 1500);
+    } catch (_) {
       try {
-        const textarea = document.createElement("textarea");
-        textarea.value = text;
-        textarea.setAttribute("readonly", "true");
-        textarea.style.position = "fixed";
-        textarea.style.left = "-9999px";
-        textarea.style.top = "0";
-        document.body.appendChild(textarea);
-        textarea.focus();
-        textarea.select();
-        const copied = document.execCommand("copy");
-        document.body.removeChild(textarea);
-        if (copied) {
-          setCopiedText(text);
-          setTimeout(() => setCopiedText(null), 1500);
+        const o = document.createElement("textarea");
+        o.value = m, o.setAttribute("readonly", "true"), o.style.position = "fixed", o.style.left = "-9999px", o.style.top = "0", document.body.appendChild(o), o.focus(), o.select();
+        const b = document.execCommand("copy");
+        if (document.body.removeChild(o), b) {
+          c(m), setTimeout(() => c(null), 1500);
           return;
         }
       } catch {
       }
-      console.error("Failed to copy", e);
+      console.error("Failed to copy", _);
     }
-  };
-  const filteredProps = useMemo(() => {
-    if (!currentGroups) return null;
-    return filterPropertyGroups(currentGroups, searchQuery);
-  }, [currentGroups, searchQuery]);
-  useEffect(() => {
-    if (!filteredProps || !searchQuery) return;
-    const matchedGroups = new Set(filteredProps.map((group) => group.name));
-    setCollapsed((prev) => {
-      const next = new Set(prev);
-      matchedGroups.forEach((groupName) => next.delete(groupName));
-      return next;
+  }, y = Se(() => u ? Na(u, r) : null, [u, r]);
+  q(() => {
+    if (!y || !r) return;
+    const m = new Set(y.map((_) => _.name));
+    a((_) => {
+      const o = new Set(_);
+      return m.forEach((b) => o.delete(b)), o;
     });
-  }, [filteredProps, searchQuery]);
-  const groupCount = filteredProps ? filteredProps.length : 0;
-  const itemCount = filteredProps ? filteredProps.reduce((sum, group) => sum + group.items.length, 0) : 0;
-  return /* @__PURE__ */ jsxs("div", { className: "ui-properties-panel", children: [
-    selectedProps && /* @__PURE__ */ jsxs("div", { className: "ui-properties-toolbar", children: [
-      /* @__PURE__ */ jsx("div", { className: "ui-search-input-wrap", children: /* @__PURE__ */ jsx(
+  }, [y, r]);
+  const f = y ? y.length : 0, v = y ? y.reduce((m, _) => m + _.items.length, 0) : 0;
+  return /* @__PURE__ */ l("div", { className: "ui-properties-panel", children: [
+    n && /* @__PURE__ */ l("div", { className: "ui-properties-toolbar", children: [
+      /* @__PURE__ */ t("div", { className: "ui-search-input-wrap", children: /* @__PURE__ */ t(
         "input",
         {
           type: "text",
-          placeholder: t("search_props"),
-          value: searchQuery,
-          onChange: (e) => setSearchQuery(e.target.value),
+          placeholder: e("search_props"),
+          value: r,
+          onChange: (m) => s(m.target.value),
           className: "ui-input ui-input-compact"
         }
       ) }),
-      /* @__PURE__ */ jsxs("div", { className: "ui-properties-subbar", children: [
-        /* @__PURE__ */ jsxs("div", { className: "ui-properties-meta", children: [
-          (searchQuery ? t("search_results") : t("prop_groups")) + `: ${groupCount}`,
-          /* @__PURE__ */ jsx("span", { children: " · " }),
-          t("prop_items") + `: ${itemCount}`
+      /* @__PURE__ */ l("div", { className: "ui-properties-subbar", children: [
+        /* @__PURE__ */ l("div", { className: "ui-properties-meta", children: [
+          e(r ? "search_results" : "prop_groups") + `: ${f}`,
+          /* @__PURE__ */ t("span", { children: " 路 " }),
+          e("prop_items") + `: ${v}`
         ] }),
-        /* @__PURE__ */ jsx("div", { className: "ui-properties-actions", children: /* @__PURE__ */ jsx(
+        /* @__PURE__ */ t("div", { className: "ui-properties-actions", children: /* @__PURE__ */ t(
           "button",
           {
             className: "ui-properties-action ui-properties-icon-btn",
-            onClick: () => currentGroups && handleCopy(serializePropertyGroups(currentGroups)),
-            disabled: !currentGroups,
-            title: t("copy_all_props"),
-            children: /* @__PURE__ */ jsx(IconCopy, { size: 14 })
+            onClick: () => u && d(Sa(u)),
+            disabled: !u,
+            title: e("copy_all_props"),
+            children: /* @__PURE__ */ t(tn, { size: 14 })
           }
         ) })
       ] })
     ] }),
-    /* @__PURE__ */ jsx("div", { className: "ui-properties-scroll", children: filteredProps ? filteredProps.map((group) => /* @__PURE__ */ jsxs("div", { children: [
-      /* @__PURE__ */ jsxs("div", { className: `ui-prop-group${collapsed.has(group.name) ? " collapsed" : ""}`, onClick: () => toggleGroup(group.name), children: [
-        /* @__PURE__ */ jsx("span", { children: group.name }),
-        /* @__PURE__ */ jsxs("div", { className: "ui-prop-group-actions", children: [
-          /* @__PURE__ */ jsx(
+    /* @__PURE__ */ t("div", { className: "ui-properties-scroll", children: y ? y.map((m) => /* @__PURE__ */ l("div", { children: [
+      /* @__PURE__ */ l("div", { className: `ui-prop-group${i.has(m.name) ? " collapsed" : ""}`, onClick: () => p(m.name), children: [
+        /* @__PURE__ */ t("span", { children: m.name }),
+        /* @__PURE__ */ l("div", { className: "ui-prop-group-actions", children: [
+          /* @__PURE__ */ t(
             "button",
             {
               className: "ui-prop-copy",
-              onClick: (e) => {
-                e.stopPropagation();
-                handleCopy([`[${group.name}]`, ...group.items.map((item) => `${item.key}: ${item.value}`)].join("\n"));
+              onClick: (_) => {
+                _.stopPropagation(), d([`[${m.name}]`, ...m.items.map((o) => `${o.key}: ${o.value}`)].join(`
+`));
               },
-              title: t("copy_group_props"),
-              children: /* @__PURE__ */ jsx(IconCopy, { size: 12 })
+              title: e("copy_group_props"),
+              children: /* @__PURE__ */ t(tn, { size: 12 })
             }
           ),
-          /* @__PURE__ */ jsx("span", { className: "ui-prop-group-chevron", children: collapsed.has(group.name) ? /* @__PURE__ */ jsx(IconChevronRight, { width: 14, height: 14 }) : /* @__PURE__ */ jsx(IconChevronDown, { width: 14, height: 14 }) })
+          /* @__PURE__ */ t("span", { className: "ui-prop-group-chevron", children: i.has(m.name) ? /* @__PURE__ */ t(It, { width: 14, height: 14 }) : /* @__PURE__ */ t(Ot, { width: 14, height: 14 }) })
         ] })
       ] }),
-      !collapsed.has(group.name) && group.items.map((item) => /* @__PURE__ */ jsxs("div", { className: "ui-prop-row", children: [
-        /* @__PURE__ */ jsx(
+      !i.has(m.name) && m.items.map((_) => /* @__PURE__ */ l("div", { className: "ui-prop-row", children: [
+        /* @__PURE__ */ t(
           "div",
           {
             className: "ui-prop-key",
-            title: `${item.path} (${t("click_to_copy")})`,
-            onClick: () => handleCopy(item.key),
-            children: item.key
+            title: `${_.path} (${e("click_to_copy")})`,
+            onClick: () => d(_.key),
+            children: _.key
           }
         ),
-        /* @__PURE__ */ jsx(
+        /* @__PURE__ */ t(
           "div",
           {
             className: "ui-prop-value",
-            title: `${item.value}
-${item.path}`,
-            onClick: () => handleCopy(item.value),
-            children: item.value
+            title: `${_.value}
+${_.path}`,
+            onClick: () => d(_.value),
+            children: _.value
           }
         )
-      ] }, item.id))
-    ] }, group.name)) : /* @__PURE__ */ jsx("div", { className: "ui-properties-empty", children: t("no_selection") }) }),
-    copiedText && /* @__PURE__ */ jsx("div", { className: "ui-copy-toast", children: t("copied") })
+      ] }, _.id))
+    ] }, m.name)) : /* @__PURE__ */ t("div", { className: "ui-properties-empty", children: e("no_selection") }) }),
+    h && /* @__PURE__ */ t("div", { className: "ui-copy-toast", children: e("copied") })
   ] });
-};
-
-const ConfirmModal = ({ isOpen, title, message, onConfirm, onCancel, t, theme }) => {
-  if (!isOpen) return null;
-  return /* @__PURE__ */ jsx(
-    FloatingPanel,
+}, La = ({ isOpen: e, title: n, message: i, onConfirm: a, onCancel: r, t: s, theme: h }) => e ? /* @__PURE__ */ t(
+  Ye,
+  {
+    title: n,
+    onClose: r,
+    width: 360,
+    height: 188,
+    modal: !0,
+    movable: !1,
+    theme: h,
+    children: /* @__PURE__ */ l(
+      "div",
+      {
+        className: "ui-modal-body ui-modal-body-confirm",
+        children: [
+          /* @__PURE__ */ t("div", { className: "ui-modal-message", children: i }),
+          /* @__PURE__ */ l("div", { className: "ui-modal-actions", children: [
+            /* @__PURE__ */ t(
+              "button",
+              {
+                className: "ui-btn ui-btn-default ui-modal-action-btn",
+                onClick: r,
+                children: s("btn_cancel")
+              }
+            ),
+            /* @__PURE__ */ t(
+              "button",
+              {
+                className: "ui-btn ui-btn-danger ui-modal-action-btn",
+                onClick: a,
+                children: s("btn_confirm")
+              }
+            )
+          ] })
+        ]
+      }
+    )
+  }
+) : null, Ea = ({ isOpen: e, onClose: n, t: i, theme: a }) => {
+  if (!e) return null;
+  const [r, s] = O(!1);
+  return /* @__PURE__ */ t(
+    Ye,
     {
-      title,
-      onClose: onCancel,
-      width: 360,
-      height: 188,
-      modal: true,
-      movable: false,
-      theme,
-      children: /* @__PURE__ */ jsxs(
-        "div",
-        {
-          className: "ui-modal-body ui-modal-body-confirm",
-          children: [
-            /* @__PURE__ */ jsx("div", { className: "ui-modal-message", children: message }),
-            /* @__PURE__ */ jsxs("div", { className: "ui-modal-actions", children: [
-              /* @__PURE__ */ jsx(
-                "button",
-                {
-                  className: "ui-btn ui-btn-default ui-modal-action-btn",
-                  onClick: onCancel,
-                  children: t("btn_cancel")
-                }
-              ),
-              /* @__PURE__ */ jsx(
-                "button",
-                {
-                  className: "ui-btn ui-btn-danger ui-modal-action-btn",
-                  onClick: onConfirm,
-                  children: t("btn_confirm")
-                }
-              )
-            ] })
-          ]
-        }
-      )
-    }
-  );
-};
-
-const AboutModal = ({ isOpen, onClose, t, theme }) => {
-  if (!isOpen) return null;
-  const [showLicenseDetails, setShowLicenseDetails] = useState(true);
-  return /* @__PURE__ */ jsx(
-    FloatingPanel,
-    {
-      title: t("about_title"),
-      onClose,
+      title: i("about_title"),
+      onClose: n,
       width: 400,
-      height: 520,
-      modal: true,
-      movable: false,
-      theme,
-      children: /* @__PURE__ */ jsxs("div", { className: "ui-modal-body ui-modal-body-scroll ui-about-modal", children: [
-        /* @__PURE__ */ jsxs("div", { className: "ui-about-hero", children: [
-          /* @__PURE__ */ jsx("div", { className: "ui-about-app-name", children: "3D Browser" }),
-          /* @__PURE__ */ jsx("div", { className: "ui-about-tagline", children: t("about_tagline") })
+      height: r ? 500 : 350,
+      modal: !0,
+      movable: !1,
+      theme: a,
+      children: /* @__PURE__ */ l("div", { className: "ui-modal-body ui-modal-body-scroll ui-about-modal", children: [
+        /* @__PURE__ */ l("div", { className: "ui-about-hero", children: [
+          /* @__PURE__ */ t("div", { className: "ui-about-app-name", children: "3D Browser" }),
+          /* @__PURE__ */ t("div", { className: "ui-about-tagline", children: i("about_tagline") })
         ] }),
-        /* @__PURE__ */ jsxs("div", { className: "ui-about-meta-card", children: [
-          /* @__PURE__ */ jsxs("div", { className: "ui-about-meta-row", children: [
-            /* @__PURE__ */ jsx("span", { className: "ui-about-meta-label", children: t("about_version") }),
-            /* @__PURE__ */ jsx("span", { className: "ui-about-meta-value", children: "1.6.0" })
+        /* @__PURE__ */ l("div", { className: "ui-about-meta-card", children: [
+          /* @__PURE__ */ l("div", { className: "ui-about-meta-row", children: [
+            /* @__PURE__ */ t("span", { className: "ui-about-meta-label", children: i("about_version") }),
+            /* @__PURE__ */ t("span", { className: "ui-about-meta-value", children: "1.6.0" })
           ] }),
-          /* @__PURE__ */ jsxs("div", { className: "ui-about-meta-row", children: [
-            /* @__PURE__ */ jsx("span", { className: "ui-about-meta-label", children: t("about_author") }),
-            /* @__PURE__ */ jsx("span", { className: "ui-about-meta-value", children: "zhangly1403@163.com" })
+          /* @__PURE__ */ l("div", { className: "ui-about-meta-row", children: [
+            /* @__PURE__ */ t("span", { className: "ui-about-meta-label", children: i("about_author") }),
+            /* @__PURE__ */ t("span", { className: "ui-about-meta-value", children: "zhangly1403@163.com" })
           ] }),
-          /* @__PURE__ */ jsxs("div", { className: "ui-about-meta-row", children: [
-            /* @__PURE__ */ jsx("span", { className: "ui-about-meta-label", children: t("project_url") }),
-            /* @__PURE__ */ jsx("a", { href: "https://github.com/zly258/3dbrowser", target: "_blank", rel: "noopener noreferrer", className: "ui-link", children: "github.com/zly258/3dbrowser" })
+          /* @__PURE__ */ l("div", { className: "ui-about-meta-row", children: [
+            /* @__PURE__ */ t("span", { className: "ui-about-meta-label", children: i("project_url") }),
+            /* @__PURE__ */ t("a", { href: "https://github.com/zly258/3dbrowser", target: "_blank", rel: "noopener noreferrer", className: "ui-link", children: "github.com/zly258/3dbrowser" })
           ] }),
-          /* @__PURE__ */ jsxs("div", { className: "ui-about-meta-row", children: [
-            /* @__PURE__ */ jsx("span", { className: "ui-about-meta-label", children: t("about_license") }),
-            /* @__PURE__ */ jsx("span", { className: "ui-about-meta-value ui-about-license-badge", children: t("about_license_nc") })
+          /* @__PURE__ */ l("div", { className: "ui-about-meta-row", children: [
+            /* @__PURE__ */ t("span", { className: "ui-about-meta-label", children: i("about_license") }),
+            /* @__PURE__ */ t("span", { className: "ui-about-meta-value ui-about-license-badge", children: i("about_license_nc") })
           ] })
         ] }),
-        /* @__PURE__ */ jsxs("div", { className: "ui-about-license-card", children: [
-          /* @__PURE__ */ jsxs(
+        /* @__PURE__ */ l("div", { className: "ui-about-license-card", children: [
+          /* @__PURE__ */ l(
             "div",
             {
               className: "ui-about-license-toggle",
-              onClick: () => setShowLicenseDetails(!showLicenseDetails),
+              onClick: () => s(!r),
               children: [
-                /* @__PURE__ */ jsx("span", { className: "ui-about-license-title", children: t("license_details") }),
-                showLicenseDetails ? /* @__PURE__ */ jsx(IconChevronUp, { width: 14, height: 14 }) : /* @__PURE__ */ jsx(IconChevronDown, { width: 14, height: 14 })
+                /* @__PURE__ */ t("span", { className: "ui-about-license-title", children: i("license_details") }),
+                r ? /* @__PURE__ */ t(_r, { width: 14, height: 14 }) : /* @__PURE__ */ t(Ot, { width: 14, height: 14 })
               ]
             }
           ),
-          showLicenseDetails && /* @__PURE__ */ jsxs("div", { className: "ui-about-license-content", children: [
-            /* @__PURE__ */ jsx("div", { className: "ui-about-license-summary", children: t("license_summary") }),
-            /* @__PURE__ */ jsxs("div", { className: "ui-about-license-link", children: [
-              t("full_license"),
+          r && /* @__PURE__ */ l("div", { className: "ui-about-license-content", children: [
+            /* @__PURE__ */ t("div", { className: "ui-about-license-summary", children: i("license_summary") }),
+            /* @__PURE__ */ l("div", { className: "ui-about-license-link", children: [
+              i("full_license"),
               " ",
-              /* @__PURE__ */ jsx("a", { href: "https://creativecommons.org/licenses/by-nc/4.0/", target: "_blank", rel: "noopener noreferrer", className: "ui-link", children: "CC BY-NC 4.0" })
+              /* @__PURE__ */ t("a", { href: "https://creativecommons.org/licenses/by-nc/4.0/", target: "_blank", rel: "noopener noreferrer", className: "ui-link", children: "CC BY-NC 4.0" })
             ] })
           ] })
         ] }),
-        /* @__PURE__ */ jsx("div", { className: "ui-about-footer", children: t("about_copyright") })
+        /* @__PURE__ */ t("div", { className: "ui-about-footer", children: i("about_copyright") })
       ] })
     }
   );
-};
-
-const ViewCube = ({ sceneMgr, lang = "zh", theme }) => {
-  const containerRef = useRef(null);
-  const canvasRef = useRef(null);
-  const rendererRef = useRef(null);
-  const sceneRef = useRef(null);
-  const cameraRef = useRef(null);
-  const cubeRef = useRef(null);
-  const raycaster = useRef(new THREE.Raycaster());
-  const mouse = useRef(new THREE.Vector2());
-  const hoveredPart = useRef(null);
-  const cubeSize = sceneMgr?.settings?.viewCubeSize || 120;
-  const t = (key) => getTranslation(lang, key);
-  useEffect(() => {
-    if (!canvasRef.current || !containerRef.current) return;
-    const width = cubeSize;
-    const height = cubeSize;
-    const canvas = canvasRef.current;
-    const gl = canvas.getContext("webgl2", {
-      antialias: true,
-      alpha: true,
-      preserveDrawingBuffer: false
+}, za = ({ sceneMgr: e, lang: n = "zh", theme: i }) => {
+  const a = ee(null), r = ee(null), s = ee(null), h = ee(null), c = ee(null), u = ee(null), p = ee(new L.Raycaster()), d = ee(new L.Vector2()), y = ee(null), f = e?.settings?.viewCubeSize || 120, v = (k) => Ct(n, k);
+  q(() => {
+    if (!r.current || !a.current) return;
+    const k = f, g = f, P = r.current, R = P.getContext("webgl2", {
+      antialias: !0,
+      alpha: !0,
+      preserveDrawingBuffer: !1
     });
-    if (gl) {
-      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
-    }
-    const renderer = new THREE.WebGLRenderer({
-      canvas,
-      context: gl || void 0,
-      antialias: true,
-      alpha: true,
+    R && (R.pixelStorei(R.UNPACK_FLIP_Y_WEBGL, !1), R.pixelStorei(R.UNPACK_PREMULTIPLY_ALPHA_WEBGL, !1));
+    const S = new L.WebGLRenderer({
+      canvas: P,
+      context: R || void 0,
+      antialias: !0,
+      alpha: !0,
       precision: "mediump"
     });
-    renderer.setSize(width, height);
-    renderer.setPixelRatio(window.devicePixelRatio);
-    rendererRef.current = renderer;
-    const scene = new THREE.Scene();
-    sceneRef.current = scene;
-    const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
-    camera.position.set(0, 0, 3.5);
-    camera.lookAt(0, 0, 0);
-    cameraRef.current = camera;
-    const ambientLight = new THREE.AmbientLight(16777215, 1);
-    scene.add(ambientLight);
-    const dirLight = new THREE.DirectionalLight(16777215, 0.6);
-    dirLight.position.set(5, 5, 5);
-    scene.add(dirLight);
-    const cubeGroup = new THREE.Group();
-    scene.add(cubeGroup);
-    cubeRef.current = cubeGroup;
-    const createFaceTexture = (text, rotation = 0) => {
-      const canvas2 = document.createElement("canvas");
-      canvas2.width = 128;
-      canvas2.height = 128;
-      const context = canvas2.getContext("2d");
-      if (context) {
-        context.fillStyle = "#f8f9fa";
-        context.fillRect(0, 0, 128, 128);
-        context.save();
-        context.translate(64, 64);
-        if (rotation !== 0) {
-          context.rotate(rotation * Math.PI / 180);
-        }
-        context.fillStyle = "#333333";
-        context.font = lang === "zh" ? 'bold 54px "Microsoft YaHei", sans-serif' : "bold 32px Arial, sans-serif";
-        context.textAlign = "center";
-        context.textBaseline = "middle";
-        context.fillText(text, 0, 0);
-        context.restore();
-        context.strokeStyle = "#cccccc";
-        context.lineWidth = 4;
-        context.strokeRect(2, 2, 124, 124);
-      }
-      const texture = new THREE.CanvasTexture(canvas2);
-      return texture;
-    };
-    const faceColor = 16316922;
-    const edgeColor = 16316922;
-    const cornerColor = 16316922;
-    const createPart = (size, pos, name, color, text, rotation = 0) => {
-      const geometry = new THREE.BoxGeometry(size.x, size.y, size.z);
-      let material;
-      if (text) {
-        const texture = createFaceTexture(text, rotation);
-        material = new THREE.MeshPhongMaterial({
-          map: texture,
-          transparent: true,
+    S.setSize(k, g), S.setPixelRatio(window.devicePixelRatio), s.current = S;
+    const I = new L.Scene();
+    h.current = I;
+    const C = new L.PerspectiveCamera(45, 1, 0.1, 100);
+    C.position.set(0, 0, 3.5), C.lookAt(0, 0, 0), c.current = C;
+    const D = new L.AmbientLight(16777215, 1);
+    I.add(D);
+    const N = new L.DirectionalLight(16777215, 0.6);
+    N.position.set(5, 5, 5), I.add(N);
+    const $ = new L.Group();
+    I.add($), u.current = $;
+    const E = (Z, te = 0) => {
+      const ue = document.createElement("canvas");
+      ue.width = 128, ue.height = 128;
+      const ne = ue.getContext("2d");
+      return ne && (ne.fillStyle = "#f8f9fa", ne.fillRect(0, 0, 128, 128), ne.save(), ne.translate(64, 64), te !== 0 && ne.rotate(te * Math.PI / 180), ne.fillStyle = "#333333", ne.font = n === "zh" ? 'bold 54px "Microsoft YaHei", sans-serif' : "bold 32px Arial, sans-serif", ne.textAlign = "center", ne.textBaseline = "middle", ne.fillText(Z, 0, 0), ne.restore(), ne.strokeStyle = "#cccccc", ne.lineWidth = 4, ne.strokeRect(2, 2, 124, 124)), new L.CanvasTexture(ue);
+    }, F = 16316922, A = 16316922, U = 16316922, G = (Z, te, ue, ne, ge, _e = 0) => {
+      const ye = new L.BoxGeometry(Z.x, Z.y, Z.z);
+      let j;
+      if (ge) {
+        const de = E(ge, _e);
+        j = new L.MeshPhongMaterial({
+          map: de,
+          transparent: !0,
           opacity: 0.98,
           shininess: 30
         });
-      } else {
-        material = new THREE.MeshPhongMaterial({
-          color,
-          transparent: true,
+      } else
+        j = new L.MeshPhongMaterial({
+          color: ne,
+          transparent: !0,
           opacity: 0.98,
           shininess: 30
         });
-      }
-      const mesh = new THREE.Mesh(geometry, material);
-      mesh.position.copy(pos);
-      mesh.name = name;
-      mesh.userData.originalOpacity = material.opacity;
-      mesh.userData.originalColor = material.color.clone();
-      mesh.userData.isFace = !!text;
-      cubeGroup.add(mesh);
-      return mesh;
+      const B = new L.Mesh(ye, j);
+      return B.position.copy(te), B.name = ue, B.userData.originalOpacity = j.opacity, B.userData.originalColor = j.color.clone(), B.userData.isFace = !!ge, $.add(B), B;
+    }, H = 0.88, x = 0.12, V = 0.12, z = 0.5;
+    G(new L.Vector3(H, 0.05, H), new L.Vector3(0, -z, 0), "front", F, v("cube_front")), G(new L.Vector3(H, 0.05, H), new L.Vector3(0, z, 0), "back", F, v("cube_back"), 180), G(new L.Vector3(H, H, 0.05), new L.Vector3(0, 0, z), "top", F, v("cube_top"), 360), G(new L.Vector3(H, H, 0.05), new L.Vector3(0, 0, -z), "bottom", F, v("cube_bottom")), G(new L.Vector3(0.05, H, H), new L.Vector3(-z, 0, 0), "left", F, v("cube_left"), 90), G(new L.Vector3(0.05, H, H), new L.Vector3(z, 0, 0), "right", F, v("cube_right"), 270), G(new L.Vector3(H, x, x), new L.Vector3(0, -z, z), "top-front", A), G(new L.Vector3(H, x, x), new L.Vector3(0, z, z), "top-back", A), G(new L.Vector3(x, H, x), new L.Vector3(-z, 0, z), "top-left", A), G(new L.Vector3(x, H, x), new L.Vector3(z, 0, z), "top-right", A), G(new L.Vector3(H, x, x), new L.Vector3(0, -z, -z), "bottom-front", A), G(new L.Vector3(H, x, x), new L.Vector3(0, z, -z), "bottom-back", A), G(new L.Vector3(x, H, x), new L.Vector3(-z, 0, -z), "bottom-left", A), G(new L.Vector3(x, H, x), new L.Vector3(z, 0, -z), "bottom-right", A), G(new L.Vector3(x, x, H), new L.Vector3(-z, -z, 0), "front-left", A), G(new L.Vector3(x, x, H), new L.Vector3(z, -z, 0), "front-right", A), G(new L.Vector3(x, x, H), new L.Vector3(-z, z, 0), "back-left", A), G(new L.Vector3(x, x, H), new L.Vector3(z, z, 0), "back-right", A), G(new L.Vector3(V, V, V), new L.Vector3(-z, -z, z), "top-front-left", U), G(new L.Vector3(V, V, V), new L.Vector3(z, -z, z), "top-front-right", U), G(new L.Vector3(V, V, V), new L.Vector3(-z, z, z), "top-back-left", U), G(new L.Vector3(V, V, V), new L.Vector3(z, z, z), "top-back-right", U), G(new L.Vector3(V, V, V), new L.Vector3(-z, -z, -z), "bottom-front-left", U), G(new L.Vector3(V, V, V), new L.Vector3(z, -z, -z), "bottom-front-right", U), G(new L.Vector3(V, V, V), new L.Vector3(-z, z, -z), "bottom-back-left", U), G(new L.Vector3(V, V, V), new L.Vector3(z, z, -z), "bottom-back-right", U);
+    let ce;
+    const re = () => {
+      ce = requestAnimationFrame(re), e && u.current && u.current.quaternion.copy(e.camera.quaternion).invert(), S.render(I, C);
     };
-    const faceSize = 0.88;
-    const edgeSize = 0.12;
-    const cornerSize = 0.12;
-    const offset = 0.5;
-    createPart(new THREE.Vector3(faceSize, 0.05, faceSize), new THREE.Vector3(0, -offset, 0), "front", faceColor, t("cube_front"));
-    createPart(new THREE.Vector3(faceSize, 0.05, faceSize), new THREE.Vector3(0, offset, 0), "back", faceColor, t("cube_back"), 180);
-    createPart(new THREE.Vector3(faceSize, faceSize, 0.05), new THREE.Vector3(0, 0, offset), "top", faceColor, t("cube_top"), 360);
-    createPart(new THREE.Vector3(faceSize, faceSize, 0.05), new THREE.Vector3(0, 0, -offset), "bottom", faceColor, t("cube_bottom"));
-    createPart(new THREE.Vector3(0.05, faceSize, faceSize), new THREE.Vector3(-offset, 0, 0), "left", faceColor, t("cube_left"), 90);
-    createPart(new THREE.Vector3(0.05, faceSize, faceSize), new THREE.Vector3(offset, 0, 0), "right", faceColor, t("cube_right"), 270);
-    createPart(new THREE.Vector3(faceSize, edgeSize, edgeSize), new THREE.Vector3(0, -offset, offset), "top-front", edgeColor);
-    createPart(new THREE.Vector3(faceSize, edgeSize, edgeSize), new THREE.Vector3(0, offset, offset), "top-back", edgeColor);
-    createPart(new THREE.Vector3(edgeSize, faceSize, edgeSize), new THREE.Vector3(-offset, 0, offset), "top-left", edgeColor);
-    createPart(new THREE.Vector3(edgeSize, faceSize, edgeSize), new THREE.Vector3(offset, 0, offset), "top-right", edgeColor);
-    createPart(new THREE.Vector3(faceSize, edgeSize, edgeSize), new THREE.Vector3(0, -offset, -offset), "bottom-front", edgeColor);
-    createPart(new THREE.Vector3(faceSize, edgeSize, edgeSize), new THREE.Vector3(0, offset, -offset), "bottom-back", edgeColor);
-    createPart(new THREE.Vector3(edgeSize, faceSize, edgeSize), new THREE.Vector3(-offset, 0, -offset), "bottom-left", edgeColor);
-    createPart(new THREE.Vector3(edgeSize, faceSize, edgeSize), new THREE.Vector3(offset, 0, -offset), "bottom-right", edgeColor);
-    createPart(new THREE.Vector3(edgeSize, edgeSize, faceSize), new THREE.Vector3(-offset, -offset, 0), "front-left", edgeColor);
-    createPart(new THREE.Vector3(edgeSize, edgeSize, faceSize), new THREE.Vector3(offset, -offset, 0), "front-right", edgeColor);
-    createPart(new THREE.Vector3(edgeSize, edgeSize, faceSize), new THREE.Vector3(-offset, offset, 0), "back-left", edgeColor);
-    createPart(new THREE.Vector3(edgeSize, edgeSize, faceSize), new THREE.Vector3(offset, offset, 0), "back-right", edgeColor);
-    createPart(new THREE.Vector3(cornerSize, cornerSize, cornerSize), new THREE.Vector3(-offset, -offset, offset), "top-front-left", cornerColor);
-    createPart(new THREE.Vector3(cornerSize, cornerSize, cornerSize), new THREE.Vector3(offset, -offset, offset), "top-front-right", cornerColor);
-    createPart(new THREE.Vector3(cornerSize, cornerSize, cornerSize), new THREE.Vector3(-offset, offset, offset), "top-back-left", cornerColor);
-    createPart(new THREE.Vector3(cornerSize, cornerSize, cornerSize), new THREE.Vector3(offset, offset, offset), "top-back-right", cornerColor);
-    createPart(new THREE.Vector3(cornerSize, cornerSize, cornerSize), new THREE.Vector3(-offset, -offset, -offset), "bottom-front-left", cornerColor);
-    createPart(new THREE.Vector3(cornerSize, cornerSize, cornerSize), new THREE.Vector3(offset, -offset, -offset), "bottom-front-right", cornerColor);
-    createPart(new THREE.Vector3(cornerSize, cornerSize, cornerSize), new THREE.Vector3(-offset, offset, -offset), "bottom-back-left", cornerColor);
-    createPart(new THREE.Vector3(cornerSize, cornerSize, cornerSize), new THREE.Vector3(offset, offset, -offset), "bottom-back-right", cornerColor);
-    let animationId;
-    const animate = () => {
-      animationId = requestAnimationFrame(animate);
-      if (sceneMgr && cubeRef.current) {
-        cubeRef.current.quaternion.copy(sceneMgr.camera.quaternion).invert();
-      }
-      renderer.render(scene, camera);
-    };
-    animate();
-    return () => {
-      cancelAnimationFrame(animationId);
-      renderer.dispose();
-      scene.traverse((obj) => {
-        if (obj instanceof THREE.Mesh) {
-          obj.geometry.dispose();
-          if (Array.isArray(obj.material)) {
-            obj.material.forEach((m) => m.dispose());
-          } else {
-            obj.material.dispose();
-          }
-        }
+    return re(), () => {
+      cancelAnimationFrame(ce), S.dispose(), I.traverse((Z) => {
+        Z instanceof L.Mesh && (Z.geometry.dispose(), Array.isArray(Z.material) ? Z.material.forEach((te) => te.dispose()) : Z.material.dispose());
       });
     };
-  }, [sceneMgr, cubeSize, lang]);
-  const handleMouseMove = (event) => {
-    if (!canvasRef.current || !sceneRef.current || !cameraRef.current || !cubeRef.current) return;
-    const rect = canvasRef.current.getBoundingClientRect();
-    mouse.current.x = (event.clientX - rect.left) / rect.width * 2 - 1;
-    mouse.current.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-    raycaster.current.setFromCamera(mouse.current, cameraRef.current);
-    const intersects = raycaster.current.intersectObjects(cubeRef.current.children);
-    if (intersects.length > 0) {
-      const mesh = intersects[0].object;
-      if (hoveredPart.current !== mesh) {
-        if (hoveredPart.current) {
-          const mat2 = hoveredPart.current.material;
-          mat2.opacity = hoveredPart.current.userData.originalOpacity;
-          mat2.color.copy(hoveredPart.current.userData.originalColor);
+  }, [e, f, n]);
+  const m = (k) => {
+    if (!r.current || !h.current || !c.current || !u.current) return;
+    const g = r.current.getBoundingClientRect();
+    d.current.x = (k.clientX - g.left) / g.width * 2 - 1, d.current.y = -((k.clientY - g.top) / g.height) * 2 + 1, p.current.setFromCamera(d.current, c.current);
+    const P = p.current.intersectObjects(u.current.children);
+    if (P.length > 0) {
+      const R = P[0].object;
+      if (y.current !== R) {
+        if (y.current) {
+          const I = y.current.material;
+          I.opacity = y.current.userData.originalOpacity, I.color.copy(y.current.userData.originalColor);
         }
-        hoveredPart.current = mesh;
-        const mat = mesh.material;
-        mat.opacity = 1;
-        mat.color.set(30932);
+        y.current = R;
+        const S = R.material;
+        S.opacity = 1, S.color.set(30932);
       }
-      containerRef.current.style.cursor = "pointer";
+      a.current.style.cursor = "pointer";
     } else {
-      if (hoveredPart.current) {
-        const mat = hoveredPart.current.material;
-        mat.opacity = hoveredPart.current.userData.originalOpacity;
-        mat.color.copy(hoveredPart.current.userData.originalColor);
-        hoveredPart.current = null;
+      if (y.current) {
+        const R = y.current.material;
+        R.opacity = y.current.userData.originalOpacity, R.color.copy(y.current.userData.originalColor), y.current = null;
       }
-      containerRef.current.style.cursor = "default";
+      a.current.style.cursor = "default";
     }
-  };
-  const handleMouseLeave = () => {
-    if (hoveredPart.current) {
-      const mat = hoveredPart.current.material;
-      mat.opacity = hoveredPart.current.userData.originalOpacity;
-      mat.color.copy(hoveredPart.current.userData.originalColor);
-      hoveredPart.current = null;
+  }, _ = () => {
+    if (y.current) {
+      const k = y.current.material;
+      k.opacity = y.current.userData.originalOpacity, k.color.copy(y.current.userData.originalColor), y.current = null;
     }
-  };
-  const handleClick = (event) => {
-    if (!canvasRef.current || !sceneRef.current || !cameraRef.current || !sceneMgr) return;
-    const rect = canvasRef.current.getBoundingClientRect();
-    mouse.current.x = (event.clientX - rect.left) / rect.width * 2 - 1;
-    mouse.current.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-    raycaster.current.setFromCamera(mouse.current, cameraRef.current);
-    const intersects = raycaster.current.intersectObjects(cubeRef.current.children);
-    if (intersects.length > 0) {
-      const name = intersects[0].object.name;
-      handleViewChange(name);
+  }, o = (k) => {
+    if (!r.current || !h.current || !c.current || !e) return;
+    const g = r.current.getBoundingClientRect();
+    d.current.x = (k.clientX - g.left) / g.width * 2 - 1, d.current.y = -((k.clientY - g.top) / g.height) * 2 + 1, p.current.setFromCamera(d.current, c.current);
+    const P = p.current.intersectObjects(u.current.children);
+    if (P.length > 0) {
+      const R = P[0].object.name;
+      b(R);
     }
+  }, b = (k) => {
+    if (!e) return;
+    let g = k;
+    k === "top-front-right" ? g = "se" : k === "top-front-left" ? g = "sw" : k === "top-back-right" ? g = "ne" : k === "top-back-left" && (g = "nw"), e.setView(g);
   };
-  const handleViewChange = (viewName) => {
-    if (!sceneMgr) return;
-    let targetView = viewName;
-    if (viewName === "top-front-right") targetView = "se";
-    else if (viewName === "top-front-left") targetView = "sw";
-    else if (viewName === "top-back-right") targetView = "ne";
-    else if (viewName === "top-back-left") targetView = "nw";
-    sceneMgr.setView(targetView);
-  };
-  return /* @__PURE__ */ jsx(
+  return /* @__PURE__ */ t(
     "div",
     {
-      ref: containerRef,
+      ref: a,
       style: {
         position: "absolute",
         top: "10px",
         right: "10px",
-        width: `${cubeSize}px`,
-        height: `${cubeSize}px`,
+        width: `${f}px`,
+        height: `${f}px`,
         zIndex: 100,
         pointerEvents: "auto",
         borderRadius: "var(--radius-lg)",
         overflow: "hidden"
       },
-      onClick: handleClick,
-      onMouseMove: handleMouseMove,
-      onMouseLeave: handleMouseLeave,
-      children: /* @__PURE__ */ jsx("canvas", { ref: canvasRef })
+      onClick: o,
+      onMouseMove: m,
+      onMouseLeave: _,
+      children: /* @__PURE__ */ t("canvas", { ref: r })
     }
   );
 };
-
-class ErrorBoundary extends Component {
-  constructor(props) {
-    super(props);
-    this.state = { hasError: false, error: null };
+class Da extends sr {
+  constructor(n) {
+    super(n), this.state = { hasError: !1, error: null };
   }
-  static getDerivedStateFromError(error) {
-    return { hasError: true, error };
+  static getDerivedStateFromError(n) {
+    return { hasError: !0, error: n };
   }
-  componentDidCatch(error, errorInfo) {
-    console.error("ErrorBoundary捕获到错误:", error, errorInfo);
+  componentDidCatch(n, i) {
+    console.error("ErrorBoundary捕获到错误:", n, i);
   }
   render() {
     if (this.state.hasError) {
-      const { t, theme } = this.props;
-      return /* @__PURE__ */ jsxs("div", { style: {
+      const { t: n, theme: i } = this.props;
+      return /* @__PURE__ */ l("div", { style: {
         display: "flex",
         flexDirection: "column",
         alignItems: "center",
         justifyContent: "center",
         height: "100%",
         width: "100%",
-        backgroundColor: theme.bg,
-        color: theme.text,
-        fontFamily: DEFAULT_FONT,
+        backgroundColor: i.bg,
+        color: i.text,
+        fontFamily: hr,
         gap: "20px",
         padding: "40px",
         textAlign: "center"
       }, children: [
-        /* @__PURE__ */ jsx("div", { style: { fontSize: "48px", lineHeight: 1 }, children: "⚠️" }),
-        /* @__PURE__ */ jsx("h1", { style: { fontSize: "var(--font-size-title)", margin: 0, fontWeight: 700 }, children: t("error_title") }),
-        /* @__PURE__ */ jsx("p", { style: { color: theme.textMuted, maxWidth: "600px", lineHeight: "1.6", fontSize: "var(--font-size-body)" }, children: t("error_msg") }),
-        /* @__PURE__ */ jsx(
+        /* @__PURE__ */ t("div", { style: { fontSize: "48px", lineHeight: 1 }, children: "⚠️" }),
+        /* @__PURE__ */ t("h1", { style: { fontSize: "var(--font-size-title)", margin: 0, fontWeight: 700 }, children: n("error_title") }),
+        /* @__PURE__ */ t("p", { style: { color: i.textMuted, maxWidth: "600px", lineHeight: "1.6", fontSize: "var(--font-size-body)" }, children: n("error_msg") }),
+        /* @__PURE__ */ t(
           "button",
           {
             onClick: () => window.location.reload(),
             style: {
               padding: "10px 24px",
-              backgroundColor: theme.accent,
+              backgroundColor: i.accent,
               color: "#fff",
               border: "none",
               borderRadius: "var(--radius-md)",
@@ -11191,7 +4355,7 @@ class ErrorBoundary extends Component {
               fontSize: "var(--font-size-body)",
               minHeight: "var(--control-h-md)"
             },
-            children: t("error_reload")
+            children: n("error_reload")
           }
         )
       ] });
@@ -11199,1280 +4363,964 @@ class ErrorBoundary extends Component {
     return this.props.children;
   }
 }
-
-function usePersistentState(key, initialValue, options = {}) {
+function it(e, n, i = {}) {
   const {
-    storage = typeof window !== "undefined" ? window.localStorage : void 0,
-    serializer = JSON.stringify,
-    parser = JSON.parse
-  } = options;
-  const resolveInitialValue = () => typeof initialValue === "function" ? initialValue() : initialValue;
-  const [state, setState] = useState(() => {
-    const fallback = resolveInitialValue();
-    if (!storage) return fallback;
+    storage: a = typeof window < "u" ? window.localStorage : void 0,
+    serializer: r = JSON.stringify,
+    parser: s = JSON.parse
+  } = i, h = () => typeof n == "function" ? n() : n, [c, u] = O(() => {
+    const p = h();
+    if (!a) return p;
     try {
-      const raw = storage.getItem(key);
-      if (raw === null) return fallback;
-      return parser(raw);
-    } catch (error) {
-      console.warn(`[usePersistentState] Failed to read "${key}"`, error);
-      return fallback;
+      const d = a.getItem(e);
+      return d === null ? p : s(d);
+    } catch (d) {
+      return console.warn(`[usePersistentState] Failed to read "${e}"`, d), p;
     }
   });
-  useEffect(() => {
-    if (!storage) return;
-    try {
-      storage.setItem(key, serializer(state));
-    } catch (error) {
-      console.warn(`[usePersistentState] Failed to write "${key}"`, error);
-    }
-  }, [key, serializer, state, storage]);
-  return [state, setState];
+  return q(() => {
+    if (a)
+      try {
+        a.setItem(e, r(c));
+      } catch (p) {
+        console.warn(`[usePersistentState] Failed to write "${e}"`, p);
+      }
+  }, [e, r, c, a]), [c, u];
 }
-
-function useChunkProgress({
-  fileSetIdRef,
-  completedFileSetsRef,
-  onProgress,
-  onCompleted
+function Va({
+  fileSetIdRef: e,
+  completedFileSetsRef: n,
+  onProgress: i,
+  onCompleted: a
 }) {
-  const chunkProgressRafRef = useRef(null);
-  const pendingChunkProgressRef = useRef(null);
-  const flushChunkProgress = useCallback(() => {
-    chunkProgressRafRef.current = null;
-    const pending = pendingChunkProgressRef.current;
-    if (!pending) return;
-    pendingChunkProgressRef.current = null;
-    const { loaded, total } = pending;
-    onProgress((prev) => {
-      if (prev.loaded === loaded && prev.total === total) return prev;
-      return { loaded, total };
-    });
-    const fileSetId = fileSetIdRef.current;
-    if (loaded === total && total > 0 && fileSetId) {
-      if (!completedFileSetsRef.current.has(fileSetId)) {
-        completedFileSetsRef.current.add(fileSetId);
-        onCompleted();
-      }
-    }
-  }, [completedFileSetsRef, fileSetIdRef, onCompleted, onProgress]);
-  const onManagerChunkProgress = useCallback((loaded, total) => {
-    pendingChunkProgressRef.current = { loaded, total };
-    if (chunkProgressRafRef.current === null) {
-      chunkProgressRafRef.current = requestAnimationFrame(flushChunkProgress);
-    }
-  }, [flushChunkProgress]);
-  useEffect(() => {
-    return () => {
-      if (chunkProgressRafRef.current !== null) {
-        cancelAnimationFrame(chunkProgressRafRef.current);
-        chunkProgressRafRef.current = null;
-      }
-      pendingChunkProgressRef.current = null;
-    };
-  }, []);
-  return { onManagerChunkProgress };
+  const r = ee(null), s = ee(null), h = T(() => {
+    r.current = null;
+    const u = s.current;
+    if (!u) return;
+    s.current = null;
+    const { loaded: p, total: d } = u;
+    i((f) => f.loaded === p && f.total === d ? f : { loaded: p, total: d });
+    const y = e.current;
+    p === d && d > 0 && y && (n.current.has(y) || (n.current.add(y), a()));
+  }, [n, e, a, i]), c = T((u, p) => {
+    s.current = { loaded: u, total: p }, r.current === null && (r.current = requestAnimationFrame(h));
+  }, [h]);
+  return q(() => () => {
+    r.current !== null && (cancelAnimationFrame(r.current), r.current = null), s.current = null;
+  }, []), { onManagerChunkProgress: c };
 }
-
-function normalizePath(path) {
-  return path.replace(/\\/g, "/").replace(/^(\.\/)+/, "").replace(/^\/+/, "").toLowerCase();
+function rn(e) {
+  return e.replace(/\\/g, "/").replace(/^(\.\/)+/, "").replace(/^\/+/, "").toLowerCase();
 }
-function candidateKeys(input) {
-  const normalized = normalizePath(input);
-  const parts = normalized.split("/");
-  const fileName = parts[parts.length - 1];
+function vn(e) {
+  const n = rn(e), i = n.split("/"), a = i[i.length - 1];
   return Array.from(/* @__PURE__ */ new Set([
-    normalized,
-    fileName,
-    `./${normalized}`,
-    `./${fileName}`
+    n,
+    a,
+    `./${n}`,
+    `./${a}`
   ]));
 }
-function createResourceResolver(files) {
-  const localFiles = files.filter((item) => item instanceof File);
-  if (localFiles.length === 0) return null;
-  const blobUrlMap = /* @__PURE__ */ new Map();
-  const register = (key, file) => {
-    if (!key || blobUrlMap.has(key)) return;
-    blobUrlMap.set(key, URL.createObjectURL(file));
+function Aa(e) {
+  const n = e.filter((r) => r instanceof File);
+  if (n.length === 0) return null;
+  const i = /* @__PURE__ */ new Map(), a = (r, s) => {
+    !r || i.has(r) || i.set(r, URL.createObjectURL(s));
   };
-  localFiles.forEach((file) => {
-    register(normalizePath(file.name), file);
-    const relativePath = file.webkitRelativePath;
-    if (relativePath) {
-      const trimmed = relativePath.split("/").slice(1).join("/");
-      register(normalizePath(trimmed), file);
+  return n.forEach((r) => {
+    a(rn(r.name), r);
+    const s = r.webkitRelativePath;
+    if (s) {
+      const h = s.split("/").slice(1).join("/");
+      a(rn(h), r);
     }
-  });
-  return {
-    resolve: (url) => {
-      if (!url || /^(blob:|data:|https?:)/i.test(url)) return url;
-      for (const key of candidateKeys(url)) {
-        const resolved = blobUrlMap.get(key);
-        if (resolved) return resolved;
+  }), {
+    resolve: (r) => {
+      if (!r || /^(blob:|data:|https?:)/i.test(r)) return r;
+      for (const s of vn(r)) {
+        const h = i.get(s);
+        if (h) return h;
       }
-      return url;
+      return r;
     },
-    has: (url) => candidateKeys(url).some((key) => blobUrlMap.has(key)),
+    has: (r) => vn(r).some((s) => i.has(s)),
     dispose: () => {
-      blobUrlMap.forEach((blobUrl) => URL.revokeObjectURL(blobUrl));
-      blobUrlMap.clear();
+      i.forEach((r) => URL.revokeObjectURL(r)), i.clear();
     }
   };
 }
-
-const STAGE_LABELS = {
+const $a = {
   fetch: "reading",
   parse: "analyzing",
   normalize: "processing",
   optimize: "processing",
   addToScene: "processing"
-};
-const STAGE_WEIGHTS = {
+}, Ba = {
   fetch: [0, 20],
   parse: [20, 58],
   normalize: [58, 72],
   optimize: [72, 92],
   addToScene: [92, 100]
-};
-const libPathCache = /* @__PURE__ */ new Map();
-let gltfModulesPromise = null;
-async function getGltfModules() {
-  if (!gltfModulesPromise) {
-    gltfModulesPromise = Promise.all([
-      import('./loaders-TXHpcosE.js').then(n => n.a),
-      import('./loaders-TXHpcosE.js').then(n => n.D),
-      import('./loaders-TXHpcosE.js').then(n => n.K),
-      import('./meshopt_decoder.module-C_9D6xwu.js')
-    ]).then(([a, b, c, d]) => ({
-      GLTFLoader: a.GLTFLoader,
-      DRACOLoader: b.DRACOLoader,
-      KTX2Loader: c.KTX2Loader,
-      MeshoptDecoder: d.MeshoptDecoder
-    }));
-  }
-  return gltfModulesPromise;
+}, Zt = /* @__PURE__ */ new Map();
+let en = null;
+async function Ia() {
+  return en || (en = Promise.all([
+    import("three/examples/jsm/loaders/GLTFLoader.js"),
+    import("three/examples/jsm/loaders/DRACOLoader.js"),
+    import("three/examples/jsm/loaders/KTX2Loader.js"),
+    import("three/examples/jsm/libs/meshopt_decoder.module.js")
+  ]).then(([e, n, i, a]) => ({
+    GLTFLoader: e.GLTFLoader,
+    DRACOLoader: n.DRACOLoader,
+    KTX2Loader: i.KTX2Loader,
+    MeshoptDecoder: a.MeshoptDecoder
+  }))), en;
 }
-function normalizeLibPath(libPath) {
-  if (!libPathCache.has(libPath)) {
-    const trimmed = libPath.replace(/\/$/, "");
-    const resolved = typeof window !== "undefined" ? new URL(trimmed ? `${trimmed}/` : "./", window.location.href).toString().replace(/\/$/, "") : trimmed;
-    libPathCache.set(libPath, resolved);
+function $n(e) {
+  if (!Zt.has(e)) {
+    const n = e.replace(/\/$/, ""), i = typeof window < "u" ? new URL(n ? `${n}/` : "./", window.location.href).toString().replace(/\/$/, "") : n;
+    Zt.set(e, i);
   }
-  return libPathCache.get(libPath);
+  return Zt.get(e);
 }
-function createLoadingManager(files, _libPath, _settings) {
-  const resourceResolver = createResourceResolver(files);
-  const manager = new THREE.LoadingManager();
-  if (resourceResolver) {
-    manager.setURLModifier((url) => resourceResolver.resolve(url));
-  }
-  const cleanup = () => {
-    resourceResolver?.dispose();
-  };
-  return { manager, cleanup, resourceResolver };
+function Oa(e, n, i) {
+  const a = Aa(e), r = new L.LoadingManager();
+  return a && r.setURLModifier((h) => a.resolve(h)), { manager: r, cleanup: () => {
+    a?.dispose();
+  }, resourceResolver: a };
 }
-async function createGltfLoaderRuntime(manager, libPath) {
-  const { GLTFLoader, DRACOLoader, KTX2Loader, MeshoptDecoder } = await getGltfModules();
-  const normalizedLibPath = normalizeLibPath(libPath);
-  const supportsCompressedTextures = typeof window !== "undefined" && !!window.createImageBitmap;
-  let probeRenderer = null;
-  const dracoLoader = new DRACOLoader(manager);
-  dracoLoader.setDecoderPath(`${normalizedLibPath}/draco/gltf/`);
-  const ktx2Loader = new KTX2Loader(manager);
-  ktx2Loader.setTranscoderPath(`${normalizedLibPath}/basis/`);
-  if (typeof document !== "undefined") {
+async function Fa(e, n) {
+  const { GLTFLoader: i, DRACOLoader: a, KTX2Loader: r, MeshoptDecoder: s } = await Ia(), h = $n(n), c = typeof window < "u" && !!window.createImageBitmap;
+  let u = null;
+  const p = new a(e);
+  p.setDecoderPath(`${h}/draco/gltf/`);
+  const d = new r(e);
+  if (d.setTranscoderPath(`${h}/basis/`), typeof document < "u")
     try {
-      probeRenderer = new THREE.WebGLRenderer({ canvas: document.createElement("canvas") });
-      ktx2Loader.detectSupport(probeRenderer);
-    } catch (error) {
-      console.warn("[LoaderUtils] KTX2 detectSupport failed", error);
+      u = new L.WebGLRenderer({ canvas: document.createElement("canvas") }), d.detectSupport(u);
+    } catch (f) {
+      console.warn("[LoaderUtils] KTX2 detectSupport failed", f);
     }
-  }
-  const loader = new GLTFLoader(manager);
-  loader.setDRACOLoader(dracoLoader);
-  loader.setMeshoptDecoder(MeshoptDecoder);
-  if (supportsCompressedTextures) {
-    loader.setKTX2Loader(ktx2Loader);
-  }
-  return {
-    loader,
+  const y = new i(e);
+  return y.setDRACOLoader(p), y.setMeshoptDecoder(s), c && y.setKTX2Loader(d), {
+    loader: y,
     cleanup: () => {
-      dracoLoader.dispose();
-      ktx2Loader.dispose();
-      probeRenderer?.dispose();
+      p.dispose(), d.dispose(), u?.dispose();
     }
   };
 }
-function createStageProgressReporter(onProgress, t, fileName, fileBaseProgress, fileWeight) {
-  return (stage, progress, msg) => {
-    const [start, end] = STAGE_WEIGHTS[stage];
-    const safeP = Math.min(100, Math.max(0, Number.isFinite(progress) ? progress : 0));
-    const stagePercent = start + safeP / 100 * (end - start);
-    const totalPercent = fileBaseProgress + stagePercent / 100 * fileWeight;
-    const label = msg || `${t(STAGE_LABELS[stage])} ${fileName}`;
-    onProgress(Math.round(totalPercent), label);
+function Pa(e, n, i, a, r) {
+  return (s, h, c) => {
+    const [u, p] = Ba[s], d = Math.min(100, Math.max(0, Number.isFinite(h) ? h : 0)), y = u + d / 100 * (p - u), f = a + y / 100 * r, v = c || `${n($a[s])} ${i}`;
+    e(Math.round(f), v);
   };
 }
-async function loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t, settings, libPath, runtimeHints) {
-  const loaderContext = createLoadingManager(files);
-  const { manager, cleanup, resourceResolver } = loaderContext;
+async function Ta(e, n, i, a, r, s, h, c, u) {
+  const p = Oa(a), { manager: d, cleanup: y, resourceResolver: f } = p;
   try {
-    if (ext === "lmb") {
-      const { LMBLoader } = await import('./lmbLoader-CgYhcRwk.js');
-      const loader = new LMBLoader();
-      reportStage("parse", 0);
-      return await loader.loadAsync(
-        url,
-        (p) => reportStage("parse", p * 100),
-        { fastMode: (runtimeHints.loadProfile ?? "balanced") === "max-speed" }
+    if (i === "lmb") {
+      const { LMBLoader: v } = await import("./lmbLoader-9Jgmv6We.js"), m = new v();
+      return r("parse", 0), await m.loadAsync(
+        n,
+        (_) => r("parse", _ * 100),
+        { fastMode: (u.loadProfile ?? "balanced") === "max-speed" }
       );
     }
-    if (ext === "glb" || ext === "gltf") {
-      const { loader, cleanup: cleanupGltf } = await createGltfLoaderRuntime(manager, libPath);
-      reportStage("parse", 0);
+    if (i === "glb" || i === "gltf") {
+      const { loader: v, cleanup: m } = await Fa(d, c);
+      r("parse", 0);
       try {
-        const gltf = await new Promise((resolve, reject) => {
-          loader.load(
-            url,
-            resolve,
-            (e) => {
-              if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
-              else reportStage("parse", 50);
+        return (await new Promise((o, b) => {
+          v.load(
+            n,
+            o,
+            (k) => {
+              k.total && k.total > 0 ? r("parse", k.loaded / k.total * 100) : r("parse", 50);
             },
-            reject
+            b
           );
-        });
-        return gltf.scene;
+        })).scene;
       } finally {
-        cleanupGltf();
+        m();
       }
     }
-    if (ext === "fbx") {
-      const { FBXLoader } = await import('./loaders-TXHpcosE.js').then(n => n.F);
-      const loader = new FBXLoader(manager);
-      reportStage("parse", 0);
-      return await new Promise((resolve, reject) => {
-        loader.load(
-          url,
-          resolve,
-          (e) => {
-            if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
-            else reportStage("parse", 50);
+    if (i === "fbx") {
+      const { FBXLoader: v } = await import("three/examples/jsm/loaders/FBXLoader.js"), m = new v(d);
+      return r("parse", 0), await new Promise((_, o) => {
+        m.load(
+          n,
+          _,
+          (b) => {
+            b.total && b.total > 0 ? r("parse", b.loaded / b.total * 100) : r("parse", 50);
           },
-          reject
+          o
         );
       });
     }
-    if (ext === "ifc") {
-      const { loadIFC } = await import('./ifcLoader-UXbmG1k2.js');
-      reportStage("parse", 0);
-      const ifcSettings = {
-        ...settings,
-        deferIfcProperties: runtimeHints.deferIfcProperties ?? true
+    if (i === "ifc") {
+      const { loadIFC: v } = await import("./ifcLoader-CKZqNA_I.js");
+      r("parse", 0);
+      const m = {
+        ...h,
+        deferIfcProperties: u.deferIfcProperties ?? !0
       };
-      return await loadIFC(
-        typeof fileOrUrl === "string" ? url : fileOrUrl,
-        (p, msg) => reportStage("parse", p, msg),
-        t,
-        libPath,
-        ifcSettings
+      return await v(
+        typeof e == "string" ? n : e,
+        (_, o) => r("parse", _, o),
+        s,
+        c,
+        m
       );
     }
-    if (ext === "obj") {
-      const [{ OBJLoader }, { MTLLoader }] = await Promise.all([
-        import('./loaders-TXHpcosE.js').then(n => n.b),
-        import('./loaders-TXHpcosE.js').then(n => n.M)
-      ]);
-      const objLoader = new OBJLoader(manager);
-      const mtlName = url.replace(/\.[^.]+$/i, ".mtl");
-      if (resourceResolver?.has(mtlName)) {
+    if (i === "obj") {
+      const [{ OBJLoader: v }, { MTLLoader: m }] = await Promise.all([
+        import("three/examples/jsm/loaders/OBJLoader.js"),
+        import("three/examples/jsm/loaders/MTLLoader.js")
+      ]), _ = new v(d), o = n.replace(/\.[^.]+$/i, ".mtl");
+      if (f?.has(o))
         try {
-          const materials = await new Promise((resolve, reject) => {
-            const mtlLoader = new MTLLoader(manager);
-            mtlLoader.load(mtlName, resolve, void 0, reject);
+          const b = await new Promise((k, g) => {
+            new m(d).load(o, k, void 0, g);
           });
-          materials.preload();
-          objLoader.setMaterials(materials);
-        } catch (error) {
-          console.warn("[LoaderUtils] Failed to load companion MTL", error);
+          b.preload(), _.setMaterials(b);
+        } catch (b) {
+          console.warn("[LoaderUtils] Failed to load companion MTL", b);
         }
-      }
-      reportStage("parse", 0);
-      return await objLoader.loadAsync(url, (e) => {
-        if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
-        else reportStage("parse", 50);
+      return r("parse", 0), await _.loadAsync(n, (b) => {
+        b.total && b.total > 0 ? r("parse", b.loaded / b.total * 100) : r("parse", 50);
       });
     }
-    if (ext === "stl") {
-      const { STLLoader } = await import('./loaders-TXHpcosE.js').then(n => n.S);
-      const loader = new STLLoader(manager);
-      reportStage("parse", 0);
-      const geometry = await loader.loadAsync(url, (e) => {
-        if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
+    if (i === "stl") {
+      const { STLLoader: v } = await import("three/examples/jsm/loaders/STLLoader.js"), m = new v(d);
+      r("parse", 0);
+      const _ = await m.loadAsync(n, (o) => {
+        o.total && o.total > 0 && r("parse", o.loaded / o.total * 100);
       });
-      return new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color: 8947848 }));
+      return new L.Mesh(_, new L.MeshStandardMaterial({ color: 8947848 }));
     }
-    if (ext === "ply") {
-      const { PLYLoader } = await import('./loaders-TXHpcosE.js').then(n => n.P);
-      const loader = new PLYLoader(manager);
-      reportStage("parse", 0);
-      const geometry = await loader.loadAsync(url, (e) => {
-        if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
+    if (i === "ply") {
+      const { PLYLoader: v } = await import("three/examples/jsm/loaders/PLYLoader.js"), m = new v(d);
+      r("parse", 0);
+      const _ = await m.loadAsync(n, (o) => {
+        o.total && o.total > 0 && r("parse", o.loaded / o.total * 100);
       });
-      return new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({
+      return new L.Mesh(_, new L.MeshStandardMaterial({
         color: 8947848,
-        vertexColors: geometry.hasAttribute("color")
+        vertexColors: _.hasAttribute("color")
       }));
     }
-    if (ext === "3mf") {
-      const { ThreeMFLoader } = await import('./loaders-TXHpcosE.js').then(n => n._);
-      const loader = new ThreeMFLoader(manager);
-      reportStage("parse", 0);
-      return await loader.loadAsync(url, (e) => {
-        if (e.total && e.total > 0) reportStage("parse", e.loaded / e.total * 100);
+    if (i === "3mf") {
+      const { ThreeMFLoader: v } = await import("three/examples/jsm/loaders/3MFLoader.js"), m = new v(d);
+      return r("parse", 0), await m.loadAsync(n, (_) => {
+        _.total && _.total > 0 && r("parse", _.loaded / _.total * 100);
       });
     }
-    if (ext === "stp" || ext === "step" || ext === "igs" || ext === "iges") {
-      reportStage("fetch", 0);
-      const buffer = typeof fileOrUrl === "string" ? await fetch(url).then((r) => r.arrayBuffer()) : await fileOrUrl.arrayBuffer();
-      const normalizedLibPath = normalizeLibPath(libPath);
-      const wasmUrl = `${normalizedLibPath}/occt-import-js/occt-import-js.wasm`;
-      const { OCCTLoader } = await import('./occtLoader-CiM09x_z.js');
-      const loader = new OCCTLoader(wasmUrl);
-      reportStage("parse", 0);
-      return await loader.load(buffer, t, (p, msg) => reportStage("parse", p, msg));
+    if (i === "stp" || i === "step" || i === "igs" || i === "iges") {
+      r("fetch", 0);
+      const v = typeof e == "string" ? await fetch(n).then((k) => k.arrayBuffer()) : await e.arrayBuffer(), _ = `${$n(c)}/occt-import-js/occt-import-js.wasm`, { OCCTLoader: o } = await import("./occtLoader-CqjlQM7F.js"), b = new o(_);
+      return r("parse", 0), await b.load(v, s, (k, g) => r("parse", k, g));
     }
     return null;
   } finally {
-    cleanup();
+    y();
   }
 }
-function normalizeLoadedObject(object, settings, mode = "full") {
-  const maxFastMeshes = 3200;
-  let meshVisited = 0;
-  object.traverse((child) => {
-    if (child.isMesh) {
-      if (mode === "fast" && meshVisited >= maxFastMeshes) return;
-      const mesh = child;
-      mesh.frustumCulled = settings.frustumCulling ?? true;
-      meshVisited += 1;
-      if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
-      if (!mesh.geometry.boundingSphere) mesh.geometry.computeBoundingSphere();
-      const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-      materials.forEach((material) => {
-        if (!material) return;
-        if ("wireframe" in material) {
-          material.wireframe = false;
-        }
+function wn(e, n, i = "full") {
+  let r = 0;
+  e.traverse((s) => {
+    if (s.isMesh) {
+      if (i === "fast" && r >= 3200) return;
+      const h = s;
+      h.frustumCulled = n.frustumCulling ?? !0, r += 1, h.geometry.boundingBox || h.geometry.computeBoundingBox(), h.geometry.boundingSphere || h.geometry.computeBoundingSphere(), (Array.isArray(h.material) ? h.material : [h.material]).forEach((u) => {
+        u && "wireframe" in u && (u.wireframe = !1);
       });
     }
   });
 }
-const loadModelFiles = async (files, onProgress, t, settings, libPath = "./libs", runtimeHints = {}) => {
-  const loadedObjects = [];
-  const totalFiles = files.length;
-  for (let i = 0; i < totalFiles; i++) {
-    if (runtimeHints.isStale?.()) break;
-    const fileOrUrl = files[i];
-    const isUrl = typeof fileOrUrl === "string";
-    let fileName = "";
-    let ext = "";
-    let url = "";
-    if (isUrl) {
-      url = fileOrUrl;
-      const urlPath = url.split("?")[0].split("#")[0];
-      fileName = urlPath.split("/").pop() || "model";
-      ext = fileName.split(".").pop()?.toLowerCase() || "";
-    } else {
-      fileName = fileOrUrl.name;
-      ext = fileName.split(".").pop()?.toLowerCase() || "";
-      url = URL.createObjectURL(fileOrUrl);
-    }
-    const fileBaseProgress = i / totalFiles * 100;
-    const fileWeight = 100 / totalFiles;
-    const reportStage = createStageProgressReporter(onProgress, t, fileName, fileBaseProgress, fileWeight);
+const Ra = async (e, n, i, a, r = "./libs", s = {}) => {
+  const h = [], c = e.length;
+  for (let u = 0; u < c && !s.isStale?.(); u++) {
+    const p = e[u], d = typeof p == "string";
+    let y = "", f = "", v = "";
+    d ? (v = p, y = v.split("?")[0].split("#")[0].split("/").pop() || "model", f = y.split(".").pop()?.toLowerCase() || "") : (y = p.name, f = y.split(".").pop()?.toLowerCase() || "", v = URL.createObjectURL(p));
+    const m = u / c * 100, _ = 100 / c, o = Pa(n, i, y, m, _);
     try {
-      reportStage("fetch", 5);
-      const object = await loadObjectByExtension(fileOrUrl, url, ext, files, reportStage, t, settings, libPath, runtimeHints);
-      if (!object) continue;
-      object.name = fileName;
-      reportStage("normalize", 30, `${t("processing")} ${fileName}`);
-      const fastSanitize = runtimeHints.fastGeometrySanitize ?? true;
-      normalizeLoadedObject(object, settings, fastSanitize ? "fast" : "full");
-      if (fastSanitize) {
-        setTimeout(() => {
-          if (runtimeHints.isStale?.()) return;
-          normalizeLoadedObject(object, settings, "full");
-        }, 0);
-      }
-      reportStage("optimize", 100, `${t("analyzing")} ${fileName}`);
-      reportStage("addToScene", 100, `${t("success")} ${fileName}`);
-      loadedObjects.push(object);
-    } catch (error) {
-      console.error(`加载 ${fileName} 失败`, error);
+      o("fetch", 5);
+      const b = await Ta(p, v, f, e, o, i, a, r, s);
+      if (!b) continue;
+      b.name = y, o("normalize", 30, `${i("processing")} ${y}`);
+      const k = s.fastGeometrySanitize ?? !0;
+      wn(b, a, k ? "fast" : "full"), k && setTimeout(() => {
+        s.isStale?.() || wn(b, a, "full");
+      }, 0), o("optimize", 100, `${i("analyzing")} ${y}`), o("addToScene", 100, `${i("success")} ${y}`), h.push(b);
+    } catch (b) {
+      console.error(`加载 ${y} 失败`, b);
     } finally {
-      if (!isUrl) URL.revokeObjectURL(url);
+      d || URL.revokeObjectURL(v);
     }
   }
-  onProgress(100, t("analyzing"));
-  return loadedObjects;
+  return n(100, i("analyzing")), h;
 };
-
-function cleanLoadingStatus(message) {
-  if (!message) return "";
-  return message.replace(/:\s*\d+%/g, "").replace(/\(\d+%\)/g, "").replace(/\d+%/g, "").trim();
+function Bn(e) {
+  return e ? e.replace(/:\s*\d+%/g, "").replace(/\(\d+%\)/g, "").replace(/\d+%/g, "").trim() : "";
 }
-function createFileSetId(items) {
-  const names = items.map((item) => typeof item === "string" ? item : item.name).sort();
-  return names.join("|");
+function ja(e) {
+  return e.map((i) => typeof i == "string" ? i : i.name).sort().join("|");
 }
-async function loadSceneItems({
-  items,
-  manager,
-  sceneSettings,
-  libPath,
-  t,
-  onProgress,
-  runtimeHints = {},
-  isStale
+async function Ua({
+  items: e,
+  manager: n,
+  sceneSettings: i,
+  libPath: a,
+  t: r,
+  onProgress: s,
+  runtimeHints: h = {},
+  isStale: c
 }) {
-  if (!items.length) return;
-  const nbimItems = [];
-  const otherItems = [];
-  for (const item of items) {
-    const path = typeof item === "string" ? item.split("?")[0].split("#")[0] : item.name;
-    if (path.toLowerCase().endsWith(".nbim")) {
-      nbimItems.push(item);
-    } else {
-      otherItems.push(item);
-    }
-  }
-  for (const item of nbimItems) {
-    if (isStale?.()) return;
-    if (typeof item === "string") {
-      const response = await fetch(item);
-      if (!response.ok) throw new Error(`HTTP ${response.status} when fetching NBIM`);
-      const blob = await response.blob();
-      const fileName = item.split("?")[0].split("#")[0].split("/").pop() || "model.nbim";
-      const file = new File([blob], fileName);
-      await manager.loadNbim(file, (p, msg) => {
-        onProgress(p, msg);
+  if (!e.length) return;
+  const u = [], p = [];
+  for (const f of e)
+    (typeof f == "string" ? f.split("?")[0].split("#")[0] : f.name).toLowerCase().endsWith(".nbim") ? u.push(f) : p.push(f);
+  for (const f of u) {
+    if (c?.()) return;
+    if (typeof f == "string") {
+      const v = await fetch(f);
+      if (!v.ok) throw new Error(`HTTP ${v.status} when fetching NBIM`);
+      const m = await v.blob(), _ = f.split("?")[0].split("#")[0].split("/").pop() || "model.nbim", o = new File([m], _);
+      await n.loadNbim(o, (b, k) => {
+        s(b, k);
       });
-    } else {
-      await manager.loadNbim(item, (p, msg) => {
-        onProgress(p, msg);
+    } else
+      await n.loadNbim(f, (v, m) => {
+        s(v, m);
       });
-    }
   }
-  if (otherItems.length === 0) return;
-  const loadedObjects = await loadModelFiles(
-    otherItems,
-    onProgress,
-    t,
-    sceneSettings,
-    libPath,
+  if (p.length === 0) return;
+  const d = await Ra(
+    p,
+    s,
+    r,
+    i,
+    a,
     {
-      ...runtimeHints,
-      isStale
+      ...h,
+      isStale: c
     }
-  );
-  const totalObjects = Math.max(loadedObjects.length, 1);
-  for (let index = 0; index < loadedObjects.length; index++) {
-    if (isStale?.()) return;
-    const obj = loadedObjects[index];
-    const objectBase = 92 + Math.round(index / totalObjects * 8);
-    await manager.addModel(obj, (p, msg) => {
-      const stagedProgress = Math.min(100, objectBase + Math.round(p / 100 * (8 / totalObjects)));
-      onProgress(stagedProgress, msg);
+  ), y = Math.max(d.length, 1);
+  for (let f = 0; f < d.length; f++) {
+    if (c?.()) return;
+    const v = d[f], m = 92 + Math.round(f / y * 8);
+    await n.addModel(v, (_, o) => {
+      const b = Math.min(100, m + Math.round(_ / 100 * (8 / y)));
+      s(b, o);
+    }), n.invalidateRender?.({
+      invalidateInteractables: !0,
+      needsBoundsUpdate: !0,
+      needsCulling: !0
     });
   }
 }
-
-function useFileLoadingFlow({
-  managerRef,
-  sceneSettings,
-  libPath,
-  t,
-  setCurrentFileSetId,
-  setLoading,
-  setStatus,
-  setProgress,
-  setToast,
-  updateTree
+function Ha({
+  managerRef: e,
+  sceneSettings: n,
+  libPath: i,
+  t: a,
+  setCurrentFileSetId: r,
+  setLoading: s,
+  setStatus: h,
+  setProgress: c,
+  setToast: u,
+  updateTree: p
 }) {
-  const loadItemsIntoScene = useCallback(async (items) => {
-    if (!items.length || !managerRef.current) return;
-    const generation = managerRef.current.beginLoadGeneration?.() ?? 0;
-    const runtimeHints = managerRef.current.getChunkOptions?.() || {};
-    await loadSceneItems({
-      items,
-      manager: managerRef.current,
-      sceneSettings,
-      libPath,
-      t,
-      onProgress: (p, msg) => {
-        setProgress(p);
-        if (msg) setStatus(cleanLoadingStatus(msg));
+  const d = T(async (f) => {
+    if (!f.length || !e.current) return;
+    const v = e.current, m = v.beginLoadGeneration?.() ?? 0, _ = v.getChunkOptions?.() || {};
+    await Ua({
+      items: f,
+      manager: v,
+      sceneSettings: n,
+      libPath: i,
+      t: a,
+      onProgress: (o, b) => {
+        c(o), b && h(Bn(b)), v.invalidateRender?.();
       },
-      runtimeHints,
-      isStale: () => !managerRef.current?.isLoadGenerationCurrent?.(generation)
+      runtimeHints: _,
+      isStale: () => !e.current?.isLoadGenerationCurrent?.(m)
+    }), v.invalidateRender?.({
+      invalidateInteractables: !0,
+      needsBoundsUpdate: !0,
+      needsCulling: !0
     });
-  }, [libPath, managerRef, sceneSettings, setProgress, setStatus, t]);
-  const processFiles = useCallback(async (items) => {
-    if (!items.length || !managerRef.current) return;
-    const setId = createFileSetId(items);
-    setCurrentFileSetId(setId);
-    managerRef.current.setChunkLoadingEnabled?.(true);
-    managerRef.current.setContentVisible?.(true);
-    setLoading(true);
-    setStatus(t("loading"));
-    setProgress(0);
-    try {
-      await loadItemsIntoScene(items);
-      updateTree();
-      const hasNbim = items.some((item) => {
-        const path = typeof item === "string" ? item : item.name;
-        return path.toLowerCase().endsWith(".nbim");
-      });
-      if (hasNbim) {
-        const stats = managerRef.current.getStats?.();
-        if (stats && stats.meshes <= 0) {
-          throw new Error("NBIM 加载完成但没有可渲染外形，请检查文件格式或分块数据");
-        }
-      } else {
-        managerRef.current?.fitView(false);
+  }, [i, e, n, c, h, a]);
+  return {
+    processFiles: T(async (f) => {
+      if (!f.length || !e.current) return;
+      const v = ja(f);
+      r(v), e.current.setChunkLoadingEnabled?.(!0), e.current.setContentVisible?.(!0), s(!0), h(a("loading")), c(0);
+      try {
+        if (await d(f), p(), e.current?.invalidateRender?.({
+          invalidateInteractables: !0,
+          needsBoundsUpdate: !0,
+          needsCulling: !0
+        }), f.some((_) => (typeof _ == "string" ? _ : _.name).toLowerCase().endsWith(".nbim"))) {
+          const _ = e.current.getStats?.();
+          if (_ && _.meshes <= 0)
+            throw new Error("NBIM 加载完成但没有可渲染外形，请检查文件格式或分块数据");
+        } else
+          e.current?.fitView(!1);
+        e.current?.invalidateRender?.({
+          invalidateInteractables: !0,
+          needsBoundsUpdate: !0,
+          needsCulling: !0
+        }), h(a("success"));
+      } catch (m) {
+        h(a("failed")), u({ message: `${a("failed")}: ${m.message}`, type: "error" });
+      } finally {
+        s(!1), e.current?.invalidateRender?.();
       }
-      setStatus(t("success"));
-    } catch (err) {
-      setStatus(t("failed"));
-      setToast({ message: `${t("failed")}: ${err.message}`, type: "error" });
-    } finally {
-      setLoading(false);
-    }
-  }, [loadItemsIntoScene, managerRef, setCurrentFileSetId, setLoading, setProgress, setStatus, setToast, t, updateTree]);
-  return {
-    processFiles,
-    loadItemsIntoScene
+    }, [d, e, r, s, c, h, u, a, p]),
+    loadItemsIntoScene: d
   };
 }
-
-function useSceneStats({ mgrInstance, showStats, setStats }) {
-  useEffect(() => {
-    if (!mgrInstance || !showStats) return;
-    const updateStats = () => {
-      if (document.visibilityState !== "visible") return;
-      setStats(mgrInstance.getStats());
+function Ga({ mgrInstance: e, showStats: n, setStats: i }) {
+  q(() => {
+    if (!e || !n) return;
+    const a = () => {
+      document.visibilityState === "visible" && i(e.getStats());
     };
-    updateStats();
-    const statsInterval = window.setInterval(updateStats, 1e3);
-    document.addEventListener("visibilitychange", updateStats);
-    return () => {
-      window.clearInterval(statsInterval);
-      document.removeEventListener("visibilitychange", updateStats);
+    a();
+    const r = window.setInterval(a, 1e3);
+    return document.addEventListener("visibilitychange", a), () => {
+      window.clearInterval(r), document.removeEventListener("visibilitychange", a);
     };
-  }, [mgrInstance, setStats, showStats]);
+  }, [e, i, n]);
 }
-
-function toggleUuidSelection(current, uuid) {
-  return current.includes(uuid) ? current.filter((id) => id !== uuid) : [...current, uuid];
+function Wa(e, n) {
+  return e.includes(n) ? e.filter((i) => i !== n) : [...e, n];
 }
-function getLastSelectedUuid(current) {
-  return current.length > 0 ? current[current.length - 1] : null;
+function Ka(e) {
+  return e.length > 0 ? e[e.length - 1] : null;
 }
-
-function useSceneSelection() {
-  const [selectedUuids, setSelectedUuids] = useState([]);
-  const selectedUuid = useMemo(
-    () => getLastSelectedUuid(selectedUuids),
-    [selectedUuids]
-  );
-  const clearSelection = useCallback(() => {
-    setSelectedUuids([]);
-  }, []);
-  const setSingleSelection = useCallback((uuid) => {
-    setSelectedUuids([uuid]);
-  }, []);
-  const toggleSelection = useCallback((uuid) => {
-    setSelectedUuids((prev) => toggleUuidSelection(prev, uuid));
+function Xa() {
+  const [e, n] = O([]), i = Se(
+    () => Ka(e),
+    [e]
+  ), a = T(() => {
+    n([]);
+  }, []), r = T((h) => {
+    n([h]);
+  }, []), s = T((h) => {
+    n((c) => Wa(c, h));
   }, []);
   return {
-    selectedUuids,
-    selectedUuid,
-    setSelectedUuids,
-    clearSelection,
-    setSingleSelection,
-    toggleSelection
+    selectedUuids: e,
+    selectedUuid: i,
+    setSelectedUuids: n,
+    clearSelection: a,
+    setSingleSelection: r,
+    toggleSelection: s
   };
 }
-
-function buildSelectedPropertyGroups({
-  basicLabel,
-  geoLabel,
-  basicProps,
-  geoProps,
-  ifcProps,
-  nbimProps,
-  nbimLabel = "BIM 属性"
+function Ya({
+  basicLabel: e,
+  geoLabel: n,
+  basicProps: i,
+  geoProps: a,
+  ifcProps: r,
+  nbimProps: s,
+  nbimLabel: h = "BIM 属性"
 }) {
-  const groups = [
+  const c = [
     {
-      name: basicLabel,
-      items: createPropertyEntries(basicLabel, basicProps, "basic")
+      name: e,
+      items: yt(e, i, "basic")
     },
     {
-      name: geoLabel,
-      items: createPropertyEntries(geoLabel, geoProps, "geometry")
+      name: n,
+      items: yt(n, a, "geometry")
     }
   ];
-  if (ifcProps) {
-    groups.push(...buildPropertyGroupsFromRecord(ifcProps, "ifc"));
-  }
-  return groups;
+  return r && c.push(...Ca(r, "ifc")), c;
 }
-
-function resolveSelectionTarget(sceneManager, selectionObject, focusUuid) {
-  let realObject = focusUuid === (selectionObject?.uuid || selectionObject?.id) && selectionObject instanceof THREE.Object3D ? selectionObject : sceneManager.contentGroup.getObjectByProperty("uuid", focusUuid);
-  if (!realObject) {
-    const nodes = sceneManager.getStructureNodes(focusUuid);
-    if (nodes && nodes.length > 0) {
-      realObject = nodes[0];
-    }
+function qa(e, n, i) {
+  let a = i === (n?.uuid || n?.id) && n instanceof L.Object3D ? n : e.contentGroup.getObjectByProperty("uuid", i);
+  if (!a) {
+    const r = e.getStructureNodes(i);
+    r && r.length > 0 && (a = r[0]);
   }
-  return realObject || selectionObject;
+  return a || n;
 }
-function resolveTargetElevation(target) {
-  if (typeof target?.userData?.ifcMetadata?.elevation === "number") {
-    return target.userData.ifcMetadata.elevation;
+function Qa(e) {
+  if (typeof e?.userData?.ifcMetadata?.elevation == "number")
+    return e.userData.ifcMetadata.elevation;
+  if (!(e instanceof L.Object3D)) return;
+  let n = e;
+  for (; n; ) {
+    const i = n.userData?.ifcMetadata?.elevation;
+    if (typeof i == "number" && Number.isFinite(i))
+      return i;
+    n = n.parent;
   }
-  if (!(target instanceof THREE.Object3D)) return void 0;
-  let cursor = target;
-  while (cursor) {
-    const elevation = cursor.userData?.ifcMetadata?.elevation;
-    if (typeof elevation === "number" && Number.isFinite(elevation)) {
-      return elevation;
-    }
-    cursor = cursor.parent;
-  }
-  return void 0;
 }
-async function fetchIfcGroups(target, cache) {
-  const resolveIfcContext = (candidate) => {
-    let cursor = candidate instanceof THREE.Object3D ? candidate : null;
-    let expressID = candidate?.userData?.expressID;
-    while (cursor) {
-      if (cursor.userData?.expressID !== void 0 && expressID === void 0) {
-        expressID = cursor.userData.expressID;
-      }
-      if (cursor.userData?.ifcManager && cursor.userData?.modelID !== void 0) {
+async function Ja(e, n) {
+  const a = ((r) => {
+    let s = r instanceof L.Object3D ? r : null, h = r?.userData?.expressID;
+    for (; s; ) {
+      if (s.userData?.expressID !== void 0 && h === void 0 && (h = s.userData.expressID), s.userData?.ifcManager && s.userData?.modelID !== void 0)
         return {
-          ifcRoot: cursor,
-          expressID
+          ifcRoot: s,
+          expressID: h
         };
-      }
-      cursor = cursor.parent;
+      s = s.parent;
     }
     return null;
-  };
-  const ifcContext = resolveIfcContext(target);
-  if (!ifcContext?.ifcRoot || ifcContext.expressID === void 0) return null;
+  })(e);
+  if (!a?.ifcRoot || a.expressID === void 0) return null;
   try {
-    const cacheKey = `${ifcContext.ifcRoot.userData.modelID}:${ifcContext.expressID}`;
-    const cached = cache.get(cacheKey);
-    if (cached) return cached;
-    const ifcManager = ifcContext.ifcRoot.userData.ifcManager;
-    const ifcProps = await ifcManager.getItemProperties(ifcContext.ifcRoot.userData.modelID, ifcContext.expressID);
-    const groups = ifcProps?.rawGroups || ifcProps?.groups || ifcProps?.normalizedGroups || null;
-    if (groups) {
-      cache.set(cacheKey, groups);
-    }
-    return groups;
-  } catch (error) {
-    console.error("IFC Props Error", error);
-    return null;
+    const r = `${a.ifcRoot.userData.modelID}:${a.expressID}`, s = n.get(r);
+    if (s) return s;
+    const c = await a.ifcRoot.userData.ifcManager.getItemProperties(a.ifcRoot.userData.modelID, a.expressID), u = c?.rawGroups || c?.groups || c?.normalizedGroups || null;
+    return u && n.set(r, u), u;
+  } catch (r) {
+    return console.error("IFC Props Error", r), null;
   }
 }
-function buildSelectionPropertyGroups({
-  sceneManager,
-  focusUuid,
-  target,
-  t,
-  ifcGroups,
-  clashSummary,
-  isDev = false
+function Za({
+  sceneManager: e,
+  focusUuid: n,
+  target: i,
+  t: a,
+  ifcGroups: r,
+  clashSummary: s,
+  isDev: h = !1
 }) {
-  const basicProps = {};
-  const geoProps = {};
-  const targetElevation = resolveTargetElevation(target);
-  const resolvedName = [target?.name, target?.userData?.name].find((value) => typeof value === "string" && value.trim().length > 0);
-  const wrappedId = sceneManager.getBimIdByUuid(focusUuid) || focusUuid;
-  if (resolvedName) {
-    basicProps[t("prop_name")] = resolvedName;
+  const c = {}, u = {}, p = Qa(i), d = [i?.name, i?.userData?.name].find((_) => typeof _ == "string" && _.trim().length > 0), y = e.getBimIdByUuid(n) || n;
+  if (d && (c[a("prop_name")] = d), c[a("prop_id")] = y, c[a("prop_type")] = i.type || (i.children ? "Group" : "Mesh"), typeof p == "number" && Number.isFinite(p) && (c[a("prop_storey_elevation")] = String(p)), i.getWorldPosition) {
+    const _ = new L.Vector3();
+    i.getWorldPosition(_), u[a("prop_pos")] = `${_.x.toFixed(2)}, ${_.y.toFixed(2)}, ${_.z.toFixed(2)}`;
   }
-  basicProps[t("prop_id")] = wrappedId;
-  basicProps[t("prop_type")] = target.type || (target.children ? "Group" : "Mesh");
-  if (typeof targetElevation === "number" && Number.isFinite(targetElevation)) {
-    basicProps[t("prop_storey_elevation")] = String(targetElevation);
-  }
-  if (target.getWorldPosition) {
-    const worldPosition = new THREE.Vector3();
-    target.getWorldPosition(worldPosition);
-    geoProps[t("prop_pos")] = `${worldPosition.x.toFixed(2)}, ${worldPosition.y.toFixed(2)}, ${worldPosition.z.toFixed(2)}`;
-  }
-  if (target.isMesh || target.type === "Mesh") {
-    if (target instanceof THREE.Mesh) {
-      const box = new THREE.Box3().setFromObject(target);
-      const size = new THREE.Vector3();
-      box.getSize(size);
-      geoProps[t("prop_dim")] = `${size.x.toFixed(2)} x ${size.y.toFixed(2)} x ${size.z.toFixed(2)}`;
-      if (target.geometry) {
-        geoProps[t("prop_vert")] = (target.geometry.attributes.position?.count || 0).toLocaleString();
-        geoProps[t("prop_tri")] = target.geometry.index ? (target.geometry.index.count / 3).toLocaleString() : ((target.geometry.attributes.position?.count || 0) / 3).toLocaleString();
-      }
-    } else if (target.userData?.boundingBox) {
-      const size = new THREE.Vector3();
-      target.userData.boundingBox.getSize(size);
-      geoProps[t("prop_dim")] = `${size.x.toFixed(2)} x ${size.y.toFixed(2)} x ${size.z.toFixed(2)}`;
+  if (i.isMesh || i.type === "Mesh") {
+    if (i instanceof L.Mesh) {
+      const o = new L.Box3().setFromObject(i), b = new L.Vector3();
+      o.getSize(b), u[a("prop_dim")] = `${b.x.toFixed(2)} x ${b.y.toFixed(2)} x ${b.z.toFixed(2)}`, i.geometry && (u[a("prop_vert")] = (i.geometry.attributes.position?.count || 0).toLocaleString(), u[a("prop_tri")] = i.geometry.index ? (i.geometry.index.count / 3).toLocaleString() : ((i.geometry.attributes.position?.count || 0) / 3).toLocaleString());
+    } else if (i.userData?.boundingBox) {
+      const o = new L.Vector3();
+      i.userData.boundingBox.getSize(o), u[a("prop_dim")] = `${o.x.toFixed(2)} x ${o.y.toFixed(2)} x ${o.z.toFixed(2)}`;
     }
-    if (target.isInstancedMesh) {
-      geoProps[t("prop_inst")] = target.count.toLocaleString();
-    }
-    const geometryData = sceneManager.getObjectGeometryData(focusUuid);
-    if (geometryData.area > 0) {
-      geoProps[t("prop_area")] = geometryData.area.toFixed(3);
-    }
-    if (geometryData.volume > 0) {
-      geoProps[t("prop_volume")] = geometryData.volume.toFixed(3);
-    }
-  } else if (target.userData?.boundingBox) {
-    const size = new THREE.Vector3();
-    target.userData.boundingBox.getSize(size);
-    geoProps[t("prop_dim")] = `${size.x.toFixed(2)} x ${size.y.toFixed(2)} x ${size.z.toFixed(2)}`;
+    i.isInstancedMesh && (u[a("prop_inst")] = i.count.toLocaleString());
+    const _ = e.getObjectGeometryData(n);
+    _.area > 0 && (u[a("prop_area")] = _.area.toFixed(3)), _.volume > 0 && (u[a("prop_volume")] = _.volume.toFixed(3));
+  } else if (i.userData?.boundingBox) {
+    const _ = new L.Vector3();
+    i.userData.boundingBox.getSize(_), u[a("prop_dim")] = `${_.x.toFixed(2)} x ${_.y.toFixed(2)} x ${_.z.toFixed(2)}`;
   }
-  const nbimProps = sceneManager.getNbimProperties(focusUuid);
-  const nbimIfcGroups = sceneManager.getNbimIfcPropertyGroups(focusUuid, "raw");
-  if (isDev && nbimProps && Object.keys(nbimProps).length > 0) {
-    console.group(`NBIM 选中属性: ${focusUuid}`);
-    console.log(nbimProps);
-    console.log(JSON.stringify(nbimProps, null, 2));
-    console.groupEnd();
-  }
-  if (isDev && nbimIfcGroups) {
-    console.group(`NBIM IFC 组属性: ${focusUuid}`);
-    console.log(nbimIfcGroups);
-    console.log(JSON.stringify(nbimIfcGroups, null, 2));
-    console.groupEnd();
-  }
-  const groups = buildSelectedPropertyGroups({
-    basicLabel: t("pg_basic"),
-    geoLabel: t("pg_geo"),
-    basicProps,
-    geoProps,
-    ifcProps: ifcGroups || nbimIfcGroups || null,
+  const f = e.getNbimProperties(n), v = e.getNbimIfcPropertyGroups(n, "raw");
+  h && f && Object.keys(f).length > 0 && (console.group(`NBIM 选中属性: ${n}`), console.log(f), console.log(JSON.stringify(f, null, 2)), console.groupEnd()), h && v && (console.group(`NBIM IFC 组属性: ${n}`), console.log(v), console.log(JSON.stringify(v, null, 2)), console.groupEnd());
+  const m = Ya({
+    basicLabel: a("pg_basic"),
+    geoLabel: a("pg_geo"),
+    basicProps: c,
+    geoProps: u,
+    ifcProps: r || v || null,
     nbimProps: null
   });
-  if (clashSummary) {
-    const clashLabel = t("pg_clash");
-    groups.push({
-      name: clashLabel,
-      items: createPropertyEntries(clashLabel, [
-        { key: t("clash_group_all"), value: String(clashSummary.total) },
-        { key: t("clash_group_new"), value: String(clashSummary.newCount) },
-        { key: t("clash_group_confirmed"), value: String(clashSummary.confirmedCount) },
-        { key: t("clash_group_resolved"), value: String(clashSummary.resolvedCount) },
-        { key: t("prop_status"), value: t(`clash_group_${clashSummary.worstStatus}`) }
-      ].map((item, index) => ({ ...item, id: `clash-summary::${index}` })))
+  if (s) {
+    const _ = a("pg_clash");
+    m.push({
+      name: _,
+      items: yt(_, [
+        { key: a("clash_group_all"), value: String(s.total) },
+        { key: a("clash_group_new"), value: String(s.newCount) },
+        { key: a("clash_group_confirmed"), value: String(s.confirmedCount) },
+        { key: a("clash_group_resolved"), value: String(s.resolvedCount) },
+        { key: a("prop_status"), value: a(`clash_group_${s.worstStatus}`) }
+      ].map((o, b) => ({ ...o, id: `clash-summary::${b}` })))
     });
   }
-  return groups;
+  return m;
 }
-
-function useViewerSelection({
-  sceneMgrRef,
-  selectedUuids,
-  setSelectedUuids,
-  setSelectedProps,
-  setHiddenUuids,
-  setIsolatedUuids,
-  updateTree,
-  propOnSelect,
-  ifcPropertyCacheRef,
-  clashSummaryByUuid,
-  focusObjectsInView,
-  t,
-  isDev = false
+function eo({
+  sceneMgrRef: e,
+  selectedUuids: n,
+  setSelectedUuids: i,
+  setSelectedProps: a,
+  setHiddenUuids: r,
+  setIsolatedUuids: s,
+  updateTree: h,
+  propOnSelect: c,
+  ifcPropertyCacheRef: u,
+  clashSummaryByUuid: p,
+  focusObjectsInView: d,
+  t: y,
+  isDev: f = !1
 }) {
-  const [locatedUuid, setLocatedUuid] = useState(null);
-  const [locateResultUuids, setLocateResultUuids] = useState([]);
-  const resetLocateState = useCallback(() => {
-    setLocatedUuid(null);
-    setLocateResultUuids([]);
-  }, []);
-  const handleSelect = useCallback(async (obj, _intersect, isMultiSelect = false) => {
-    const sceneManager = sceneMgrRef.current;
-    if (!sceneManager) return;
-    if (!obj) {
-      setSelectedUuids([]);
-      setSelectedProps(null);
-      sceneManager.highlightObjects([]);
+  const [v, m] = O(null), [_, o] = O([]), b = T(() => {
+    m(null), o([]);
+  }, []), k = T(async (S, I, C = !1, D = !1) => {
+    const N = e.current;
+    if (!N) return;
+    if (!S) {
+      i([]), a(null), N.highlightObjects([]);
       return;
     }
-    const rawUuid = obj.uuid || obj.id;
-    const uuid = sceneManager.resolveSelectionUuid(rawUuid);
-    if (!uuid) return;
-    const nextUuids = isMultiSelect ? selectedUuids.includes(uuid) ? selectedUuids.filter((id) => id !== uuid) : [...selectedUuids, uuid] : [uuid];
-    setSelectedUuids(nextUuids);
-    sceneManager.highlightObjects(nextUuids);
-    const focusUuid = nextUuids[nextUuids.length - 1];
-    if (!focusUuid) {
-      setSelectedProps(null);
+    const $ = S.uuid || S.id, E = N.resolveSelectionUuid($);
+    if (!E) return;
+    const F = C ? n.includes(E) ? n.filter((x) => x !== E) : [...n, E] : [E];
+    i(F), D || N.highlightObjects(F);
+    const A = F[F.length - 1];
+    if (!A) {
+      a(null);
       return;
     }
-    propOnSelect?.(focusUuid, obj);
-    const target = resolveSelectionTarget(sceneManager, obj, focusUuid);
-    const ifcGroups = await fetchIfcGroups(target, ifcPropertyCacheRef.current || /* @__PURE__ */ new Map());
-    const selectedGroups = buildSelectionPropertyGroups({
-      sceneManager,
-      focusUuid,
-      target,
-      t,
-      ifcGroups,
-      clashSummary: clashSummaryByUuid[focusUuid],
-      isDev
+    c?.(A, S);
+    const U = qa(N, S, A), G = await Ja(U, u.current || /* @__PURE__ */ new Map()), H = Za({
+      sceneManager: N,
+      focusUuid: A,
+      target: U,
+      t: y,
+      ifcGroups: G,
+      clashSummary: p[A],
+      isDev: f
     });
-    setSelectedProps(selectedGroups);
+    a(H);
   }, [
-    clashSummaryByUuid,
-    ifcPropertyCacheRef,
-    isDev,
-    propOnSelect,
-    sceneMgrRef,
-    selectedUuids,
-    setSelectedProps,
-    setSelectedUuids,
-    t
-  ]);
-  const handleLocateObject = useCallback((obj) => {
-    const sceneManager = sceneMgrRef.current;
-    if (!sceneManager || !obj) return false;
-    const rawUuid = obj.uuid || obj.id;
-    if (!rawUuid) return false;
-    const uuid = sceneManager.resolveSelectionUuid(rawUuid);
-    if (!uuid) return false;
-    const bounds = sceneManager.getBoundsForObject(uuid);
-    if (!bounds) return false;
-    setLocatedUuid(uuid);
-    return focusObjectsInView({ uuids: [uuid], focusUuid: uuid, updateSelection: false });
-  }, [focusObjectsInView, sceneMgrRef]);
-  const handleLocateResultsChange = useCallback((uuids) => {
-    const changed = !(locateResultUuids.length === uuids.length && locateResultUuids.every((uuid, index) => uuid === uuids[index]));
-    if (!changed) return;
-    setLocateResultUuids(uuids);
-    const sceneManager = sceneMgrRef.current;
-    if (!sceneManager || uuids.length > 0) return;
-    sceneManager.clearLocateFocus();
-  }, [locateResultUuids, sceneMgrRef]);
-  const handleClearLocate = useCallback(() => {
-    resetLocateState();
-    sceneMgrRef.current?.clearLocateFocus();
-    sceneMgrRef.current?.highlightObjects(selectedUuids);
-  }, [resetLocateState, sceneMgrRef, selectedUuids]);
-  return {
-    locatedUuid,
-    locateResultUuids,
-    resetLocateState,
-    handleSelect,
-    handleLocateObject,
-    handleLocateResultsChange,
-    handleClearLocate
+    p,
+    u,
+    f,
+    c,
+    e,
+    n,
+    a,
+    i,
+    y
+  ]), g = T((S) => {
+    const I = e.current;
+    if (!I || !S) return !1;
+    const C = S.uuid || S.id;
+    if (!C) return !1;
+    const D = I.resolveSelectionUuid(C);
+    return !D || !I.getBoundsForObject(D) ? !1 : (m(D), d({ uuids: [D], focusUuid: D, updateSelection: !1 }));
+  }, [d, e]), P = T((S) => {
+    if (!!(_.length === S.length && _.every((D, N) => D === S[N]))) return;
+    o(S);
+    const C = e.current;
+    !C || S.length > 0 || C.clearLocateFocus();
+  }, [_, e]), R = T(() => {
+    b(), e.current?.clearLocateFocus(), e.current?.highlightObjects(n);
+  }, [b, e, n]);
+  return q(() => {
+    const S = e.current;
+    if (!S || n.length <= 1) return;
+    let I = !1;
+    const C = async () => {
+      const N = new L.Box3();
+      let $ = 0, E = 0;
+      const F = /* @__PURE__ */ new Set(), A = /* @__PURE__ */ new Map(), U = new Set(n), G = /* @__PURE__ */ new Map();
+      S.contentGroup.traverse((Z) => {
+        const te = Z.uuid, ue = Z.userData?.id;
+        (U.has(te) || ue && U.has(ue)) && (G.set(te, Z), ue && G.set(ue, Z), N.expandByObject(Z));
+      });
+      const H = 2e3;
+      let x = performance.now();
+      for (let Z = 0; Z < n.length; Z += H) {
+        if (I) return;
+        const te = n.slice(Z, Z + H);
+        for (const ue of te) {
+          const ne = G.get(ue), ge = S.getStructureNodes(ue), _e = ge && ge.length > 0 ? ge[0] : null, ye = String(ne?.type || _e?.type || "Object");
+          A.set(ye, (A.get(ye) || 0) + 1);
+          const j = ne?.userData?.rootName || ne?.userData?.modelName;
+          j && F.add(String(j));
+          const B = S.getObjectGeometryData(ue);
+          $ += B.area, E += B.volume;
+        }
+        performance.now() - x > 16 && (await new Promise((ue) => setTimeout(ue, 0)), x = performance.now());
+      }
+      if (I) return;
+      const V = (Z) => Array.from(Z.entries()).sort((te, ue) => ue[1] - te[1]).slice(0, 4).map(([te, ue]) => `${te} x${ue}`).join(", "), z = N.isEmpty() ? null : N.getSize(new L.Vector3()), ce = [
+        { key: y("selected_count"), value: String(n.length) },
+        { key: y("summary_models"), value: String(F.size || 1) },
+        { key: y("summary_types"), value: V(A) || "-" }
+      ];
+      z && ce.push({
+        key: y("summary_bounds"),
+        value: `${z.x.toFixed(2)} x ${z.y.toFixed(2)} x ${z.z.toFixed(2)}`
+      }), $ > 0 && ce.push({ key: y("prop_area"), value: $.toFixed(3) }), E > 0 && ce.push({ key: y("prop_volume"), value: E.toFixed(3) });
+      const re = `${n.length} ${y("selected_count")}`;
+      a([
+        {
+          name: re,
+          items: yt(re, ce.map((Z) => ({ key: Z.key, value: Z.value })))
+        }
+      ]);
+    }, D = window.setTimeout(C, 200);
+    return () => {
+      I = !0, clearTimeout(D);
+    };
+  }, [n, e, y, a]), {
+    locatedUuid: v,
+    locateResultUuids: _,
+    resetLocateState: b,
+    handleSelect: k,
+    handleLocateObject: g,
+    handleLocateResultsChange: P,
+    handleClearLocate: R
   };
 }
-
-function useViewerActions({
-  sceneMgrRef,
-  t,
-  setLoading,
-  setProgress,
-  setStatus,
-  setToast,
-  setActiveTool,
-  setConfirmState,
-  setSelectedUuids,
-  setSelectedProps,
-  setChunkProgress,
-  resetLocateState,
-  clearSearchResult,
-  resetClashState,
-  resetMeasurementState,
-  resetExplodeState,
-  updateTree,
-  ifcPropertyCacheRef,
-  completedFileSetsRef
+function to({
+  sceneMgrRef: e,
+  t: n,
+  setLoading: i,
+  setProgress: a,
+  setStatus: r,
+  setToast: s,
+  setActiveTool: h,
+  setConfirmState: c,
+  setSelectedUuids: u,
+  setSelectedProps: p,
+  setChunkProgress: d,
+  resetLocateState: y,
+  clearSearchResult: f,
+  resetClashState: v,
+  resetMeasurementState: m,
+  resetExplodeState: _,
+  updateTree: o,
+  ifcPropertyCacheRef: b,
+  completedFileSetsRef: k
 }) {
-  const getExportModelNames = useCallback(() => {
-    const manager = sceneMgrRef.current;
-    if (!manager) return [];
-    const names = [];
-    manager.contentGroup.children.forEach((child) => {
-      if (child.userData?.isOptimizedGroup) return;
-      if (child.name.startsWith("optimized_")) return;
-      const rawName = (typeof child.userData?.modelName === "string" ? child.userData.modelName : "") || (child.children?.[0]?.name || "") || child.name;
-      const baseName = sanitizeFileStem(stripFileExtension(rawName));
-      names.push(baseName);
-    });
-    return Array.from(new Set(names));
-  }, [sceneMgrRef]);
-  const getDefaultExportFileName = useCallback((format) => {
-    const modelNames = getExportModelNames();
-    if (modelNames.length === 1) {
-      return modelNames[0];
-    }
-    const now = /* @__PURE__ */ new Date();
-    const pad = (value) => String(value).padStart(2, "0");
-    const suffix = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-    return `${t("export_batch_name")}_${suffix}`;
-  }, [getExportModelNames, t]);
-  const resolveExportFilename = useCallback((format, requestedName) => {
-    const fallback = getDefaultExportFileName(format);
-    const stem = sanitizeFileStem(stripFileExtension((requestedName || "").trim()) || fallback);
-    return `${stem}.${format}`;
-  }, [getDefaultExportFileName]);
-  const handleExport = useCallback(async (format, requestedName) => {
-    const manager = sceneMgrRef.current;
-    if (!manager) return;
-    const content = manager.contentGroup;
-    const resolvedFileName = resolveExportFilename(format, requestedName);
-    const resolvedStem = stripFileExtension(resolvedFileName);
-    if (format === "nbim") {
-      if (content.children.length === 0) {
-        setToast({ message: t("no_models"), type: "info" });
+  const g = T(() => {
+    const D = e.current;
+    if (!D) return [];
+    const N = [];
+    return D.contentGroup.children.forEach(($) => {
+      if ($.userData?.isOptimizedGroup || $.name.startsWith("optimized_")) return;
+      const E = (typeof $.userData?.modelName == "string" ? $.userData.modelName : "") || $.children?.[0]?.name || "" || $.name, F = yn(Kt(E));
+      N.push(F);
+    }), Array.from(new Set(N));
+  }, [e]), P = T((D) => {
+    const N = g();
+    if (N.length === 1)
+      return N[0];
+    const $ = /* @__PURE__ */ new Date(), E = (A) => String(A).padStart(2, "0"), F = `${$.getFullYear()}${E($.getMonth() + 1)}${E($.getDate())}_${E($.getHours())}${E($.getMinutes())}${E($.getSeconds())}`;
+    return `${n("export_batch_name")}_${F}`;
+  }, [g, n]), R = T((D, N) => {
+    const $ = P(D);
+    return `${yn(Kt((N || "").trim()) || $)}.${D}`;
+  }, [P]), S = T(async (D, N) => {
+    const $ = e.current;
+    if (!$) return;
+    const E = $.contentGroup, F = R(D, N), A = Kt(F);
+    if (D === "nbim") {
+      if (E.children.length === 0) {
+        s({ message: n("no_models"), type: "info" });
         return;
       }
-      setLoading(true);
-      setStatus(`${t("processing")}...`);
-      setActiveTool("none");
-      window.setTimeout(async () => {
+      i(!0), r(`${n("processing")}...`), h("none"), window.setTimeout(async () => {
         try {
-          await sceneMgrRef.current?.exportNbim(resolvedStem);
-          setToast({ message: t("success"), type: "success" });
-        } catch (error) {
-          console.error(error);
-          setToast({ message: `${t("failed")}: ${error.message}`, type: "error" });
+          await e.current?.exportNbim(A), s({ message: n("success"), type: "success" });
+        } catch (H) {
+          console.error(H), s({ message: `${n("failed")}: ${H.message}`, type: "error" });
         } finally {
-          setLoading(false);
+          i(!1);
         }
       }, 100);
       return;
     }
-    const modelsToExport = content.children.filter((child) => !child.userData.isOptimizedGroup);
-    if (modelsToExport.length === 0) {
-      setToast({ message: t("no_models"), type: "info" });
+    const U = E.children.filter((H) => !H.userData.isOptimizedGroup);
+    if (U.length === 0) {
+      s({ message: n("no_models"), type: "info" });
       return;
     }
-    const exportGroup = new THREE.Group();
-    modelsToExport.forEach((model) => exportGroup.add(model.clone()));
-    setLoading(true);
-    setProgress(0);
-    setStatus(`${t("processing")}...`);
-    setActiveTool("none");
-    window.setTimeout(async () => {
+    const G = new L.Group();
+    U.forEach((H) => G.add(H.clone())), i(!0), a(0), r(`${n("processing")}...`), h("none"), window.setTimeout(async () => {
       try {
-        let blob = null;
-        if (format === "glb") {
-          blob = await exportGLB(exportGroup);
-        } else if (format === "lmb") {
-          blob = await exportLMB(exportGroup, (message) => setStatus(cleanLoadingStatus(message)));
+        let H = null;
+        if (D === "glb" ? H = await lr(G) : D === "lmb" && (H = await cr(G, (x) => r(Bn(x)))), H) {
+          const x = URL.createObjectURL(H), V = document.createElement("a");
+          V.href = x, V.download = F, V.click(), URL.revokeObjectURL(x), s({ message: n("success"), type: "success" });
         }
-        if (blob) {
-          const url = URL.createObjectURL(blob);
-          const anchor = document.createElement("a");
-          anchor.href = url;
-          anchor.download = resolvedFileName;
-          anchor.click();
-          URL.revokeObjectURL(url);
-          setToast({ message: t("success"), type: "success" });
-        }
-      } catch (error) {
-        console.error(error);
-        setToast({ message: `${t("failed")}: ${error.message}`, type: "error" });
+      } catch (H) {
+        console.error(H), s({ message: `${n("failed")}: ${H.message}`, type: "error" });
       } finally {
-        setLoading(false);
-        setProgress(0);
+        i(!1), a(0);
       }
     }, 100);
-  }, [resolveExportFilename, sceneMgrRef, setActiveTool, setLoading, setProgress, setStatus, setToast, t]);
-  const handleClear = useCallback(async () => {
-    const manager = sceneMgrRef.current;
-    if (!manager) return;
-    setConfirmState({
-      isOpen: true,
-      title: t("op_clear"),
-      message: t("confirm_clear"),
+  }, [R, e, h, i, a, r, s, n]), I = T(async () => {
+    e.current && c({
+      isOpen: !0,
+      title: n("op_clear"),
+      message: n("confirm_clear"),
       action: async () => {
-        setLoading(true);
-        setProgress(0);
-        setStatus(`${t("op_clear")}...`);
+        i(!0), a(0), r(`${n("op_clear")}...`);
         try {
-          await sceneMgrRef.current?.clear();
-          setSelectedUuids([]);
-          resetLocateState();
-          setSelectedProps(null);
-          clearSearchResult();
-          resetClashState();
-          ifcPropertyCacheRef.current.clear();
-          resetMeasurementState();
-          setChunkProgress({ loaded: 0, total: 0 });
-          completedFileSetsRef.current.clear();
-          resetExplodeState();
-          updateTree();
-          setStatus(t("ready"));
-        } catch (error) {
-          console.error("清空场景失败:", error);
+          await e.current?.clear(), u([]), y(), p(null), f(), v(), b.current.clear(), m(), d({ loaded: 0, total: 0 }), k.current.clear(), _(), o(), r(n("ready"));
+        } catch (N) {
+          console.error("清空场景失败:", N);
         } finally {
-          setLoading(false);
+          i(!1);
         }
       }
     });
   }, [
-    clearSearchResult,
-    completedFileSetsRef,
-    ifcPropertyCacheRef,
-    resetClashState,
-    resetExplodeState,
-    resetLocateState,
-    resetMeasurementState,
-    sceneMgrRef,
-    setChunkProgress,
-    setConfirmState,
-    setLoading,
-    setProgress,
-    setSelectedProps,
-    setSelectedUuids,
-    setStatus,
-    t,
-    updateTree
-  ]);
-  const handleScreenshot = useCallback((mode = "scene") => {
-    const manager = sceneMgrRef.current;
-    if (!manager) return;
-    try {
-      const renderer = manager.renderer;
-      const scene = manager.scene;
-      const previousBackground = scene.background;
-      if (mode === "transparent") {
-        scene.background = null;
-        renderer.setClearAlpha(0);
-      } else {
-        renderer.setClearAlpha(1);
+    f,
+    k,
+    b,
+    v,
+    _,
+    y,
+    m,
+    e,
+    d,
+    c,
+    i,
+    a,
+    p,
+    u,
+    r,
+    n,
+    o
+  ]), C = T((D = "scene") => {
+    const N = e.current;
+    if (N)
+      try {
+        const $ = N.renderer, E = N.scene, F = E.background;
+        D === "transparent" ? (E.background = null, $.setClearAlpha(0)) : $.setClearAlpha(1), $.render(E, N.camera);
+        const A = N.canvas.toDataURL("image/png"), U = document.createElement("a");
+        U.href = A, U.download = D === "transparent" ? "screenshot-transparent.png" : "screenshot.png", U.click(), E.background = F, $.setClearAlpha(1), $.render(E, N.camera), s({ message: n("success"), type: "success" });
+      } catch ($) {
+        console.error($), s({ message: n("failed"), type: "error" });
       }
-      renderer.render(scene, manager.camera);
-      const dataUrl = manager.canvas.toDataURL("image/png");
-      const anchor = document.createElement("a");
-      anchor.href = dataUrl;
-      anchor.download = mode === "transparent" ? "screenshot-transparent.png" : "screenshot.png";
-      anchor.click();
-      scene.background = previousBackground;
-      renderer.setClearAlpha(1);
-      renderer.render(scene, manager.camera);
-      setToast({ message: t("success"), type: "success" });
-    } catch (error) {
-      console.error(error);
-      setToast({ message: t("failed"), type: "error" });
-    }
-  }, [sceneMgrRef, setToast, t]);
+  }, [e, s, n]);
   return {
-    getDefaultExportFileName,
-    handleExport,
-    handleClear,
-    handleScreenshot
+    getDefaultExportFileName: P,
+    handleExport: S,
+    handleClear: I,
+    handleScreenshot: C
   };
 }
-
-function useViewerCanvasInteractions({
-  sceneMgrRef,
-  canvasRef,
-  activeTool,
-  setActiveTool,
-  measureType,
-  setMeasureType,
-  pickEnabled,
-  selectedUuids,
-  setSelectedUuids,
-  setSelectedProps,
-  setMousePos,
-  setHighlightedMeasureId,
-  handleSelect,
-  handleContextMenu,
-  handleUndoVisibility,
-  clearSelectionState
+function no({
+  sceneMgrRef: e,
+  canvasRef: n,
+  activeTool: i,
+  setActiveTool: a,
+  measureType: r,
+  setMeasureType: s,
+  pickEnabled: h,
+  selectedUuids: c,
+  setSelectedUuids: u,
+  setSelectedProps: p,
+  setMousePos: d,
+  setHighlightedMeasureId: y,
+  handleSelect: f,
+  handleContextMenu: v,
+  handleUndoVisibility: m,
+  clearSelectionState: _
 }) {
-  const pointerDownRef = useRef(null);
-  const mouseMoveRafRef = useRef(null);
-  const pendingMousePointRef = useRef(null);
-  useEffect(() => {
-    const manager = sceneMgrRef.current;
-    const canvas = canvasRef.current;
-    if (!manager || !canvas) return;
-    const clickMoveThreshold = 6;
-    const handleMouseDown = (event) => {
-      pointerDownRef.current = {
-        x: event.clientX,
-        y: event.clientY,
-        moved: false,
-        button: event.button
+  const o = ee(null), b = ee(null), k = ee(null);
+  q(() => {
+    const g = e.current, P = n.current;
+    if (!g || !P) return;
+    const R = 6, S = (N) => {
+      o.current = {
+        x: N.clientX,
+        y: N.clientY,
+        moved: !1,
+        button: N.button
       };
-    };
-    const handleClick = (event) => {
-      const pointerState = pointerDownRef.current;
-      if (!pointerState || pointerState.button !== 0 || pointerState.moved) {
-        pointerDownRef.current = null;
+    }, I = (N) => {
+      const $ = o.current;
+      if (!$ || $.button !== 0 || $.moved) {
+        o.current = null;
         return;
       }
-      pointerDownRef.current = null;
-      if (activeTool === "boxSelect") return;
-      if (activeTool === "measure") {
-        if (measureType !== "none") {
-          const intersect = manager.getRayIntersects(event.clientX, event.clientY);
-          if (intersect) {
-            const modelUuid = intersect.object.uuid;
-            manager.addMeasurePoint(intersect.point, modelUuid);
+      if (o.current = null, i !== "boxSelect") {
+        if (i === "measure") {
+          if (r !== "none") {
+            const F = g.getRayIntersects(N.clientX, N.clientY);
+            if (F) {
+              const A = F.object.uuid;
+              g.addMeasurePoint(F.point, A);
+              return;
+            }
+          }
+          const E = g.pickMeasurement(N.clientX, N.clientY);
+          if (E) {
+            y(E), g.highlightMeasurement(E);
             return;
           }
-        }
-        const measurementId = manager.pickMeasurement(event.clientX, event.clientY);
-        if (measurementId) {
-          setHighlightedMeasureId(measurementId);
-          manager.highlightMeasurement(measurementId);
+          y(null), g.highlightMeasurement(null);
           return;
         }
-        setHighlightedMeasureId(null);
-        manager.highlightMeasurement(null);
+        if (h) {
+          const E = g.pick(N.clientX, N.clientY);
+          f(E ? E.object : null, E ? E.intersect : null, N.ctrlKey);
+        }
+      }
+    }, C = (N) => {
+      if (o.current && !o.current.moved) {
+        const $ = N.clientX - o.current.x, E = N.clientY - o.current.y;
+        $ * $ + E * E > R * R && (o.current.moved = !0);
+      }
+      if (i === "measure") {
+        g.updateMeasureHover(N.clientX, N.clientY), d(null);
         return;
       }
-      if (pickEnabled) {
-        const result = manager.pick(event.clientX, event.clientY);
-        void handleSelect(result ? result.object : null, result ? result.intersect : null, event.ctrlKey);
+      if (N.buttons !== 0) {
+        k.current = null, b.current !== null && (cancelAnimationFrame(b.current), b.current = null), d(null);
+        return;
       }
+      k.current = { x: N.clientX, y: N.clientY }, b.current === null && (b.current = requestAnimationFrame(() => {
+        b.current = null;
+        const $ = k.current;
+        if (!$) return;
+        const E = g.getRayIntersects($.x, $.y);
+        d(E ? E.point : null);
+      }));
+    }, D = (N) => {
+      if ((N.key === "z" || N.key === "Z") && (N.ctrlKey || N.metaKey)) {
+        m();
+        return;
+      }
+      N.key === "Escape" && (i === "measure" && r !== "none" && (s("none"), g.startMeasurement("none")), i === "boxSelect" && (g.cancelBoxSelect(), a("none")), _());
     };
-    const handleMouseMove = (event) => {
-      if (pointerDownRef.current && !pointerDownRef.current.moved) {
-        const dx = event.clientX - pointerDownRef.current.x;
-        const dy = event.clientY - pointerDownRef.current.y;
-        if (dx * dx + dy * dy > clickMoveThreshold * clickMoveThreshold) {
-          pointerDownRef.current.moved = true;
-        }
-      }
-      if (activeTool === "measure") {
-        manager.updateMeasureHover(event.clientX, event.clientY);
-        setMousePos(null);
-        return;
-      }
-      if (event.buttons !== 0) {
-        pendingMousePointRef.current = null;
-        if (mouseMoveRafRef.current !== null) {
-          cancelAnimationFrame(mouseMoveRafRef.current);
-          mouseMoveRafRef.current = null;
-        }
-        setMousePos(null);
-        return;
-      }
-      pendingMousePointRef.current = { x: event.clientX, y: event.clientY };
-      if (mouseMoveRafRef.current !== null) return;
-      mouseMoveRafRef.current = requestAnimationFrame(() => {
-        mouseMoveRafRef.current = null;
-        const pending = pendingMousePointRef.current;
-        if (!pending) return;
-        const intersect = manager.getRayIntersects(pending.x, pending.y);
-        setMousePos(intersect ? intersect.point : null);
-      });
-    };
-    const handleKeyDown = (event) => {
-      if ((event.key === "z" || event.key === "Z") && (event.ctrlKey || event.metaKey)) {
-        handleUndoVisibility();
-        return;
-      }
-      if (event.key === "Escape") {
-        if (activeTool === "measure" && measureType !== "none") {
-          setMeasureType("none");
-          manager.startMeasurement("none");
-        }
-        if (activeTool === "boxSelect") {
-          manager.cancelBoxSelect();
-          setActiveTool("none");
-        }
-        clearSelectionState();
-      }
-    };
-    canvas.addEventListener("mousedown", handleMouseDown);
-    canvas.addEventListener("click", handleClick);
-    canvas.addEventListener("mousemove", handleMouseMove);
-    canvas.addEventListener("contextmenu", handleContextMenu);
-    window.addEventListener("keydown", handleKeyDown);
-    return () => {
-      if (mouseMoveRafRef.current !== null) {
-        cancelAnimationFrame(mouseMoveRafRef.current);
-        mouseMoveRafRef.current = null;
-      }
-      pendingMousePointRef.current = null;
-      canvas.removeEventListener("mousedown", handleMouseDown);
-      canvas.removeEventListener("click", handleClick);
-      canvas.removeEventListener("mousemove", handleMouseMove);
-      canvas.removeEventListener("contextmenu", handleContextMenu);
-      window.removeEventListener("keydown", handleKeyDown);
+    return P.addEventListener("mousedown", S), P.addEventListener("click", I), P.addEventListener("mousemove", C), P.addEventListener("contextmenu", v), window.addEventListener("keydown", D), () => {
+      b.current !== null && (cancelAnimationFrame(b.current), b.current = null), k.current = null, P.removeEventListener("mousedown", S), P.removeEventListener("click", I), P.removeEventListener("mousemove", C), P.removeEventListener("contextmenu", v), window.removeEventListener("keydown", D);
     };
   }, [
-    activeTool,
-    canvasRef,
-    clearSelectionState,
-    handleContextMenu,
-    handleSelect,
-    handleUndoVisibility,
-    measureType,
-    pickEnabled,
-    sceneMgrRef,
-    setActiveTool,
-    setHighlightedMeasureId,
-    setMeasureType,
-    setMousePos
-  ]);
-  useEffect(() => {
-    const manager = sceneMgrRef.current;
-    const canvas = canvasRef.current;
-    if (!manager || !canvas || activeTool !== "boxSelect") return;
-    manager.controls.mouseButtons.LEFT = void 0;
-    const onPointerDown = (event) => {
-      if (event.button !== 0) return;
-      manager.startBoxSelect(event.clientX, event.clientY);
-    };
-    const onPointerMove = (event) => {
-      manager.updateBoxSelect(event.clientX, event.clientY);
-    };
-    const onPointerUp = (event) => {
-      if (event.button !== 0) return;
-      const uuids = manager.endBoxSelect();
-      if (uuids.length > 0) {
-        const nextUuids = event.shiftKey ? [.../* @__PURE__ */ new Set([...selectedUuids, ...uuids])] : uuids;
-        setSelectedUuids(nextUuids);
-        setSelectedProps(null);
-        manager.highlightObjects(nextUuids);
+    i,
+    n,
+    _,
+    v,
+    f,
+    m,
+    r,
+    h,
+    e,
+    a,
+    y,
+    s,
+    d
+  ]), q(() => {
+    const g = e.current, P = n.current;
+    if (!g || !P || i !== "boxSelect") return;
+    g.controls.mouseButtons.LEFT = void 0;
+    const R = (C) => {
+      C.button === 0 && g.startBoxSelect(C.clientX, C.clientY);
+    }, S = (C) => {
+      g.updateBoxSelect(C.clientX, C.clientY);
+    }, I = (C) => {
+      if (C.button !== 0) return;
+      const D = g.endBoxSelect();
+      if (D.length > 0) {
+        const N = C.shiftKey ? [.../* @__PURE__ */ new Set([...c, ...D])] : D;
+        u(N), p(null), g.highlightObjects(N);
       }
     };
-    canvas.addEventListener("pointerdown", onPointerDown);
-    window.addEventListener("pointermove", onPointerMove);
-    window.addEventListener("pointerup", onPointerUp);
-    return () => {
-      canvas.removeEventListener("pointerdown", onPointerDown);
-      window.removeEventListener("pointermove", onPointerMove);
-      window.removeEventListener("pointerup", onPointerUp);
-      if (manager.controls) {
-        manager.controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
-      }
-      manager.cancelBoxSelect();
+    return P.addEventListener("pointerdown", R), window.addEventListener("pointermove", S), window.addEventListener("pointerup", I), () => {
+      P.removeEventListener("pointerdown", R), window.removeEventListener("pointermove", S), window.removeEventListener("pointerup", I), g.controls && (g.controls.mouseButtons.LEFT = L.MOUSE.ROTATE), g.cancelBoxSelect();
     };
-  }, [activeTool, canvasRef, sceneMgrRef, selectedUuids, setSelectedProps, setSelectedUuids]);
+  }, [i, n, e, c, p, u]);
 }
-
-const SUPPORTED_DROP_EXTENSIONS = [
+const io = [
   ".lmb",
   ".glb",
   ".gltf",
@@ -12488,2166 +5336,1054 @@ const SUPPORTED_DROP_EXTENSIONS = [
   ".igs",
   ".iges"
 ];
-function useViewerFileActions({
-  sceneMgrRef,
-  t,
-  processFiles,
-  loadItemsIntoScene,
-  setLoading,
-  setStatus,
-  setProgress,
-  setToast,
-  setActiveTool,
-  setSelectedUuids,
-  setSelectedProps,
-  resetMeasurementState,
-  updateTree,
-  isDev
+function ro({
+  sceneMgrRef: e,
+  t: n,
+  processFiles: i,
+  loadItemsIntoScene: a,
+  setLoading: r,
+  setStatus: s,
+  setProgress: h,
+  setToast: c,
+  setActiveTool: u,
+  setSelectedUuids: p,
+  setSelectedProps: d,
+  resetMeasurementState: y,
+  updateTree: f,
+  isDev: v
 }) {
-  const handleOpenFiles = useCallback(async (event) => {
-    if (!event.target.files?.length) return;
-    await processFiles(Array.from(event.target.files));
-    event.target.value = "";
-  }, [processFiles]);
-  const handleBatchConvert = useCallback(async (event) => {
-    const manager = sceneMgrRef.current;
-    if (!event.target.files?.length || !manager) return;
-    const files = Array.from(event.target.files);
-    event.target.value = "";
-    const invalidFiles = files.filter((file) => file.name.toLowerCase().endsWith(".nbim"));
-    if (invalidFiles.length > 0) {
-      setToast({ message: t("unsupported_format"), type: "info" });
+  const m = T(async (g) => {
+    g.target.files?.length && (await i(Array.from(g.target.files)), g.target.value = "");
+  }, [i]), _ = T(async (g) => {
+    const P = e.current;
+    if (!g.target.files?.length || !P) return;
+    const R = Array.from(g.target.files);
+    if (g.target.value = "", R.filter((I) => I.name.toLowerCase().endsWith(".nbim")).length > 0) {
+      c({ message: n("unsupported_format"), type: "info" });
       return;
     }
-    manager.setChunkLoadingEnabled?.(false);
-    manager.setContentVisible?.(false);
-    setLoading(true);
-    setStatus(`${t("processing")}...`);
-    setProgress(0);
-    setActiveTool("none");
+    P.setChunkLoadingEnabled?.(!1), P.setContentVisible?.(!1), r(!0), s(`${n("processing")}...`), h(0), u("none");
     try {
-      await manager.clear();
-      setSelectedUuids([]);
-      setSelectedProps(null);
-      resetMeasurementState();
-      updateTree();
-      await loadItemsIntoScene(files);
-      updateTree();
-      setStatus(`${t("processing")}...`);
-      await manager.exportNbim();
-      setStatus(t("success"));
-      setToast({ message: t("success"), type: "success" });
-    } catch (error) {
-      console.error("[ThreeViewer] handleBatchConvert error:", error);
-      setStatus(t("failed"));
-      setToast({ message: `${t("failed")}: ${error.message}`, type: "error" });
+      await P.clear(), p([]), d(null), y(), f(), await a(R), f(), s(`${n("processing")}...`), await P.exportNbim(), s(n("success")), c({ message: n("success"), type: "success" });
+    } catch (I) {
+      console.error("[ThreeViewer] handleBatchConvert error:", I), s(n("failed")), c({ message: `${n("failed")}: ${I.message}`, type: "error" });
     } finally {
       try {
-        await sceneMgrRef.current?.clear();
-        updateTree();
+        await e.current?.clear(), f();
       } catch {
       }
-      sceneMgrRef.current?.setChunkLoadingEnabled?.(true);
-      sceneMgrRef.current?.setContentVisible?.(true);
-      setLoading(false);
+      e.current?.setChunkLoadingEnabled?.(!0), e.current?.setContentVisible?.(!0), r(!1);
     }
   }, [
-    loadItemsIntoScene,
-    resetMeasurementState,
-    sceneMgrRef,
-    setActiveTool,
-    setLoading,
-    setProgress,
-    setSelectedProps,
-    setSelectedUuids,
-    setStatus,
-    setToast,
-    t,
-    updateTree
-  ]);
-  const handleOpenUrl = useCallback(async () => {
-    const url = window.prompt(t("menu_open_url"), "http://");
-    if (!url || !url.startsWith("http")) return;
-    if (isDev) {
-      console.log("[ThreeViewer] handleOpenUrl called with:", url);
+    a,
+    y,
+    e,
+    u,
+    r,
+    h,
+    d,
+    p,
+    s,
+    c,
+    n,
+    f
+  ]), o = T(async () => {
+    const g = window.prompt(n("menu_open_url"), "http://");
+    if (!(!g || !g.startsWith("http"))) {
+      v && console.log("[ThreeViewer] handleOpenUrl called with:", g), r(!0), s(`${n("processing")}...`);
+      try {
+        await i([g]);
+      } catch (P) {
+        console.error("[ThreeViewer] handleOpenUrl error:", P), s(n("failed")), c({ message: `${n("failed")}: ${P.message}`, type: "error" });
+      } finally {
+        r(!1);
+      }
     }
-    setLoading(true);
-    setStatus(`${t("processing")}...`);
-    try {
-      await processFiles([url]);
-    } catch (error) {
-      console.error("[ThreeViewer] handleOpenUrl error:", error);
-      setStatus(t("failed"));
-      setToast({ message: `${t("failed")}: ${error.message}`, type: "error" });
-    } finally {
-      setLoading(false);
-    }
-  }, [isDev, processFiles, setLoading, setStatus, setToast, t]);
-  const handleDragOver = useCallback((event) => {
-    event.preventDefault();
-    event.stopPropagation();
-  }, []);
-  const handleDrop = useCallback(async (event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    if (!event.dataTransfer.files?.length) return;
-    const files = Array.from(event.dataTransfer.files);
-    const validFiles = files.filter((file) => {
-      const extension = file.name.substring(file.name.lastIndexOf(".")).toLowerCase();
-      return SUPPORTED_DROP_EXTENSIONS.includes(extension);
+  }, [v, i, r, s, c, n]), b = T((g) => {
+    g.preventDefault(), g.stopPropagation();
+  }, []), k = T(async (g) => {
+    if (g.preventDefault(), g.stopPropagation(), !g.dataTransfer.files?.length) return;
+    const P = Array.from(g.dataTransfer.files), R = P.filter((S) => {
+      const I = S.name.substring(S.name.lastIndexOf(".")).toLowerCase();
+      return io.includes(I);
     });
-    if (validFiles.length < files.length) {
-      setToast({ message: t("unsupported_format"), type: "info" });
-    }
-    if (validFiles.length > 0) {
-      await processFiles(validFiles);
-    }
-  }, [processFiles, setToast, t]);
+    R.length < P.length && c({ message: n("unsupported_format"), type: "info" }), R.length > 0 && await i(R);
+  }, [i, c, n]);
   return {
-    handleOpenFiles,
-    handleBatchConvert,
-    handleOpenUrl,
-    handleDragOver,
-    handleDrop
+    handleOpenFiles: m,
+    handleBatchConvert: _,
+    handleOpenUrl: o,
+    handleDragOver: b,
+    handleDrop: k
   };
 }
-
-function useViewerLayout(options) {
+function ao(e) {
   const {
-    propShowOutline,
-    propShowProperties,
-    setShowOutline,
-    setShowProps
-  } = options;
-  const [leftWidth, setLeftWidth] = useState(260);
-  const [rightWidth, setRightWidth] = useState(300);
-  const resizingLeft = useRef(false);
-  const resizingRight = useRef(false);
-  useEffect(() => {
-    if (propShowOutline !== void 0) {
-      setShowOutline(propShowOutline);
-    }
-  }, [propShowOutline, setShowOutline]);
-  useEffect(() => {
-    if (propShowProperties !== void 0) {
-      setShowProps(propShowProperties);
-    }
-  }, [propShowProperties, setShowProps]);
-  useEffect(() => {
-    const handleMove = (event) => {
-      if (resizingLeft.current) {
-        setLeftWidth(Math.max(150, Math.min(500, event.clientX)));
+    propShowOutline: n,
+    propShowProperties: i,
+    setShowOutline: a,
+    setShowProps: r
+  } = e, [s, h] = O(260), [c, u] = O(300), p = ee(!1), d = ee(!1);
+  return q(() => {
+    n !== void 0 && a(n);
+  }, [n, a]), q(() => {
+    i !== void 0 && r(i);
+  }, [i, r]), q(() => {
+    const y = (v) => {
+      if (p.current && h(Math.max(150, Math.min(500, v.clientX))), d.current) {
+        const m = window.innerWidth - v.clientX;
+        u(Math.max(200, Math.min(600, m)));
       }
-      if (resizingRight.current) {
-        const nextWidth = window.innerWidth - event.clientX;
-        setRightWidth(Math.max(200, Math.min(600, nextWidth)));
-      }
+    }, f = () => {
+      p.current = !1, d.current = !1;
     };
-    const handleUp = () => {
-      resizingLeft.current = false;
-      resizingRight.current = false;
+    return window.addEventListener("mousemove", y), window.addEventListener("mouseup", f), () => {
+      window.removeEventListener("mousemove", y), window.removeEventListener("mouseup", f);
     };
-    window.addEventListener("mousemove", handleMove);
-    window.addEventListener("mouseup", handleUp);
-    return () => {
-      window.removeEventListener("mousemove", handleMove);
-      window.removeEventListener("mouseup", handleUp);
-    };
-  }, []);
-  return {
-    leftWidth,
-    rightWidth,
-    resizingLeft,
-    resizingRight
+  }, []), {
+    leftWidth: s,
+    rightWidth: c,
+    resizingLeft: p,
+    resizingRight: d
   };
 }
-
-const DEFAULT_CLIP_VALUES = { x: [0, 100], y: [0, 100], z: [0, 100] };
-const DEFAULT_CLIP_ACTIVE = { x: false, y: false, z: false };
-function useViewerTools({ initialSettings, mgrInstance }) {
-  const [activeTool, setActiveTool] = useState("none");
-  const [explodeEnabled, setExplodeEnabled] = useState(false);
-  const [explodeStrength, setExplodeStrength] = useState(32);
-  const [explodeMode, setExplodeMode] = useState("radial");
-  const [measureType, setMeasureType] = useState("none");
-  const [measureHistory, setMeasureHistory] = useState([]);
-  const [highlightedMeasureId, setHighlightedMeasureId] = useState(null);
-  const [clipEnabled, setClipEnabled] = useState(false);
-  const [clipValues, setClipValues] = useState(DEFAULT_CLIP_VALUES);
-  const [clipActive, setClipActive] = useState(DEFAULT_CLIP_ACTIVE);
-  const [clipHelperVisible, setClipHelperVisible] = usePersistentState(
+const oo = { x: [0, 100], y: [0, 100], z: [0, 100] }, so = { x: !1, y: !1, z: !1 };
+function lo({ initialSettings: e, mgrInstance: n }) {
+  const [i, a] = O("none"), [r, s] = O(!1), [h, c] = O(32), [u, p] = O("radial"), [d, y] = O("none"), [f, v] = O([]), [m, _] = O(null), [o, b] = O(!1), [k, g] = O(oo), [P, R] = O(so), [S, I] = it(
     "3dbrowser_clipHelperVisible",
-    initialSettings?.clip?.helperVisible ?? false,
+    e?.clip?.helperVisible ?? !1,
     {
-      serializer: (value) => String(value),
-      parser: (raw) => raw === "true"
+      serializer: (A) => String(A),
+      parser: (A) => A === "true"
     }
-  );
-  const [clipHelperOpacity, setClipHelperOpacity] = usePersistentState(
+  ), [C, D] = it(
     "3dbrowser_clipHelperOpacity",
-    initialSettings?.clip?.helperOpacity ?? 0.12,
+    e?.clip?.helperOpacity ?? 0.12,
     {
-      serializer: (value) => String(value),
-      parser: (raw) => {
-        const parsed = Number(raw);
-        return Number.isFinite(parsed) ? parsed : 0.12;
+      serializer: (A) => String(A),
+      parser: (A) => {
+        const U = Number(A);
+        return Number.isFinite(U) ? U : 0.12;
       }
     }
+  ), N = Se(
+    () => Math.min(0.35, Math.max(0.05, C)),
+    [C]
   );
-  const normalizedClipHelperOpacity = useMemo(
-    () => Math.min(0.35, Math.max(0.05, clipHelperOpacity)),
-    [clipHelperOpacity]
-  );
-  useEffect(() => {
-    if (normalizedClipHelperOpacity !== clipHelperOpacity) {
-      setClipHelperOpacity(normalizedClipHelperOpacity);
-    }
-  }, [clipHelperOpacity, normalizedClipHelperOpacity, setClipHelperOpacity]);
-  useEffect(() => {
-    if (!mgrInstance) return;
-    mgrInstance.setClipHelperOptions({
-      visible: clipHelperVisible,
-      opacity: normalizedClipHelperOpacity
+  return q(() => {
+    N !== C && D(N);
+  }, [C, N, D]), q(() => {
+    n && n.setClipHelperOptions({
+      visible: S,
+      opacity: N
     });
-  }, [clipHelperVisible, mgrInstance, normalizedClipHelperOpacity]);
-  useEffect(() => {
-    if (!mgrInstance) return;
-    if (activeTool !== "measure") {
-      mgrInstance.clearMeasurementPreview();
-      mgrInstance.highlightMeasurement(null);
-      setHighlightedMeasureId(null);
-      setMeasureType("none");
-    }
-  }, [activeTool, mgrInstance]);
-  useEffect(() => {
-    if (!mgrInstance) return;
-    mgrInstance.setClippingEnabled(clipEnabled);
-    if (!clipEnabled) return;
-    let bounds = mgrInstance.computeTotalBounds(true);
-    if (bounds.isEmpty()) {
-      bounds = mgrInstance.computeTotalBounds(false);
-    }
-    if (!bounds.isEmpty()) {
-      mgrInstance.updateClippingPlanes(bounds, clipValues, clipActive);
-    }
-  }, [clipActive, clipEnabled, clipValues, mgrInstance]);
-  useEffect(() => {
-    if (!mgrInstance) return;
-    mgrInstance.startMeasurement(measureType);
-  }, [measureType, mgrInstance]);
-  useEffect(() => {
-    if (!mgrInstance) return;
-    mgrInstance.setExplodeEnabled(explodeEnabled);
-  }, [explodeEnabled, mgrInstance]);
-  useEffect(() => {
-    if (!mgrInstance) return;
-    mgrInstance.setExplodeStrength(explodeStrength);
-  }, [explodeStrength, mgrInstance]);
-  useEffect(() => {
-    if (!mgrInstance) return;
-    mgrInstance.setExplodeMode(explodeMode);
-  }, [explodeMode, mgrInstance]);
-  const resetExplodeState = () => {
-    setExplodeEnabled(false);
-    setExplodeStrength(32);
-    setExplodeMode("radial");
-  };
-  const resetMeasurementState = () => {
-    setMeasureHistory([]);
-    setHighlightedMeasureId(null);
-    setMeasureType("none");
-  };
-  const handleMeasureUpdate = (records) => {
-    setMeasureHistory(records.map((record) => ({ id: record.id, type: record.type, val: record.val })));
-  };
-  return {
-    activeTool,
-    setActiveTool,
-    explodeEnabled,
-    setExplodeEnabled,
-    explodeStrength,
-    setExplodeStrength,
-    explodeMode,
-    setExplodeMode,
-    resetExplodeState,
-    measureType,
-    setMeasureType,
-    measureHistory,
-    setMeasureHistory,
-    highlightedMeasureId,
-    setHighlightedMeasureId,
-    resetMeasurementState,
-    handleMeasureUpdate,
-    clipEnabled,
-    setClipEnabled,
-    clipValues,
-    setClipValues,
-    clipActive,
-    setClipActive,
-    clipHelperVisible,
-    setClipHelperVisible,
-    clipHelperOpacity: normalizedClipHelperOpacity,
-    setClipHelperOpacity
+  }, [S, n, N]), q(() => {
+    n && i !== "measure" && (n.clearMeasurementPreview(), n.highlightMeasurement(null), _(null), y("none"));
+  }, [i, n]), q(() => {
+    if (!n || (n.setClippingEnabled(o), !o)) return;
+    let A = n.computeTotalBounds(!0);
+    A.isEmpty() && (A = n.computeTotalBounds(!1)), A.isEmpty() || n.updateClippingPlanes(A, k, P);
+  }, [P, o, k, n]), q(() => {
+    n && n.startMeasurement(d);
+  }, [d, n]), q(() => {
+    n && n.setExplodeEnabled(r);
+  }, [r, n]), q(() => {
+    n && n.setExplodeStrength(h);
+  }, [h, n]), q(() => {
+    n && n.setExplodeMode(u);
+  }, [u, n]), {
+    activeTool: i,
+    setActiveTool: a,
+    explodeEnabled: r,
+    setExplodeEnabled: s,
+    explodeStrength: h,
+    setExplodeStrength: c,
+    explodeMode: u,
+    setExplodeMode: p,
+    resetExplodeState: () => {
+      s(!1), c(32), p("radial");
+    },
+    measureType: d,
+    setMeasureType: y,
+    measureHistory: f,
+    setMeasureHistory: v,
+    highlightedMeasureId: m,
+    setHighlightedMeasureId: _,
+    resetMeasurementState: () => {
+      v([]), _(null), y("none");
+    },
+    handleMeasureUpdate: (A) => {
+      v(A.map((U) => ({ id: U.id, type: U.type, val: U.val })));
+    },
+    clipEnabled: o,
+    setClipEnabled: b,
+    clipValues: k,
+    setClipValues: g,
+    clipActive: P,
+    setClipActive: R,
+    clipHelperVisible: S,
+    setClipHelperVisible: I,
+    clipHelperOpacity: N,
+    setClipHelperOpacity: D
   };
 }
-
-const VISIBILITY_BATCH_SIZE = 400;
-function nextAnimationFrame() {
-  return new Promise((resolve) => {
-    window.requestAnimationFrame(() => resolve());
+const $t = 400;
+function co() {
+  return new Promise((e) => {
+    window.requestAnimationFrame(() => e());
   });
 }
-function useViewerVisibility({
-  sceneMgrRef,
-  selectedUuids,
-  setSelectedUuids,
-  setSelectedProps,
-  updateTree,
-  resetLocateState
+function uo({
+  sceneMgrRef: e,
+  selectedUuids: n,
+  setSelectedUuids: i,
+  setSelectedProps: a,
+  updateTree: r,
+  resetLocateState: s
 }) {
-  const [contextMenu, setContextMenu] = useState({
+  const [h, c] = O({
     x: 0,
     y: 0,
-    visible: false
-  });
-  const [hiddenUuids, setHiddenUuids] = useState(/* @__PURE__ */ new Set());
-  const [isolatedUuids, setIsolatedUuids] = useState(/* @__PURE__ */ new Set());
-  const visibilityStackRef = useRef([]);
-  const closeContextMenu = useCallback(() => {
-    setContextMenu((prev) => ({ ...prev, visible: false }));
-  }, []);
-  const handleContextMenu = useCallback((event) => {
-    event.preventDefault();
-    event.stopPropagation();
-    setContextMenu({
-      x: event.clientX,
-      y: event.clientY,
-      visible: true
+    visible: !1
+  }), [u, p] = O(/* @__PURE__ */ new Set()), [d, y] = O(/* @__PURE__ */ new Set()), f = ee([]), v = T(() => {
+    c((S) => ({ ...S, visible: !1 }));
+  }, []), m = T((S) => {
+    S.preventDefault(), S.stopPropagation(), c({
+      x: S.clientX,
+      y: S.clientY,
+      visible: !0
     });
-  }, []);
-  const handleHideSelected = useCallback(() => {
-    const sceneManager = sceneMgrRef.current;
-    if (!sceneManager || selectedUuids.length === 0) return;
-    const stateToRestore = selectedUuids.map((uuid) => {
-      const object = sceneManager.contentGroup.getObjectByProperty("uuid", uuid);
-      return { uuid, visible: object ? object.visible : true };
+  }, []), _ = T(() => {
+    const S = e.current;
+    if (!S || n.length === 0) return;
+    const I = n.map((D) => {
+      const N = S.contentGroup.getObjectByProperty("uuid", D);
+      return { uuid: D, visible: N ? N.visible : !0 };
     });
-    visibilityStackRef.current.push(stateToRestore);
-    const uuidsToHide = [...selectedUuids];
-    setSelectedUuids([]);
-    setSelectedProps(null);
-    sceneManager.highlightObjects([]);
-    closeContextMenu();
-    void (async () => {
-      for (let index = 0; index < uuidsToHide.length; index += VISIBILITY_BATCH_SIZE) {
-        const chunk = uuidsToHide.slice(index, index + VISIBILITY_BATCH_SIZE);
-        const isLastChunk = index + VISIBILITY_BATCH_SIZE >= uuidsToHide.length;
-        sceneManager.setObjectsVisibility(chunk, false, { deferRefresh: !isLastChunk });
-        if (index + VISIBILITY_BATCH_SIZE < uuidsToHide.length) {
-          await nextAnimationFrame();
-        }
+    f.current.push(I);
+    const C = [...n];
+    i([]), a(null), S.highlightObjects([]), v(), (async () => {
+      for (let $ = 0; $ < C.length; $ += $t) {
+        const E = C.slice($, $ + $t), F = $ + $t >= C.length;
+        S.setObjectsVisibility(E, !1, { deferRefresh: !F }), $ + $t < C.length && await co();
       }
-      const nextHiddenUuids = new Set(hiddenUuids);
-      const nextIsolatedUuids = new Set(isolatedUuids);
-      uuidsToHide.forEach((uuid) => {
-        nextHiddenUuids.add(uuid);
-        nextIsolatedUuids.delete(uuid);
-      });
-      setHiddenUuids(nextHiddenUuids);
-      setIsolatedUuids(nextIsolatedUuids);
-      updateTree();
+      const D = new Set(u), N = new Set(d);
+      C.forEach(($) => {
+        D.add($), N.delete($);
+      }), p(D), y(N), r();
     })();
   }, [
-    closeContextMenu,
-    hiddenUuids,
-    isolatedUuids,
-    sceneMgrRef,
-    selectedUuids,
-    setSelectedProps,
-    setSelectedUuids,
-    updateTree
-  ]);
-  const handleShowAll = useCallback(() => {
-    const sceneManager = sceneMgrRef.current;
-    if (!sceneManager) return;
-    if (hiddenUuids.size > 0 || isolatedUuids.size > 0) {
-      sceneManager.setAllVisibility(true);
-      setHiddenUuids(/* @__PURE__ */ new Set());
-      setIsolatedUuids(/* @__PURE__ */ new Set());
-      updateTree();
-    }
-    resetLocateState();
-    sceneManager.clearLocateFocus();
-    closeContextMenu();
-  }, [closeContextMenu, hiddenUuids, isolatedUuids, resetLocateState, sceneMgrRef, updateTree]);
-  const handleToggleVisibility = useCallback((uuid, visible) => {
-    const sceneManager = sceneMgrRef.current;
-    if (!sceneManager) return;
-    visibilityStackRef.current.push([{ uuid, visible: !visible }]);
-    sceneManager.setObjectVisibility(uuid, visible);
-    const nextHiddenUuids = new Set(hiddenUuids);
-    if (visible) {
-      nextHiddenUuids.delete(uuid);
-    } else {
-      nextHiddenUuids.add(uuid);
-    }
-    setHiddenUuids(nextHiddenUuids);
-    updateTree();
-  }, [hiddenUuids, sceneMgrRef, updateTree]);
-  const handleHideObject = useCallback((uuid) => {
-    const sceneManager = sceneMgrRef.current;
-    if (!sceneManager) return;
-    visibilityStackRef.current.push([{ uuid, visible: true }]);
-    sceneManager.setObjectVisibility(uuid, false);
-    setHiddenUuids((prev) => new Set(prev).add(uuid));
-    setSelectedUuids((prev) => prev.filter((id) => id !== uuid));
-    updateTree();
-  }, [sceneMgrRef, setSelectedUuids, updateTree]);
-  const handleIsolateObject = useCallback((uuid) => {
-    const sceneManager = sceneMgrRef.current;
-    if (!sceneManager) return;
-    sceneManager.isolateObjects([uuid]);
-    setHiddenUuids(/* @__PURE__ */ new Set());
-    setIsolatedUuids(/* @__PURE__ */ new Set([uuid]));
-    setSelectedUuids([uuid]);
-    sceneManager.highlightObjects([uuid]);
-    updateTree();
-    closeContextMenu();
-  }, [closeContextMenu, sceneMgrRef, setSelectedUuids, updateTree]);
-  const handleIsolateSelection = useCallback(() => {
-    const sceneManager = sceneMgrRef.current;
-    if (!sceneManager || selectedUuids.length === 0) return;
-    const nextIsolated = selectedUuids.filter((id) => !isolatedUuids.has(id));
-    if (nextIsolated.length > 0) {
-      sceneManager.isolateObjects(selectedUuids);
-      setIsolatedUuids(/* @__PURE__ */ new Set([...isolatedUuids, ...nextIsolated]));
-      setHiddenUuids(/* @__PURE__ */ new Set());
-      updateTree();
-    }
-    closeContextMenu();
-  }, [closeContextMenu, isolatedUuids, sceneMgrRef, selectedUuids, updateTree]);
-  const handleUndoVisibility = useCallback(() => {
-    const sceneManager = sceneMgrRef.current;
-    if (!sceneManager || visibilityStackRef.current.length === 0) return;
-    const lastAction = visibilityStackRef.current.pop();
-    if (!lastAction) return;
-    sceneManager.applyVisibilityBatch(lastAction, {
-      recomputeBounds: true,
-      refreshExplode: false,
-      invalidateInteractables: true
+    v,
+    u,
+    d,
+    e,
+    n,
+    a,
+    i,
+    r
+  ]), o = T(() => {
+    const S = e.current;
+    S && ((u.size > 0 || d.size > 0) && (S.setAllVisibility(!0), p(/* @__PURE__ */ new Set()), y(/* @__PURE__ */ new Set()), r()), s(), S.clearLocateFocus(), v());
+  }, [v, u, d, s, e, r]), b = T((S, I) => {
+    const C = e.current;
+    if (!C) return;
+    f.current.push([{ uuid: S, visible: !I }]), C.setObjectVisibility(S, I);
+    const D = new Set(u);
+    I ? D.delete(S) : D.add(S), p(D), r();
+  }, [u, e, r]), k = T((S) => {
+    const I = e.current;
+    I && (f.current.push([{ uuid: S, visible: !0 }]), I.setObjectVisibility(S, !1), p((C) => new Set(C).add(S)), i((C) => C.filter((D) => D !== S)), r());
+  }, [e, i, r]), g = T((S) => {
+    const I = e.current;
+    I && (I.isolateObjects([S]), p(/* @__PURE__ */ new Set()), y(/* @__PURE__ */ new Set([S])), i([S]), I.highlightObjects([S]), r(), v());
+  }, [v, e, i, r]), P = T(() => {
+    const S = e.current;
+    if (!S || n.length === 0) return;
+    const I = n.filter((C) => !d.has(C));
+    I.length > 0 && (S.isolateObjects(n), y(/* @__PURE__ */ new Set([...d, ...I])), p(/* @__PURE__ */ new Set()), r()), v();
+  }, [v, d, e, n, r]), R = T(() => {
+    const S = e.current;
+    if (!S || f.current.length === 0) return;
+    const I = f.current.pop();
+    if (!I) return;
+    S.applyVisibilityBatch(I, {
+      recomputeBounds: !0,
+      refreshExplode: !1,
+      invalidateInteractables: !0
     });
-    const nextHiddenUuids = new Set(hiddenUuids);
-    lastAction.forEach((change) => {
-      if (change.visible) {
-        nextHiddenUuids.delete(change.uuid);
-      } else {
-        nextHiddenUuids.add(change.uuid);
-      }
-    });
-    setHiddenUuids(nextHiddenUuids);
-    updateTree();
-  }, [hiddenUuids, sceneMgrRef, updateTree]);
+    const C = new Set(u);
+    I.forEach((D) => {
+      D.visible ? C.delete(D.uuid) : C.add(D.uuid);
+    }), p(C), r();
+  }, [u, e, r]);
   return {
-    contextMenu,
-    hiddenUuids,
-    isolatedUuids,
-    setHiddenUuids,
-    setIsolatedUuids,
-    handleContextMenu,
-    closeContextMenu,
-    handleHideSelected,
-    handleShowAll,
-    handleToggleVisibility,
-    handleHideObject,
-    handleIsolateObject,
-    handleIsolateSelection,
-    handleUndoVisibility
+    contextMenu: h,
+    hiddenUuids: u,
+    isolatedUuids: d,
+    setHiddenUuids: p,
+    setIsolatedUuids: y,
+    handleContextMenu: m,
+    closeContextMenu: v,
+    handleHideSelected: _,
+    handleShowAll: o,
+    handleToggleVisibility: b,
+    handleHideObject: k,
+    handleIsolateObject: g,
+    handleIsolateSelection: P,
+    handleUndoVisibility: R
   };
 }
-
-function useViewpoints({
-  currentFileSetId,
-  sceneMgrRef,
-  setToast,
-  setConfirmState,
-  t,
-  captureStateSnapshot,
-  restoreStateSnapshot
+function ho({
+  currentFileSetId: e,
+  sceneMgrRef: n,
+  setToast: i,
+  setConfirmState: a,
+  t: r,
+  captureStateSnapshot: s,
+  restoreStateSnapshot: h
 }) {
-  const [viewpoints, setViewpoints] = useState([]);
-  useEffect(() => {
-    if (!currentFileSetId) {
-      setViewpoints([]);
+  const [c, u] = O([]);
+  q(() => {
+    if (!e) {
+      u([]);
       return;
     }
     try {
-      const saved = localStorage.getItem(`viewpoints_${currentFileSetId}`);
-      setViewpoints(saved ? JSON.parse(saved) : []);
-    } catch (error) {
-      console.error("Failed to load viewpoints", error);
-      setViewpoints([]);
+      const o = localStorage.getItem(`viewpoints_${e}`);
+      u(o ? JSON.parse(o) : []);
+    } catch (o) {
+      console.error("Failed to load viewpoints", o), u([]);
     }
-  }, [currentFileSetId]);
-  const persistViewpoints = useCallback((nextViewpoints) => {
-    if (!currentFileSetId) return;
-    setViewpoints(nextViewpoints);
+  }, [e]);
+  const p = T((o) => {
+    if (e) {
+      u(o);
+      try {
+        localStorage.setItem(`viewpoints_${e}`, JSON.stringify(o));
+      } catch (b) {
+        console.error("Failed to persist viewpoints", b);
+      }
+    }
+  }, [e]), d = T(() => {
+    const o = n.current;
+    if (!o) return "";
     try {
-      localStorage.setItem(`viewpoints_${currentFileSetId}`, JSON.stringify(nextViewpoints));
-    } catch (error) {
-      console.error("Failed to persist viewpoints", error);
+      o.renderer.render(o.scene, o.camera);
+      const b = o.canvas, k = Math.min(640 / b.width, 360 / b.height), g = Math.round(b.width * k), P = Math.round(b.height * k), R = document.createElement("canvas");
+      R.width = g, R.height = P;
+      const S = R.getContext("2d");
+      return S ? (S.drawImage(b, 0, 0, g, P), R.toDataURL("image/jpeg", 0.92)) : "";
+    } catch (b) {
+      return console.error("Failed to capture thumbnail", b), "";
     }
-  }, [currentFileSetId]);
-  const captureViewThumbnail = useCallback(() => {
-    const manager = sceneMgrRef.current;
-    if (!manager) return "";
-    try {
-      manager.renderer.render(manager.scene, manager.camera);
-      const srcCanvas = manager.canvas;
-      const scale = Math.min(640 / srcCanvas.width, 360 / srcCanvas.height);
-      const dstWidth = Math.round(srcCanvas.width * scale);
-      const dstHeight = Math.round(srcCanvas.height * scale);
-      const tempCanvas = document.createElement("canvas");
-      tempCanvas.width = dstWidth;
-      tempCanvas.height = dstHeight;
-      const context = tempCanvas.getContext("2d");
-      if (!context) return "";
-      context.drawImage(srcCanvas, 0, 0, dstWidth, dstHeight);
-      return tempCanvas.toDataURL("image/jpeg", 0.92);
-    } catch (error) {
-      console.error("Failed to capture thumbnail", error);
-      return "";
-    }
-  }, [sceneMgrRef]);
-  const handleSaveViewpoint = useCallback((customName, saveOptions = {
-    visibility: true,
-    selection: true,
-    clip: true,
-    explode: true
-  }, replaceId) => {
-    const manager = sceneMgrRef.current;
-    if (!manager || !currentFileSetId) {
-      setToast({ message: t("no_models"), type: "info" });
+  }, [n]), y = T((o, b = {
+    visibility: !0,
+    selection: !0,
+    clip: !0,
+    explode: !0
+  }, k) => {
+    const g = n.current;
+    if (!g || !e) {
+      i({ message: r("no_models"), type: "info" });
       return;
     }
-    if (manager.contentGroup.children.length === 0) {
-      setToast({ message: t("no_models"), type: "info" });
+    if (g.contentGroup.children.length === 0) {
+      i({ message: r("no_models"), type: "info" });
       return;
     }
-    const name = customName || `${t("viewpoint_title")} ${viewpoints.length + 1}`;
-    const cameraState = manager.getCameraState();
-    const image = captureViewThumbnail();
-    const stateSnapshot = captureStateSnapshot(saveOptions);
-    const nextViewpoints = replaceId ? viewpoints.map((viewpoint) => viewpoint.id === replaceId ? { ...viewpoint, name, cameraState, image, saveOptions, stateSnapshot } : viewpoint) : [...viewpoints, { id: Date.now().toString(), name, cameraState, image, saveOptions, stateSnapshot }];
-    persistViewpoints(nextViewpoints);
-    setToast({ message: t("success"), type: "success" });
-  }, [captureStateSnapshot, captureViewThumbnail, currentFileSetId, persistViewpoints, sceneMgrRef, setToast, t, viewpoints]);
-  const handleUpdateViewpointName = useCallback((id, newName) => {
-    persistViewpoints(viewpoints.map((viewpoint) => viewpoint.id === id ? { ...viewpoint, name: newName } : viewpoint));
-  }, [persistViewpoints, viewpoints]);
-  const handleLoadViewpoint = useCallback(async (viewpoint) => {
-    if (!viewpoint.cameraState) return;
-    sceneMgrRef.current?.setCameraState(viewpoint.cameraState);
-    await restoreStateSnapshot(viewpoint.stateSnapshot);
-    setToast({ message: `${t("viewpoint_loading")}: ${viewpoint.name}`, type: "info" });
-  }, [restoreStateSnapshot, sceneMgrRef, setToast, t]);
-  const handleOverwriteViewpoint = useCallback((id) => {
-    const viewpoint = viewpoints.find((item) => item.id === id);
-    if (!viewpoint) return;
-    handleSaveViewpoint(
-      viewpoint.name,
-      viewpoint.saveOptions || {
-        visibility: true,
-        selection: true,
-        clip: true,
-        explode: true
+    const P = o || `${r("viewpoint_title")} ${c.length + 1}`, R = g.getCameraState(), S = d(), I = s(b), C = k ? c.map((D) => D.id === k ? { ...D, name: P, cameraState: R, image: S, saveOptions: b, stateSnapshot: I } : D) : [...c, { id: Date.now().toString(), name: P, cameraState: R, image: S, saveOptions: b, stateSnapshot: I }];
+    p(C), i({ message: r("success"), type: "success" });
+  }, [s, d, e, p, n, i, r, c]), f = T((o, b) => {
+    p(c.map((k) => k.id === o ? { ...k, name: b } : k));
+  }, [p, c]), v = T(async (o) => {
+    o.cameraState && (n.current?.setCameraState(o.cameraState), await h(o.stateSnapshot), i({ message: `${r("viewpoint_loading")}: ${o.name}`, type: "info" }));
+  }, [h, n, i, r]), m = T((o) => {
+    const b = c.find((k) => k.id === o);
+    b && y(
+      b.name,
+      b.saveOptions || {
+        visibility: !0,
+        selection: !0,
+        clip: !0,
+        explode: !0
       },
-      id
+      o
     );
-  }, [handleSaveViewpoint, viewpoints]);
-  const handleDeleteViewpoint = useCallback((id) => {
-    const viewpoint = viewpoints.find((item) => item.id === id);
-    setConfirmState({
-      isOpen: true,
-      title: t("viewpoint_title"),
-      message: `${t("confirm_delete")} "${viewpoint?.name || t("viewpoint_default_name")}"?`,
+  }, [y, c]), _ = T((o) => {
+    const b = c.find((k) => k.id === o);
+    a({
+      isOpen: !0,
+      title: r("viewpoint_title"),
+      message: `${r("confirm_delete")} "${b?.name || r("viewpoint_default_name")}"?`,
       action: () => {
-        persistViewpoints(viewpoints.filter((item) => item.id !== id));
+        p(c.filter((k) => k.id !== o));
       }
     });
-  }, [persistViewpoints, setConfirmState, t, viewpoints]);
+  }, [p, a, r, c]);
   return {
-    viewpoints,
-    handleSaveViewpoint,
-    handleUpdateViewpointName,
-    handleLoadViewpoint,
-    handleOverwriteViewpoint,
-    handleDeleteViewpoint
+    viewpoints: c,
+    handleSaveViewpoint: y,
+    handleUpdateViewpointName: f,
+    handleLoadViewpoint: v,
+    handleOverwriteViewpoint: m,
+    handleDeleteViewpoint: _
   };
 }
-
-const SUPPORTED_DRAG_EXTENSIONS = [".lmb", ".glb", ".gltf", ".ifc", ".nbim", ".fbx", ".obj", ".stl", ".ply", ".3ds", ".dae", ".stp", ".step", ".igs", ".iges"];
-const IGNORED_GLOBAL_ERRORS = [
+const xn = [".lmb", ".glb", ".gltf", ".ifc", ".nbim", ".fbx", ".obj", ".stl", ".ply", ".3ds", ".dae", ".stp", ".step", ".igs", ".iges"], Cn = [
   "ResizeObserver loop completed",
   "ResizeObserver loop limit",
   "texImage3D: FLIP_Y or PREMULTIPLY_ALPHA"
 ];
-function useViewportLifecycle({
-  allowDragOpen,
-  mgrInstance,
-  viewportRef,
-  t,
-  processFiles,
-  setToast,
-  setErrorState
+function po({
+  allowDragOpen: e,
+  mgrInstance: n,
+  viewportRef: i,
+  t: a,
+  processFiles: r,
+  setToast: s,
+  setErrorState: h
 }) {
-  useEffect(() => {
-    if (!viewportRef.current || !mgrInstance) return;
-    const observer = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      if (!entry) return;
-      const { width, height } = entry.contentRect;
-      if (width === 0 || height === 0) return;
-      requestAnimationFrame(() => {
-        mgrInstance.resize(width, height);
+  q(() => {
+    if (!i.current || !n) return;
+    const c = new ResizeObserver((p) => {
+      const d = p[0];
+      if (!d) return;
+      const { width: y, height: f } = d.contentRect;
+      y === 0 || f === 0 || requestAnimationFrame(() => {
+        n.resize(y, f);
       });
     });
-    observer.observe(viewportRef.current);
-    const handleWindowResize = () => {
-      if (!viewportRef.current) return;
-      const rect = viewportRef.current.getBoundingClientRect();
-      mgrInstance.resize(rect.width, rect.height);
+    c.observe(i.current);
+    const u = () => {
+      if (!i.current) return;
+      const p = i.current.getBoundingClientRect();
+      n.resize(p.width, p.height);
     };
-    window.addEventListener("resize", handleWindowResize);
-    return () => {
-      observer.disconnect();
-      window.removeEventListener("resize", handleWindowResize);
+    return window.addEventListener("resize", u), () => {
+      c.disconnect(), window.removeEventListener("resize", u);
     };
-  }, [mgrInstance, viewportRef]);
-  useEffect(() => {
-    const handleDragOver = (event) => {
-      if (!allowDragOpen) return;
-      event.preventDefault();
-      event.stopPropagation();
-    };
-    const handleDrop = async (event) => {
-      if (!allowDragOpen) return;
-      event.preventDefault();
-      event.stopPropagation();
-      const files = event.dataTransfer?.files ? Array.from(event.dataTransfer.files) : [];
-      if (files.length === 0) return;
-      const unsupportedFiles = files.filter((file) => {
-        const ext = `.${file.name.split(".").pop()?.toLowerCase()}`;
-        return !SUPPORTED_DRAG_EXTENSIONS.includes(ext);
+  }, [n, i]), q(() => {
+    const c = (p) => {
+      e && (p.preventDefault(), p.stopPropagation());
+    }, u = async (p) => {
+      if (!e) return;
+      p.preventDefault(), p.stopPropagation();
+      const d = p.dataTransfer?.files ? Array.from(p.dataTransfer.files) : [];
+      if (d.length === 0) return;
+      const y = d.filter((v) => {
+        const m = `.${v.name.split(".").pop()?.toLowerCase()}`;
+        return !xn.includes(m);
       });
-      if (unsupportedFiles.length > 0) {
-        setToast({
-          message: `${t("failed")}: 不支持的格式 - ${unsupportedFiles.map((file) => file.name).join(", ")}`,
-          type: "error"
-        });
-      }
-      const supportedFiles = files.filter((file) => {
-        const ext = `.${file.name.split(".").pop()?.toLowerCase()}`;
-        return SUPPORTED_DRAG_EXTENSIONS.includes(ext);
+      y.length > 0 && s({
+        message: `${a("failed")}: 不支持的格式 - ${y.map((v) => v.name).join(", ")}`,
+        type: "error"
       });
-      if (supportedFiles.length > 0) {
-        await processFiles(supportedFiles);
-      }
-    };
-    window.addEventListener("dragover", handleDragOver);
-    window.addEventListener("drop", handleDrop);
-    return () => {
-      window.removeEventListener("dragover", handleDragOver);
-      window.removeEventListener("drop", handleDrop);
-    };
-  }, [allowDragOpen, processFiles, setToast, t]);
-  useEffect(() => {
-    const handleError = (event) => {
-      const message = event.message || "";
-      if (!message && !event.error || IGNORED_GLOBAL_ERRORS.some((item) => message.includes(item))) {
-        return;
-      }
-      console.error("Global Error:", event.error || message);
-      setErrorState({
-        isOpen: true,
-        title: t("failed"),
-        message: message || "An unexpected error occurred",
-        detail: event.error?.stack || ""
+      const f = d.filter((v) => {
+        const m = `.${v.name.split(".").pop()?.toLowerCase()}`;
+        return xn.includes(m);
       });
+      f.length > 0 && await r(f);
     };
-    const handleRejection = (event) => {
-      if (!event.reason) return;
-      const message = event.reason?.message || String(event.reason);
-      if (IGNORED_GLOBAL_ERRORS.some((item) => message.includes(item))) {
-        return;
-      }
-      console.error("Unhandled Rejection:", event.reason);
-      setErrorState({
-        isOpen: true,
-        title: t("failed"),
-        message: message || "A promise was rejected without reason",
-        detail: event.reason?.stack || ""
-      });
+    return window.addEventListener("dragover", c), window.addEventListener("drop", u), () => {
+      window.removeEventListener("dragover", c), window.removeEventListener("drop", u);
     };
-    window.addEventListener("error", handleError);
-    window.addEventListener("unhandledrejection", handleRejection);
-    return () => {
-      window.removeEventListener("error", handleError);
-      window.removeEventListener("unhandledrejection", handleRejection);
+  }, [e, r, s, a]), q(() => {
+    const c = (p) => {
+      const d = p.message || "";
+      !d && !p.error || Cn.some((y) => d.includes(y)) || (console.error("Global Error:", p.error || d), h({
+        isOpen: !0,
+        title: a("failed"),
+        message: d || "An unexpected error occurred",
+        detail: p.error?.stack || ""
+      }));
+    }, u = (p) => {
+      if (!p.reason) return;
+      const d = p.reason?.message || String(p.reason);
+      Cn.some((y) => d.includes(y)) || (console.error("Unhandled Rejection:", p.reason), h({
+        isOpen: !0,
+        title: a("failed"),
+        message: d || "A promise was rejected without reason",
+        detail: p.reason?.stack || ""
+      }));
     };
-  }, [setErrorState, t]);
+    return window.addEventListener("error", c), window.addEventListener("unhandledrejection", u), () => {
+      window.removeEventListener("error", c), window.removeEventListener("unhandledrejection", u);
+    };
+  }, [h, a]);
 }
-
-function appendPropertyEntries(entries, groupName, value, source) {
-  if (!value) return;
-  entries.push(...createPropertyEntries(groupName, value, source));
+function ft(e, n, i, a) {
+  i && e.push(...yt(n, i, a));
 }
-function flattenNestedRecord(groupName, input, entries, source) {
-  Object.entries(input).forEach(([key, value]) => {
-    if (Array.isArray(value) || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-      appendPropertyEntries(entries, groupName, [{ key, value, source }], source);
+function Nn(e, n, i, a) {
+  Object.entries(n).forEach(([r, s]) => {
+    if (Array.isArray(s) || typeof s == "string" || typeof s == "number" || typeof s == "boolean") {
+      ft(i, e, [{ key: r, value: s, source: a }], a);
       return;
     }
-    if (value && typeof value === "object") {
-      Object.entries(value).forEach(([subKey, subValue]) => {
-        appendPropertyEntries(entries, groupName, [{ key: `${key}.${subKey}`, value: subValue, rawKey: subKey, source }], source);
-      });
-    }
+    s && typeof s == "object" && Object.entries(s).forEach(([h, c]) => {
+      ft(i, e, [{ key: `${r}.${h}`, value: c, rawKey: h, source: a }], a);
+    });
   });
 }
-function usePropertySearch({
-  sceneMgrRef,
-  selectedUuids,
-  setSelectedUuids,
-  onSelectObject,
-  focusObjectsInView,
-  t,
-  setToast
+function mo({
+  sceneMgrRef: e,
+  selectedUuids: n,
+  setSelectedUuids: i,
+  onSelectObject: a,
+  focusObjectsInView: r,
+  t: s,
+  setToast: h
 }) {
-  const [searchConditions, setSearchConditions] = useState([
+  const [c, u] = O([
     { id: "cond_init", propertyName: "", operator: "contains", value: "" }
-  ]);
-  const [searchResults, setSearchResults] = useState([]);
-  const [searching, setSearching] = useState(false);
-  const [searchProgress, setSearchProgress] = useState(0);
-  const [searchStatus, setSearchStatus] = useState("");
-  const searchRunTokenRef = useRef(0);
-  const searchInFlightRef = useRef(false);
-  const resolveModelId = useCallback((uuid, obj) => {
-    let cursor = obj;
-    while (cursor) {
-      const owner = cursor.userData?.originalUuid || cursor.userData?.modelUuid || cursor.userData?.rootUuid;
-      if (owner) return String(owner);
-      cursor = cursor.parent;
+  ]), [p, d] = O([]), [y, f] = O(!1), [v, m] = O(0), [_, o] = O(""), b = ee(0), k = ee(!1), g = T((E, F) => {
+    let A = F;
+    for (; A; ) {
+      const G = A.userData?.originalUuid || A.userData?.modelUuid || A.userData?.rootUuid;
+      if (G) return String(G);
+      A = A.parent;
     }
-    const structureNode = sceneMgrRef.current?.getStructureNodes(uuid)?.[0];
-    if (structureNode?.userData?.originalUuid) return String(structureNode.userData.originalUuid);
-    return uuid;
-  }, [sceneMgrRef]);
-  const buildSearchPropertyEntries = useCallback((uuid, obj) => {
-    const entries = [];
-    appendPropertyEntries(entries, "Object", [
-      { key: "name", value: obj?.name, source: "object" },
-      { key: "type", value: obj?.type, source: "object" },
-      { key: "uuid", value: uuid, source: "object" },
-      { key: "bimid", value: sceneMgrRef.current?.getBimIdByUuid(uuid) || "", source: "object" }
+    const U = e.current?.getStructureNodes(E)?.[0];
+    return U?.userData?.originalUuid ? String(U.userData.originalUuid) : E;
+  }, [e]), P = T((E, F) => {
+    const A = [];
+    ft(A, "Object", [
+      { key: "name", value: F?.name, source: "object" },
+      { key: "type", value: F?.type, source: "object" },
+      { key: "uuid", value: E, source: "object" },
+      { key: "bimid", value: e.current?.getBimIdByUuid(E) || "", source: "object" }
     ]);
-    const userData = obj?.userData || {};
-    Object.entries(userData).forEach(([key, value]) => {
-      if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-        appendPropertyEntries(entries, "UserData", [{ key, value, source: "userData" }], "userData");
-      } else if (Array.isArray(value)) {
-        value.forEach((item, index) => {
-          appendPropertyEntries(entries, "UserData", [{ key, value: item, id: `userData::${key}::${index}`, source: "userData" }], "userData");
-        });
-      }
-    });
-    const ifcMeta = obj?.userData?.ifcMetadata || {};
-    flattenNestedRecord("IFC Metadata", ifcMeta, entries, "ifcMetadata");
-    const nbimProps = sceneMgrRef.current?.getNbimProperties(uuid);
-    if (nbimProps && typeof nbimProps === "object") {
-      flattenNestedRecord("NBIM", nbimProps, entries, "nbim");
-    }
-    const nbimIfcGroups = sceneMgrRef.current?.getNbimIfcPropertyGroups(uuid, "normalized");
-    if (nbimIfcGroups && typeof nbimIfcGroups === "object") {
-      Object.entries(nbimIfcGroups).forEach(([groupName, groupEntries]) => {
-        appendPropertyEntries(entries, groupName, groupEntries, "nbim-ifc");
+    const U = F?.userData || {};
+    Object.entries(U).forEach(([V, z]) => {
+      typeof z == "string" || typeof z == "number" || typeof z == "boolean" ? ft(A, "UserData", [{ key: V, value: z, source: "userData" }], "userData") : Array.isArray(z) && z.forEach((ce, re) => {
+        ft(A, "UserData", [{ key: V, value: ce, id: `userData::${V}::${re}`, source: "userData" }], "userData");
       });
-    }
-    return entries;
-  }, [sceneMgrRef]);
-  const collectSearchCandidates = useCallback(() => {
-    const candidates = [];
-    const visited = /* @__PURE__ */ new Set();
-    const sceneMgr = sceneMgrRef.current;
-    if (!sceneMgr) return candidates;
-    sceneMgr.contentGroup.updateMatrixWorld(true);
-    sceneMgr.contentGroup.traverse((obj) => {
-      const mesh = obj;
-      if (!mesh.isMesh || !mesh.visible || !mesh.geometry) return;
-      if (mesh.userData?.isIfcGridHelper) return;
-      if (visited.has(mesh.uuid)) return;
-      visited.add(mesh.uuid);
-      candidates.push({
-        uuid: mesh.uuid,
-        name: mesh.name || mesh.uuid,
-        type: mesh.type || "Mesh",
-        modelId: resolveModelId(mesh.uuid, mesh),
+    });
+    const G = F?.userData?.ifcMetadata || {};
+    Nn("IFC Metadata", G, A, "ifcMetadata");
+    const H = e.current?.getNbimProperties(E);
+    H && typeof H == "object" && Nn("NBIM", H, A, "nbim");
+    const x = e.current?.getNbimIfcPropertyGroups(E, "normalized");
+    return x && typeof x == "object" && Object.entries(x).forEach(([V, z]) => {
+      ft(A, V, z, "nbim-ifc");
+    }), A;
+  }, [e]), R = T(() => {
+    const E = [], F = e.current;
+    if (!F) return E;
+    const A = /* @__PURE__ */ new Set(), U = /* @__PURE__ */ new Set();
+    F.contentGroup.updateMatrixWorld(!0), F.contentGroup.traverse((H) => {
+      const x = H;
+      if (!x.isMesh || !x.geometry || x.userData?.isIfcGridHelper) return;
+      A.add(x.uuid);
+      const V = String(
+        F.getBimIdByUuid(x.uuid) || x.userData?.expressID || x.uuid
+      );
+      U.has(V) || (U.add(V), E.push({
+        uuid: x.uuid,
+        name: x.name || x.uuid,
+        type: x.type || "Mesh",
+        modelId: g(x.uuid, x),
         sourceLabel: "object",
-        source: mesh
-      });
+        source: x
+      }));
     });
-    const walkNodes = (nodes) => {
-      nodes.forEach((node) => {
-        if (!node || node.visible === false) return;
-        const id = String(node.id || "");
-        if (id && node.bimId && !visited.has(id)) {
-          visited.add(id);
-          candidates.push({
-            uuid: id,
-            name: String(node.name || id),
-            type: String(node.type || "Node"),
-            modelId: String(node.userData?.originalUuid || node.id || id),
+    const G = (H) => {
+      H.forEach((x) => {
+        if (!x || x.visible === !1) return;
+        const V = String(x.id || "");
+        if (V && x.bimId) {
+          const z = String(x.bimId || V);
+          !U.has(z) && A.has(V) && (U.add(z), E.push({
+            uuid: V,
+            name: String(x.name || V),
+            type: String(x.type || "Node"),
+            modelId: String(x.userData?.originalUuid || V),
             sourceLabel: "structure",
             source: {
-              name: node.name,
-              type: node.type,
-              userData: node.userData || {}
+              name: x.name,
+              type: x.type,
+              userData: x.userData || {}
             }
-          });
+          }));
         }
-        if (Array.isArray(node.children) && node.children.length > 0) {
-          walkNodes(node.children);
-        }
+        Array.isArray(x.children) && x.children.length > 0 && G(x.children);
       });
     };
-    if (Array.isArray(sceneMgr.structureRoot?.children) && sceneMgr.structureRoot.children.length > 0) {
-      walkNodes(sceneMgr.structureRoot.children);
-    }
-    return candidates;
-  }, [resolveModelId, sceneMgrRef]);
-  const evaluateCondition = useCallback((value, operator, query) => {
-    if (operator === "equals") return value === query;
-    if (operator === "contains") return value.includes(query);
-    if (operator === "notContains") return !value.includes(query);
-    if (operator === "startsWith") return value.startsWith(query);
-    if (operator === "endsWith") return value.endsWith(query);
-    return false;
-  }, []);
-  const matchesPropertyName = useCallback((entry, query) => {
-    if (!query) return false;
-    return entry.normalizedKey === query || entry.normalizedPath === query || !!entry.rawKey && normalizePropertyToken(entry.rawKey) === query || entry.normalizedPath.endsWith(`.${query}`);
-  }, []);
-  const handleRunPropertySearch = useCallback(async () => {
-    if (!sceneMgrRef.current) return;
-    if (searchInFlightRef.current) return;
-    const normalizedConditions = searchConditions.map((item) => ({
-      ...item,
-      normalizedPropertyName: normalizePropertyToken(item.propertyName),
-      normalizedValue: normalizePropertyToken(item.value)
-    })).filter((item) => item.normalizedPropertyName && item.normalizedValue);
-    if (normalizedConditions.length === 0) {
-      setSearchResults([]);
-      setSearching(false);
-      setSearchProgress(0);
-      setSearchStatus("");
-      setToast({ message: t("search_invalid_condition"), type: "info" });
-      sceneMgrRef.current.highlightObjects(selectedUuids);
+    return Array.isArray(F.structureRoot?.children) && F.structureRoot.children.length > 0 && G(F.structureRoot.children), E;
+  }, [g, e]), S = T((E, F, A) => F === "equals" ? E === A : F === "contains" ? E.includes(A) : F === "notContains" ? !E.includes(A) : F === "startsWith" ? E.startsWith(A) : F === "endsWith" ? E.endsWith(A) : !1, []), I = T((E, F) => F ? E.normalizedKey === F || E.normalizedPath === F || !!E.rawKey && rt(E.rawKey) === F || E.normalizedPath.endsWith(`.${F}`) : !1, []), C = T(async () => {
+    if (!e.current || k.current) return;
+    const E = c.map((U) => ({
+      ...U,
+      normalizedPropertyName: rt(U.propertyName),
+      normalizedValue: rt(U.value)
+    })).filter((U) => U.normalizedPropertyName && U.normalizedValue);
+    if (E.length === 0) {
+      d([]), f(!1), m(0), o(""), h({ message: s("search_invalid_condition"), type: "info" }), e.current.highlightObjects(n);
       return;
     }
-    const runToken = ++searchRunTokenRef.current;
-    const searchStartAt = performance.now();
-    searchInFlightRef.current = true;
-    setSearching(true);
-    setSearchProgress(0);
-    setSearchStatus(t("searching"));
+    const F = ++b.current, A = performance.now();
+    k.current = !0, f(!0), m(0), o(s("searching"));
     try {
-      const candidates = collectSearchCandidates();
-      const total = candidates.length;
-      const batchSize = 600;
-      const nextResults = [];
-      let lastProgressAt = performance.now();
-      let cancelled = false;
-      for (let i = 0; i < candidates.length; i++) {
-        if (searchRunTokenRef.current !== runToken) {
-          cancelled = true;
-          setSearchStatus(t("search_cancelled"));
+      const U = R(), G = U.length, H = 600, x = [];
+      let V = performance.now(), z = !1;
+      for (let ce = 0; ce < U.length; ce++) {
+        if (b.current !== F) {
+          z = !0, o(s("search_cancelled"));
           break;
         }
-        const item = candidates[i];
-        const entries = buildSearchPropertyEntries(item.uuid, item.source);
-        let result = null;
-        const matchedBy = /* @__PURE__ */ new Set();
-        normalizedConditions.forEach((condition, index) => {
-          const matchedEntries = entries.filter((entry) => matchesPropertyName(entry, condition.normalizedPropertyName));
-          const matched = matchedEntries.some((entry) => evaluateCondition(entry.normalizedValue, condition.operator, condition.normalizedValue));
-          if (matched) {
-            matchedEntries.forEach((entry) => {
-              if (evaluateCondition(entry.normalizedValue, condition.operator, condition.normalizedValue)) {
-                matchedBy.add(entry.path);
-              }
-            });
-          }
-          if (index === 0 || result === null) result = matched;
-          else if ((condition.connector || "AND") === "AND") result = Boolean(result) && matched;
-          else result = Boolean(result) || matched;
-        });
-        if (result) {
-          nextResults.push({
-            uuid: item.uuid,
-            name: item.name || item.uuid,
-            type: item.type,
-            modelId: item.modelId,
-            source: item.sourceLabel,
-            matchedBy: Array.from(matchedBy)
-          });
-        }
-        if ((i + 1) % batchSize === 0 || i === candidates.length - 1) {
-          const now = performance.now();
-          const progress = total > 0 ? (i + 1) / total * 100 : 100;
-          if (now - lastProgressAt > 120 || i === candidates.length - 1) {
-            setSearchProgress(progress);
-            lastProgressAt = now;
-          }
-          await new Promise((resolve) => window.setTimeout(resolve, 0));
+        const re = U[ce], Z = P(re.uuid, re.source);
+        let te = null;
+        const ue = /* @__PURE__ */ new Set();
+        if (E.forEach((ne, ge) => {
+          const _e = Z.filter((j) => I(j, ne.normalizedPropertyName)), ye = _e.some((j) => S(j.normalizedValue, ne.operator, ne.normalizedValue));
+          ye && _e.forEach((j) => {
+            S(j.normalizedValue, ne.operator, ne.normalizedValue) && ue.add(j.path);
+          }), ge === 0 || te === null ? te = ye : (ne.connector || "AND") === "AND" ? te = !!te && ye : te = !!te || ye;
+        }), te && x.push({
+          uuid: re.uuid,
+          name: re.name || re.uuid,
+          type: re.type,
+          modelId: re.modelId,
+          source: re.sourceLabel,
+          matchedBy: Array.from(ue)
+        }), (ce + 1) % H === 0 || ce === U.length - 1) {
+          const ne = performance.now(), ge = G > 0 ? (ce + 1) / G * 100 : 100;
+          (ne - V > 120 || ce === U.length - 1) && (m(ge), V = ne), await new Promise((_e) => window.setTimeout(_e, 0));
         }
       }
-      if (!cancelled) {
-        setSearchResults(nextResults);
-        setSearchProgress(100);
-        setSearchStatus(`${t("search_results")}: ${nextResults.length}`);
-      }
+      z || (d(x), m(100), o(`${s("search_results")}: ${x.length}`));
     } finally {
-      const elapsed = performance.now() - searchStartAt;
-      const minVisibleMs = 220;
-      if (elapsed < minVisibleMs) {
-        await new Promise((resolve) => window.setTimeout(resolve, minVisibleMs - elapsed));
-      }
-      setSearching(false);
-      searchInFlightRef.current = false;
+      const U = performance.now() - A, G = 220;
+      U < G && await new Promise((H) => window.setTimeout(H, G - U)), f(!1), k.current = !1;
     }
-  }, [buildSearchPropertyEntries, collectSearchCandidates, evaluateCondition, matchesPropertyName, sceneMgrRef, searchConditions, selectedUuids, setToast, t]);
-  const handleApplySearchResultHighlight = useCallback((uuid) => {
-    if (!sceneMgrRef.current) return;
-    const target = sceneMgrRef.current.contentGroup.getObjectByProperty("uuid", uuid);
-    focusObjectsInView({ uuids: [uuid], focusUuid: uuid });
-    if (target) {
-      void onSelectObject(target);
+  }, [P, R, S, I, e, c, n, h, s]), D = T((E) => {
+    if (!e.current) return;
+    const F = e.current.contentGroup.getObjectByProperty("uuid", E);
+    if (r({ uuids: [E], focusUuid: E }), F) {
+      a(F);
       return;
     }
-    setSelectedUuids([uuid]);
-  }, [focusObjectsInView, onSelectObject, sceneMgrRef, setSelectedUuids]);
-  const handleClearSearchResult = useCallback(() => {
-    searchRunTokenRef.current++;
-    setSearchResults([]);
-    setSearching(false);
-    setSearchProgress(0);
-    setSearchStatus("");
-    searchInFlightRef.current = false;
-    if (!sceneMgrRef.current) return;
-    sceneMgrRef.current.highlightObjects(selectedUuids);
-  }, [sceneMgrRef, selectedUuids]);
-  const handleCancelSearch = useCallback(() => {
-    if (!searchInFlightRef.current) return;
-    searchRunTokenRef.current++;
-    setSearchStatus(t("search_cancelling"));
-  }, [t]);
+    i([E]);
+  }, [r, a, e, i]), N = T(() => {
+    b.current++, d([]), f(!1), m(0), o(""), k.current = !1, e.current && e.current.highlightObjects(n);
+  }, [e, n]), $ = T(() => {
+    k.current && (b.current++, o(s("search_cancelling")));
+  }, [s]);
   return {
-    searchConditions,
-    setSearchConditions,
-    searchResults,
-    searching,
-    searchProgress,
-    searchStatus,
-    handleRunPropertySearch,
-    handleApplySearchResultHighlight,
-    handleClearSearchResult,
-    handleCancelSearch
+    searchConditions: c,
+    setSearchConditions: u,
+    searchResults: p,
+    searching: y,
+    searchProgress: v,
+    searchStatus: _,
+    handleRunPropertySearch: C,
+    handleApplySearchResultHighlight: D,
+    handleClearSearchResult: N,
+    handleCancelSearch: $
   };
 }
-
-// module scope helper variables
-
-const a = {
-	c: null, // center
-	u: [ new Vector3(), new Vector3(), new Vector3() ], // basis vectors
-	e: [] // half width
-};
-
-const b = {
-	c: null, // center
-	u: [ new Vector3(), new Vector3(), new Vector3() ], // basis vectors
-	e: [] // half width
-};
-
-const R = [[], [], []];
-const AbsR = [[], [], []];
-const t = [];
-
-const xAxis = new Vector3();
-const yAxis = new Vector3();
-const zAxis = new Vector3();
-const v1 = new Vector3();
-const size = new Vector3();
-const closestPoint = new Vector3();
-const rotationMatrix = new Matrix3();
-const aabb = new Box3();
-const matrix = new Matrix4();
-const inverse = new Matrix4();
-const localRay = new Ray();
-
-/**
- * Represents an oriented bounding box (OBB) in 3D space.
- *
- * @three_import import { OBB } from 'three/addons/math/OBB.js';
- */
-class OBB {
-
-	/**
-	 * Constructs a new OBB.
-	 *
-	 * @param {Vector3} [center] - The center of the OBB.
-	 * @param {Vector3} [halfSize] - Positive halfwidth extents of the OBB along each axis.
-	 * @param {Matrix3} [rotation] - The rotation of the OBB.
-	 */
-	constructor( center = new Vector3(), halfSize = new Vector3(), rotation = new Matrix3() ) {
-
-		/**
-		 * The center of the OBB.
-		 *
-		 * @type {Vector3}
-		 */
-		this.center = center;
-
-		/**
-		 * Positive halfwidth extents of the OBB along each axis.
-		 *
-		 * @type {Vector3}
-		 */
-		this.halfSize = halfSize;
-
-		/**
-		 * The rotation of the OBB.
-		 *
-		 * @type {Matrix3}
-		 */
-		this.rotation = rotation;
-
-	}
-
-	/**
-	 * Sets the OBBs components to the given values.
-	 *
-	 * @param {Vector3} [center] - The center of the OBB.
-	 * @param {Vector3} [halfSize] - Positive halfwidth extents of the OBB along each axis.
-	 * @param {Matrix3} [rotation] - The rotation of the OBB.
-	 * @return {OBB} A reference to this OBB.
-	 */
-	set( center, halfSize, rotation ) {
-
-		this.center = center;
-		this.halfSize = halfSize;
-		this.rotation = rotation;
-
-		return this;
-
-	}
-
-	/**
-	 * Copies the values of the given OBB to this instance.
-	 *
-	 * @param {OBB} obb - The OBB to copy.
-	 * @return {OBB} A reference to this OBB.
-	 */
-	copy( obb ) {
-
-		this.center.copy( obb.center );
-		this.halfSize.copy( obb.halfSize );
-		this.rotation.copy( obb.rotation );
-
-		return this;
-
-	}
-
-	/**
-	 * Returns a new OBB with copied values from this instance.
-	 *
-	 * @return {OBB} A clone of this instance.
-	 */
-	clone() {
-
-		return new this.constructor().copy( this );
-
-	}
-
-	/**
-	 * Returns the size of this OBB.
-	 *
-	 * @param {Vector3} target - The target vector that is used to store the method's result.
-	 * @return {Vector3} The size.
-	 */
-	getSize( target ) {
-
-		return target.copy( this.halfSize ).multiplyScalar( 2 );
-
-	}
-
-	/**
-	 * Clamps the given point within the bounds of this OBB.
-	 *
-	 * @param {Vector3} point - The point that should be clamped within the bounds of this OBB.
-	 * @param {Vector3} target - The target vector that is used to store the method's result.
-	 * @returns {Vector3} - The clamped point.
-	 */
-	clampPoint( point, target ) {
-
-		// Reference: Closest Point on OBB to Point in Real-Time Collision Detection
-		// by Christer Ericson (chapter 5.1.4)
-
-		const halfSize = this.halfSize;
-
-		v1.subVectors( point, this.center );
-		this.rotation.extractBasis( xAxis, yAxis, zAxis );
-
-		// start at the center position of the OBB
-
-		target.copy( this.center );
-
-		// project the target onto the OBB axes and walk towards that point
-
-		const x = MathUtils.clamp( v1.dot( xAxis ), - halfSize.x, halfSize.x );
-		target.add( xAxis.multiplyScalar( x ) );
-
-		const y = MathUtils.clamp( v1.dot( yAxis ), - halfSize.y, halfSize.y );
-		target.add( yAxis.multiplyScalar( y ) );
-
-		const z = MathUtils.clamp( v1.dot( zAxis ), - halfSize.z, halfSize.z );
-		target.add( zAxis.multiplyScalar( z ) );
-
-		return target;
-
-	}
-
-	/**
-	 * Returns `true` if the given point lies within this OBB.
-	 *
-	 * @param {Vector3} point - The point to test.
-	 * @returns {boolean} - Whether the given point lies within this OBB or not.
-	 */
-	containsPoint( point ) {
-
-		v1.subVectors( point, this.center );
-		this.rotation.extractBasis( xAxis, yAxis, zAxis );
-
-		// project v1 onto each axis and check if these points lie inside the OBB
-
-		return Math.abs( v1.dot( xAxis ) ) <= this.halfSize.x &&
-				Math.abs( v1.dot( yAxis ) ) <= this.halfSize.y &&
-				Math.abs( v1.dot( zAxis ) ) <= this.halfSize.z;
-
-	}
-
-	/**
-	 * Returns `true` if the given AABB intersects this OBB.
-	 *
-	 * @param {Box3} box3 - The AABB to test.
-	 * @returns {boolean} - Whether the given AABB intersects this OBB or not.
-	 */
-	intersectsBox3( box3 ) {
-
-		return this.intersectsOBB( obb.fromBox3( box3 ) );
-
-	}
-
-	/**
-	 * Returns `true` if the given bounding sphere intersects this OBB.
-	 *
-	 * @param {Sphere} sphere - The bounding sphere to test.
-	 * @returns {boolean} - Whether the given bounding sphere intersects this OBB or not.
-	 */
-	intersectsSphere( sphere ) {
-
-		// find the point on the OBB closest to the sphere center
-
-		this.clampPoint( sphere.center, closestPoint );
-
-		// if that point is inside the sphere, the OBB and sphere intersect
-
-		return closestPoint.distanceToSquared( sphere.center ) <= ( sphere.radius * sphere.radius );
-
-	}
-
-	/**
-	 * Returns `true` if the given OBB intersects this OBB.
-	 *
-	 * @param {OBB} obb - The OBB to test.
-	 * @param {number} [epsilon=Number.EPSILON] - A small value to prevent arithmetic errors.
-	 * @returns {boolean} - Whether the given OBB intersects this OBB or not.
-	 */
-	intersectsOBB( obb, epsilon = Number.EPSILON ) {
-
-		// Reference: OBB-OBB Intersection in Real-Time Collision Detection
-		// by Christer Ericson (chapter 4.4.1)
-
-		// prepare data structures (the code uses the same nomenclature like the reference)
-
-		a.c = this.center;
-		a.e[ 0 ] = this.halfSize.x;
-		a.e[ 1 ] = this.halfSize.y;
-		a.e[ 2 ] = this.halfSize.z;
-		this.rotation.extractBasis( a.u[ 0 ], a.u[ 1 ], a.u[ 2 ] );
-
-		b.c = obb.center;
-		b.e[ 0 ] = obb.halfSize.x;
-		b.e[ 1 ] = obb.halfSize.y;
-		b.e[ 2 ] = obb.halfSize.z;
-		obb.rotation.extractBasis( b.u[ 0 ], b.u[ 1 ], b.u[ 2 ] );
-
-		// compute rotation matrix expressing b in a's coordinate frame
-
-		for ( let i = 0; i < 3; i ++ ) {
-
-			for ( let j = 0; j < 3; j ++ ) {
-
-				R[ i ][ j ] = a.u[ i ].dot( b.u[ j ] );
-
-			}
-
-		}
-
-		// compute translation vector
-
-		v1.subVectors( b.c, a.c );
-
-		// bring translation into a's coordinate frame
-
-		t[ 0 ] = v1.dot( a.u[ 0 ] );
-		t[ 1 ] = v1.dot( a.u[ 1 ] );
-		t[ 2 ] = v1.dot( a.u[ 2 ] );
-
-		// compute common subexpressions. Add in an epsilon term to
-		// counteract arithmetic errors when two edges are parallel and
-		// their cross product is (near) null
-
-		for ( let i = 0; i < 3; i ++ ) {
-
-			for ( let j = 0; j < 3; j ++ ) {
-
-				AbsR[ i ][ j ] = Math.abs( R[ i ][ j ] ) + epsilon;
-
-			}
-
-		}
-
-		let ra, rb;
-
-		// test axes L = A0, L = A1, L = A2
-
-		for ( let i = 0; i < 3; i ++ ) {
-
-			ra = a.e[ i ];
-			rb = b.e[ 0 ] * AbsR[ i ][ 0 ] + b.e[ 1 ] * AbsR[ i ][ 1 ] + b.e[ 2 ] * AbsR[ i ][ 2 ];
-			if ( Math.abs( t[ i ] ) > ra + rb ) return false;
-
-
-		}
-
-		// test axes L = B0, L = B1, L = B2
-
-		for ( let i = 0; i < 3; i ++ ) {
-
-			ra = a.e[ 0 ] * AbsR[ 0 ][ i ] + a.e[ 1 ] * AbsR[ 1 ][ i ] + a.e[ 2 ] * AbsR[ 2 ][ i ];
-			rb = b.e[ i ];
-			if ( Math.abs( t[ 0 ] * R[ 0 ][ i ] + t[ 1 ] * R[ 1 ][ i ] + t[ 2 ] * R[ 2 ][ i ] ) > ra + rb ) return false;
-
-		}
-
-		// test axis L = A0 x B0
-
-		ra = a.e[ 1 ] * AbsR[ 2 ][ 0 ] + a.e[ 2 ] * AbsR[ 1 ][ 0 ];
-		rb = b.e[ 1 ] * AbsR[ 0 ][ 2 ] + b.e[ 2 ] * AbsR[ 0 ][ 1 ];
-		if ( Math.abs( t[ 2 ] * R[ 1 ][ 0 ] - t[ 1 ] * R[ 2 ][ 0 ] ) > ra + rb ) return false;
-
-		// test axis L = A0 x B1
-
-		ra = a.e[ 1 ] * AbsR[ 2 ][ 1 ] + a.e[ 2 ] * AbsR[ 1 ][ 1 ];
-		rb = b.e[ 0 ] * AbsR[ 0 ][ 2 ] + b.e[ 2 ] * AbsR[ 0 ][ 0 ];
-		if ( Math.abs( t[ 2 ] * R[ 1 ][ 1 ] - t[ 1 ] * R[ 2 ][ 1 ] ) > ra + rb ) return false;
-
-		// test axis L = A0 x B2
-
-		ra = a.e[ 1 ] * AbsR[ 2 ][ 2 ] + a.e[ 2 ] * AbsR[ 1 ][ 2 ];
-		rb = b.e[ 0 ] * AbsR[ 0 ][ 1 ] + b.e[ 1 ] * AbsR[ 0 ][ 0 ];
-		if ( Math.abs( t[ 2 ] * R[ 1 ][ 2 ] - t[ 1 ] * R[ 2 ][ 2 ] ) > ra + rb ) return false;
-
-		// test axis L = A1 x B0
-
-		ra = a.e[ 0 ] * AbsR[ 2 ][ 0 ] + a.e[ 2 ] * AbsR[ 0 ][ 0 ];
-		rb = b.e[ 1 ] * AbsR[ 1 ][ 2 ] + b.e[ 2 ] * AbsR[ 1 ][ 1 ];
-		if ( Math.abs( t[ 0 ] * R[ 2 ][ 0 ] - t[ 2 ] * R[ 0 ][ 0 ] ) > ra + rb ) return false;
-
-		// test axis L = A1 x B1
-
-		ra = a.e[ 0 ] * AbsR[ 2 ][ 1 ] + a.e[ 2 ] * AbsR[ 0 ][ 1 ];
-		rb = b.e[ 0 ] * AbsR[ 1 ][ 2 ] + b.e[ 2 ] * AbsR[ 1 ][ 0 ];
-		if ( Math.abs( t[ 0 ] * R[ 2 ][ 1 ] - t[ 2 ] * R[ 0 ][ 1 ] ) > ra + rb ) return false;
-
-		// test axis L = A1 x B2
-
-		ra = a.e[ 0 ] * AbsR[ 2 ][ 2 ] + a.e[ 2 ] * AbsR[ 0 ][ 2 ];
-		rb = b.e[ 0 ] * AbsR[ 1 ][ 1 ] + b.e[ 1 ] * AbsR[ 1 ][ 0 ];
-		if ( Math.abs( t[ 0 ] * R[ 2 ][ 2 ] - t[ 2 ] * R[ 0 ][ 2 ] ) > ra + rb ) return false;
-
-		// test axis L = A2 x B0
-
-		ra = a.e[ 0 ] * AbsR[ 1 ][ 0 ] + a.e[ 1 ] * AbsR[ 0 ][ 0 ];
-		rb = b.e[ 1 ] * AbsR[ 2 ][ 2 ] + b.e[ 2 ] * AbsR[ 2 ][ 1 ];
-		if ( Math.abs( t[ 1 ] * R[ 0 ][ 0 ] - t[ 0 ] * R[ 1 ][ 0 ] ) > ra + rb ) return false;
-
-		// test axis L = A2 x B1
-
-		ra = a.e[ 0 ] * AbsR[ 1 ][ 1 ] + a.e[ 1 ] * AbsR[ 0 ][ 1 ];
-		rb = b.e[ 0 ] * AbsR[ 2 ][ 2 ] + b.e[ 2 ] * AbsR[ 2 ][ 0 ];
-		if ( Math.abs( t[ 1 ] * R[ 0 ][ 1 ] - t[ 0 ] * R[ 1 ][ 1 ] ) > ra + rb ) return false;
-
-		// test axis L = A2 x B2
-
-		ra = a.e[ 0 ] * AbsR[ 1 ][ 2 ] + a.e[ 1 ] * AbsR[ 0 ][ 2 ];
-		rb = b.e[ 0 ] * AbsR[ 2 ][ 1 ] + b.e[ 1 ] * AbsR[ 2 ][ 0 ];
-		if ( Math.abs( t[ 1 ] * R[ 0 ][ 2 ] - t[ 0 ] * R[ 1 ][ 2 ] ) > ra + rb ) return false;
-
-		// since no separating axis is found, the OBBs must be intersecting
-
-		return true;
-
-	}
-
-	/**
-	 * Returns `true` if the given plane intersects this OBB.
-	 *
-	 * @param {Plane} plane - The plane to test.
-	 * @returns {boolean} Whether the given plane intersects this OBB or not.
-	 */
-	intersectsPlane( plane ) {
-
-		// Reference: Testing Box Against Plane in Real-Time Collision Detection
-		// by Christer Ericson (chapter 5.2.3)
-
-		this.rotation.extractBasis( xAxis, yAxis, zAxis );
-
-		// compute the projection interval radius of this OBB onto L(t) = this->center + t * p.normal;
-
-		const r = this.halfSize.x * Math.abs( plane.normal.dot( xAxis ) ) +
-				this.halfSize.y * Math.abs( plane.normal.dot( yAxis ) ) +
-				this.halfSize.z * Math.abs( plane.normal.dot( zAxis ) );
-
-		// compute distance of the OBB's center from the plane
-
-		const d = plane.normal.dot( this.center ) - plane.constant;
-
-		// Intersection occurs when distance d falls within [-r,+r] interval
-
-		return Math.abs( d ) <= r;
-
-	}
-
-	/**
-	 * Performs a ray/OBB intersection test and stores the intersection point
-	 * in the given 3D vector.
-	 *
-	 * @param {Ray} ray - The ray to test.
-	 * @param {Vector3} target - The target vector that is used to store the method's result.
-	 * @return {?Vector3} The intersection point. If no intersection is detected, `null` is returned.
-	 */
-	intersectRay( ray, target ) {
-
-		// the idea is to perform the intersection test in the local space
-		// of the OBB.
-
-		this.getSize( size );
-		aabb.setFromCenterAndSize( v1.set( 0, 0, 0 ), size );
-
-		// create a 4x4 transformation matrix
-
-		matrix.setFromMatrix3( this.rotation );
-		matrix.setPosition( this.center );
-
-		// transform ray to the local space of the OBB
-
-		inverse.copy( matrix ).invert();
-		localRay.copy( ray ).applyMatrix4( inverse );
-
-		// perform ray <-> AABB intersection test
-
-		if ( localRay.intersectBox( aabb, target ) ) {
-
-			// transform the intersection point back to world space
-
-			return target.applyMatrix4( matrix );
-
-		} else {
-
-			return null;
-
-		}
-
-	}
-
-	/**
-	 * Returns `true` if the given ray intersects this OBB.
-	 *
-	 * @param {Ray} ray - The ray to test.
-	 * @returns {boolean} Whether the given ray intersects this OBB or not.
-	 */
-	intersectsRay( ray ) {
-
-		return this.intersectRay( ray, v1 ) !== null;
-
-	}
-
-	/**
-	 * Defines an OBB based on the given AABB.
-	 *
-	 * @param {Box3} box3 - The AABB to setup the OBB from.
-	 * @return {OBB} A reference of this OBB.
-	 */
-	fromBox3( box3 ) {
-
-		box3.getCenter( this.center );
-
-		box3.getSize( this.halfSize ).multiplyScalar( 0.5 );
-
-		this.rotation.identity();
-
-		return this;
-
-	}
-
-	/**
-	 * Returns `true` if the given OBB is equal to this OBB.
-	 *
-	 * @param {OBB} obb - The OBB to test.
-	 * @returns {boolean} Whether the given OBB is equal to this OBB or not.
-	 */
-	equals( obb ) {
-
-		return obb.center.equals( this.center ) &&
-			obb.halfSize.equals( this.halfSize ) &&
-			obb.rotation.equals( this.rotation );
-
-	}
-
-	/**
-	 * Applies the given transformation matrix to this OBB. This method can be
-	 * used to transform the bounding volume with the world matrix of a 3D object
-	 * in order to keep both entities in sync.
-	 *
-	 * @param {Matrix4} matrix - The matrix to apply.
-	 * @return {OBB} A reference of this OBB.
-	 */
-	applyMatrix4( matrix ) {
-
-		const e = matrix.elements;
-
-		let sx = v1.set( e[ 0 ], e[ 1 ], e[ 2 ] ).length();
-		const sy = v1.set( e[ 4 ], e[ 5 ], e[ 6 ] ).length();
-		const sz = v1.set( e[ 8 ], e[ 9 ], e[ 10 ] ).length();
-
-		const det = matrix.determinant();
-		if ( det < 0 ) sx = - sx;
-
-		rotationMatrix.setFromMatrix4( matrix );
-
-		const invSX = 1 / sx;
-		const invSY = 1 / sy;
-		const invSZ = 1 / sz;
-
-		rotationMatrix.elements[ 0 ] *= invSX;
-		rotationMatrix.elements[ 1 ] *= invSX;
-		rotationMatrix.elements[ 2 ] *= invSX;
-
-		rotationMatrix.elements[ 3 ] *= invSY;
-		rotationMatrix.elements[ 4 ] *= invSY;
-		rotationMatrix.elements[ 5 ] *= invSY;
-
-		rotationMatrix.elements[ 6 ] *= invSZ;
-		rotationMatrix.elements[ 7 ] *= invSZ;
-		rotationMatrix.elements[ 8 ] *= invSZ;
-
-		this.rotation.multiply( rotationMatrix );
-
-		this.halfSize.x *= sx;
-		this.halfSize.y *= sy;
-		this.halfSize.z *= sz;
-
-		v1.setFromMatrixPosition( matrix );
-		this.center.add( v1 );
-
-		return this;
-
-	}
-
+function fo(e, n) {
+  const i = Math.max(0, e.min.x - n.max.x, n.min.x - e.max.x), a = Math.max(0, e.min.y - n.max.y, n.min.y - e.max.y), r = Math.max(0, e.min.z - n.max.z, n.min.z - e.max.z);
+  return Math.sqrt(i * i + a * a + r * r);
 }
-
-const obb = new OBB();
-
-function buildBoxFromGeometry(geometry, matrixWorld) {
-  if (!geometry.boundingBox) geometry.computeBoundingBox();
-  return geometry.boundingBox ? geometry.boundingBox.clone().applyMatrix4(matrixWorld) : null;
+function _o(e, n) {
+  e.boundingBox || e.computeBoundingBox();
+  const i = e.boundingBox;
+  if (!i) return null;
+  const a = new L.Vector3(), r = new L.Vector3();
+  i.getCenter(a), i.getSize(r).multiplyScalar(0.5), a.applyMatrix4(n);
+  const s = new L.Matrix3().setFromMatrix4(n);
+  return new dr(a, r, s);
 }
-function distanceBetweenBoxes(a, b) {
-  const dx = Math.max(0, a.min.x - b.max.x, b.min.x - a.max.x);
-  const dy = Math.max(0, a.min.y - b.max.y, b.min.y - a.max.y);
-  const dz = Math.max(0, a.min.z - b.max.z, b.min.z - a.max.z);
-  return Math.sqrt(dx * dx + dy * dy + dz * dz);
-}
-function buildObbFromGeometry(geometry, matrixWorld) {
-  if (!geometry.boundingBox) geometry.computeBoundingBox();
-  const bb = geometry.boundingBox;
-  if (!bb) return null;
-  const center = new THREE.Vector3();
-  const halfSize = new THREE.Vector3();
-  bb.getCenter(center);
-  bb.getSize(halfSize).multiplyScalar(0.5);
-  center.applyMatrix4(matrixWorld);
-  const rotation = new THREE.Matrix3().setFromMatrix4(matrixWorld);
-  return new OBB(center, halfSize, rotation);
-}
-function useClashCheck({
-  sceneMgrRef,
-  treeRoot,
-  clashModelOptions,
-  selectedUuids,
-  setSelectedUuids,
-  focusObjectsInView,
-  t
+function go({
+  sceneMgrRef: e,
+  treeRoot: n,
+  clashModelOptions: i,
+  selectedUuids: a,
+  setSelectedUuids: r,
+  focusObjectsInView: s,
+  t: h
 }) {
-  const [clashResults, setClashResults] = useState([]);
-  const [clashRunning, setClashRunning] = useState(false);
-  const [clashProgress, setClashProgress] = useState(0);
-  const [clashStatus, setClashStatus] = useState("");
-  const [clashScannedCount, setClashScannedCount] = useState(0);
-  const [clashSetA, setClashSetA] = useState([]);
-  const [clashSetB, setClashSetB] = useState([]);
-  const [clashTolerance, setClashTolerance] = useState(0);
-  const [clashMinOverlapVolume, setClashMinOverlapVolume] = useState(0);
-  const [clashClearanceDistance, setClashClearanceDistance] = useState(0.05);
-  const [clashUseNarrowPhase, setClashUseNarrowPhase] = useState(true);
-  const [clashUseTrianglePhase, setClashUseTrianglePhase] = useState(false);
-  const [clashIncludeSameModel, setClashIncludeSameModel] = useState(false);
-  const [clashPairsScanned, setClashPairsScanned] = useState(0);
-  const [clashResultFilter, setClashResultFilter] = useState("ALL");
-  const [clashTypeFilter, setClashTypeFilter] = useState("ALL");
-  const clashRunTokenRef = useRef(0);
-  const clashInFlightRef = useRef(false);
-  const clashCandidateCacheRef = useRef(/* @__PURE__ */ new Map());
-  const clashModelNameById = useMemo(() => {
-    const map = /* @__PURE__ */ new Map();
-    clashModelOptions.forEach((option) => map.set(option.id, option.name));
-    return map;
-  }, [clashModelOptions]);
-  const resolveModelOwner = useCallback((obj) => {
-    let current = obj;
-    while (current) {
-      const owner = current.userData?.originalUuid;
-      if (owner) return String(owner);
-      current = current.parent;
+  const [c, u] = O([]), [p, d] = O(!1), [y, f] = O(0), [v, m] = O(""), [_, o] = O(0), [b, k] = O([]), [g, P] = O([]), [R, S] = O(0), [I, C] = O(0), [D, N] = O(0.05), [$, E] = O(!0), [F, A] = O(!1), [U, G] = O(!1), [H, x] = O(0), [V, z] = O("ALL"), [ce, re] = O("ALL"), Z = ee(0), te = ee(!1), ue = ee(/* @__PURE__ */ new Map()), ne = Se(() => {
+    const K = /* @__PURE__ */ new Map();
+    return i.forEach((Y) => K.set(Y.id, Y.name)), K;
+  }, [i]), ge = T((K) => {
+    let Y = K;
+    for (; Y; ) {
+      const Q = Y.userData?.originalUuid;
+      if (Q) return String(Q);
+      Y = Y.parent;
     }
     return "";
-  }, []);
-  const buildMeshInfo = useCallback((uuid, geometry, matrixWorld) => {
-    const pos = geometry.attributes.position;
-    if (!pos) return null;
-    const index = geometry.index;
-    const triangleCount = index ? Math.floor(index.count / 3) : Math.floor(pos.count / 3);
+  }, []), _e = T((K, Y, Q) => {
+    const M = Y.attributes.position;
+    if (!M) return null;
+    const ie = Y.index, pe = Math.floor(ie ? ie.count / 3 : M.count / 3);
     return {
-      uuid,
-      geometry,
-      matrixWorld: matrixWorld.clone(),
-      triangleCount
+      uuid: K,
+      geometry: Y,
+      matrixWorld: Q.clone(),
+      triangleCount: pe
     };
-  }, []);
-  const collectClashCandidates = useCallback(() => {
-    const sceneMgr = sceneMgrRef.current;
-    if (!sceneMgr) return [];
-    const cached = clashCandidateCacheRef.current;
-    cached.clear();
-    sceneMgr.contentGroup.updateMatrixWorld(true);
-    sceneMgr.contentGroup.traverse((obj) => {
-      const mesh = obj;
-      if (!mesh.isMesh || !mesh.visible || !mesh.geometry) return;
-      if (mesh.userData?.isIfcGridHelper) return;
-      const box = buildBoxFromGeometry(mesh.geometry, mesh.matrixWorld);
-      if (!box || box.isEmpty()) return;
-      const modelId = resolveModelOwner(mesh);
-      const candidate = {
-        uuid: mesh.uuid,
-        name: mesh.name || mesh.uuid,
-        modelId,
-        modelName: clashModelNameById.get(modelId) || modelId || mesh.name || mesh.uuid,
-        box,
-        testBox: box.clone(),
-        obb: clashUseNarrowPhase ? buildObbFromGeometry(mesh.geometry, mesh.matrixWorld) : null,
-        meshInfo: buildMeshInfo(mesh.uuid, mesh.geometry, mesh.matrixWorld)
+  }, []), ye = T(() => {
+    const K = e.current;
+    if (!K) return [];
+    const Y = ue.current;
+    Y.clear();
+    const Q = /* @__PURE__ */ new Set();
+    return K.contentGroup.traverse((M) => {
+      const ie = M;
+      ie.isMesh && ie.geometry && !ie.userData?.isIfcGridHelper && Q.add(ie.uuid);
+    }), K.collectRenderableTargets().forEach((M) => {
+      if (!Q.has(M.uuid) || M.box.isEmpty()) return;
+      const ie = K.getStructureNodes(M.uuid) || [];
+      if (ie.length > 0 && ie.every((ve) => ve.visible === !1)) return;
+      const pe = ie[0]?.userData?.originalUuid ? String(ie[0].userData.originalUuid) : ge(M.object), le = {
+        key: M.key,
+        uuid: M.uuid,
+        name: M.name || M.uuid,
+        modelId: pe,
+        modelName: ne.get(pe) || pe || M.name || M.uuid,
+        box: M.box.clone(),
+        testBox: M.box.clone(),
+        obb: $ ? _o(M.geometry, M.matrixWorld) : null,
+        meshInfo: _e(M.key, M.geometry, M.matrixWorld)
       };
-      cached.set(candidate.uuid, candidate);
-    });
-    sceneMgr.optimizedMapping.forEach((mappings, originalUuid) => {
-      if (cached.has(originalUuid) || !mappings || mappings.length === 0) return;
-      const nodes = sceneMgr.getStructureNodes(originalUuid) || [];
-      if (nodes.length > 0 && nodes.every((node2) => node2.visible === false)) return;
-      const box = new THREE.Box3();
-      mappings.forEach((mapping) => {
-        const geometry = mapping.geometry || mapping.mesh.geometry;
-        if (!geometry) return;
-        const matrix = new THREE.Matrix4();
-        mapping.mesh.getMatrixAt(mapping.instanceId, matrix);
-        matrix.premultiply(mapping.mesh.matrixWorld);
-        const partBox = buildBoxFromGeometry(geometry, matrix);
-        if (partBox && !partBox.isEmpty()) box.union(partBox);
-      });
-      if (box.isEmpty()) return;
-      const node = nodes[0];
-      const modelId = node?.userData?.originalUuid ? String(node.userData.originalUuid) : "";
-      cached.set(originalUuid, {
-        uuid: originalUuid,
-        name: node?.name || originalUuid,
-        modelId,
-        modelName: clashModelNameById.get(modelId) || modelId || node?.name || originalUuid,
-        box,
-        testBox: box.clone(),
-        obb: null,
-        meshInfo: null
-      });
-    });
-    return Array.from(cached.values());
-  }, [buildMeshInfo, clashModelNameById, clashUseNarrowPhase, resolveModelOwner, sceneMgrRef]);
-  const collectTriangleCentersInBox = useCallback((meshInfo, box, maxCenters, maxTrianglesToScan) => {
-    const centers = [];
-    const pos = meshInfo.geometry.attributes.position;
-    if (!pos) return centers;
-    const index = meshInfo.geometry.index;
-    const triCount = index ? Math.floor(index.count / 3) : Math.floor(pos.count / 3);
-    const scanCount = Math.min(triCount, maxTrianglesToScan);
-    const stride = triCount > scanCount ? Math.max(1, Math.floor(triCount / scanCount)) : 1;
-    const a = new THREE.Vector3();
-    const b = new THREE.Vector3();
-    const c = new THREE.Vector3();
-    const center = new THREE.Vector3();
-    for (let ti = 0; ti < triCount; ti += stride) {
-      const i0 = index ? index.getX(ti * 3) : ti * 3;
-      const i1 = index ? index.getX(ti * 3 + 1) : ti * 3 + 1;
-      const i2 = index ? index.getX(ti * 3 + 2) : ti * 3 + 2;
-      a.fromBufferAttribute(pos, i0).applyMatrix4(meshInfo.matrixWorld);
-      b.fromBufferAttribute(pos, i1).applyMatrix4(meshInfo.matrixWorld);
-      c.fromBufferAttribute(pos, i2).applyMatrix4(meshInfo.matrixWorld);
-      center.copy(a).add(b).add(c).multiplyScalar(1 / 3);
-      if (!box.containsPoint(center)) continue;
-      centers.push(center.clone());
-      if (centers.length >= maxCenters) break;
+      Y.set(le.key, le);
+    }), Array.from(Y.values());
+  }, [_e, ne, $, ge, e]), j = T((K, Y, Q, M) => {
+    const ie = [], pe = K.geometry.attributes.position;
+    if (!pe) return ie;
+    const le = K.geometry.index, ve = Math.floor(le ? le.count / 3 : pe.count / 3), Te = Math.min(ve, M), ze = ve > Te ? Math.max(1, Math.floor(ve / Te)) : 1, me = new L.Vector3(), Me = new L.Vector3(), Re = new L.Vector3(), Oe = new L.Vector3();
+    for (let xe = 0; xe < ve; xe += ze) {
+      const Ce = le ? le.getX(xe * 3) : xe * 3, et = le ? le.getX(xe * 3 + 1) : xe * 3 + 1, $e = le ? le.getX(xe * 3 + 2) : xe * 3 + 2;
+      if (me.fromBufferAttribute(pe, Ce).applyMatrix4(K.matrixWorld), Me.fromBufferAttribute(pe, et).applyMatrix4(K.matrixWorld), Re.fromBufferAttribute(pe, $e).applyMatrix4(K.matrixWorld), Oe.copy(me).add(Me).add(Re).multiplyScalar(1 / 3), !!Y.containsPoint(Oe) && (ie.push(Oe.clone()), ie.length >= Q))
+        break;
     }
-    return centers;
-  }, []);
-  const isPointInsideMeshByRaycast = useCallback((point, meshInfo) => {
-    const pos = meshInfo.geometry.attributes.position;
-    if (!pos) return false;
-    const index = meshInfo.geometry.index;
-    const triCount = index ? Math.floor(index.count / 3) : Math.floor(pos.count / 3);
-    const maxTrianglesToScan = 12e3;
-    const scanCount = Math.min(triCount, maxTrianglesToScan);
-    const stride = triCount > scanCount ? Math.max(1, Math.floor(triCount / scanCount)) : 1;
-    const origin = point.clone();
-    origin.x -= 1e-4;
-    const ray = new THREE.Ray(origin, new THREE.Vector3(1, 0, 0));
-    const hit = new THREE.Vector3();
-    const a = new THREE.Vector3();
-    const b = new THREE.Vector3();
-    const c = new THREE.Vector3();
-    let intersections = 0;
-    for (let ti = 0; ti < triCount; ti += stride) {
-      const i0 = index ? index.getX(ti * 3) : ti * 3;
-      const i1 = index ? index.getX(ti * 3 + 1) : ti * 3 + 1;
-      const i2 = index ? index.getX(ti * 3 + 2) : ti * 3 + 2;
-      a.fromBufferAttribute(pos, i0).applyMatrix4(meshInfo.matrixWorld);
-      b.fromBufferAttribute(pos, i1).applyMatrix4(meshInfo.matrixWorld);
-      c.fromBufferAttribute(pos, i2).applyMatrix4(meshInfo.matrixWorld);
-      const intersection = ray.intersectTriangle(a, b, c, false, hit);
-      if (!intersection || hit.x < origin.x) continue;
-      intersections++;
+    return ie;
+  }, []), B = T((K, Y) => {
+    const Q = Y.geometry.attributes.position;
+    if (!Q) return !1;
+    const M = Y.geometry.index, ie = Math.floor(M ? M.count / 3 : Q.count / 3), le = Math.min(ie, 12e3), ve = ie > le ? Math.max(1, Math.floor(ie / le)) : 1, Te = K.clone();
+    Te.x -= 1e-4;
+    const ze = new L.Ray(Te, new L.Vector3(1, 0, 0)), me = new L.Vector3(), Me = new L.Vector3(), Re = new L.Vector3(), Oe = new L.Vector3();
+    let xe = 0;
+    for (let Ce = 0; Ce < ie; Ce += ve) {
+      const et = M ? M.getX(Ce * 3) : Ce * 3, $e = M ? M.getX(Ce * 3 + 1) : Ce * 3 + 1, tt = M ? M.getX(Ce * 3 + 2) : Ce * 3 + 2;
+      Me.fromBufferAttribute(Q, et).applyMatrix4(Y.matrixWorld), Re.fromBufferAttribute(Q, $e).applyMatrix4(Y.matrixWorld), Oe.fromBufferAttribute(Q, tt).applyMatrix4(Y.matrixWorld), !(!ze.intersectTriangle(Me, Re, Oe, !1, me) || me.x < Te.x) && xe++;
     }
-    return intersections % 2 === 1;
-  }, []);
-  const passesTrianglePhase = useCallback((a, b, overlap) => {
-    if (!a.meshInfo || !b.meshInfo) return true;
-    if (a.meshInfo.triangleCount <= 0 || b.meshInfo.triangleCount <= 0) return true;
-    const triLimit = 3e4;
-    if (a.meshInfo.triangleCount > triLimit || b.meshInfo.triangleCount > triLimit) return true;
-    const centersA = collectTriangleCentersInBox(a.meshInfo, overlap, 4, 6e3);
-    const centersB = collectTriangleCentersInBox(b.meshInfo, overlap, 4, 6e3);
-    if (centersA.length === 0 || centersB.length === 0) return false;
-    return centersA.some((center) => isPointInsideMeshByRaycast(center, b.meshInfo)) || centersB.some((center) => isPointInsideMeshByRaycast(center, a.meshInfo));
-  }, [collectTriangleCentersInBox, isPointInsideMeshByRaycast]);
-  const handleRunClashCheck = useCallback(async () => {
-    if (!sceneMgrRef.current || clashInFlightRef.current) return;
-    const runToken = ++clashRunTokenRef.current;
-    const startedAt = performance.now();
-    clashInFlightRef.current = true;
-    setClashRunning(true);
-    setClashProgress(0);
-    setClashStatus(t("clash_collecting"));
-    setClashResults([]);
-    setClashPairsScanned(0);
+    return xe % 2 === 1;
+  }, []), de = T((K, Y, Q) => {
+    if (!K.meshInfo || !Y.meshInfo || K.meshInfo.triangleCount <= 0 || Y.meshInfo.triangleCount <= 0) return !0;
+    const M = 3e4;
+    if (K.meshInfo.triangleCount > M || Y.meshInfo.triangleCount > M) return !0;
+    const ie = j(K.meshInfo, Q, 4, 6e3), pe = j(Y.meshInfo, Q, 4, 6e3);
+    return ie.length === 0 || pe.length === 0 ? !1 : ie.some((le) => B(le, Y.meshInfo)) || pe.some((le) => B(le, K.meshInfo));
+  }, [j, B]), he = T(async () => {
+    if (!e.current || te.current) return;
+    const K = ++Z.current, Y = performance.now();
+    te.current = !0, d(!0), f(0), m(h("clash_collecting")), u([]), x(0);
     try {
-      const rawCandidates = collectClashCandidates();
-      setClashScannedCount(rawCandidates.length);
-      if (rawCandidates.length < 2) {
-        setClashStatus(t("clash_insufficient_candidates"));
+      const Q = ye();
+      if (o(Q.length), Q.length < 2) {
+        m(h("clash_insufficient_candidates"));
         return;
       }
-      const setAFilter = new Set(clashSetA);
-      const setBFilter = new Set(clashSetB);
-      const hasA = setAFilter.size > 0;
-      const hasB = setBFilter.size > 0;
-      const pairAllowed = (aModelId, bModelId) => {
-        if (!clashIncludeSameModel && aModelId && bModelId && aModelId === bModelId) return false;
-        if (hasA && hasB) {
-          return setAFilter.has(aModelId) && setBFilter.has(bModelId) || setAFilter.has(bModelId) && setBFilter.has(aModelId);
-        }
-        if (hasA) return setAFilter.has(aModelId) || setAFilter.has(bModelId);
-        if (hasB) return setBFilter.has(aModelId) || setBFilter.has(bModelId);
-        return true;
-      };
-      const candidateEligible = (modelId) => {
-        if (hasA && hasB) return setAFilter.has(modelId) || setBFilter.has(modelId);
-        if (hasA) return setAFilter.has(modelId);
-        if (hasB) return setBFilter.has(modelId);
-        return true;
-      };
-      const effectiveClearance = Math.max(0, clashClearanceDistance);
-      const bounded = rawCandidates.filter((candidate) => !candidate.box.isEmpty() && candidateEligible(candidate.modelId)).map((candidate) => {
-        const testBox = candidate.box.clone();
-        if (clashTolerance > 0 || effectiveClearance > 0) {
-          testBox.expandByScalar(Math.max(clashTolerance, effectiveClearance));
-        }
-        return {
-          ...candidate,
-          testBox
+      const M = new Set(b), ie = new Set(g), pe = M.size > 0, le = ie.size > 0, ve = (X, oe) => !U && X && oe && X === oe ? !1 : pe && le ? M.has(X) && ie.has(oe) || M.has(oe) && ie.has(X) : pe ? M.has(X) || M.has(oe) : le ? ie.has(X) || ie.has(oe) : !0, Te = (X) => pe && le ? M.has(X) || ie.has(X) : pe ? M.has(X) : le ? ie.has(X) : !0, ze = Math.max(0, D), me = Q.filter((X) => !X.box.isEmpty() && Te(X.modelId)).map((X) => {
+        const oe = X.box.clone();
+        return (R > 0 || ze > 0) && oe.expandByScalar(Math.max(R, ze)), {
+          ...X,
+          testBox: oe
         };
       });
-      if (bounded.length < 2) {
-        setClashStatus(t("clash_no_results"));
-        setClashProgress(100);
+      if (me.length < 2) {
+        m(h("clash_no_results")), f(100);
         return;
       }
-      bounded.sort((a, b) => a.testBox.min.x - b.testBox.min.x);
-      setClashStatus(t("clash_running"));
-      const maxResults = 2e3;
-      const results = [];
-      const overlapBox = new THREE.Box3();
-      const overlapSize = new THREE.Vector3();
-      const n = bounded.length;
-      let pairChecks = 0;
-      for (let i = 0; i < n; i++) {
-        if (clashRunTokenRef.current !== runToken) {
-          setClashStatus(t("clash_cancelled"));
+      me.sort((X, oe) => X.testBox.min.x - oe.testBox.min.x), m(h("clash_running"));
+      const Me = 2e3, Re = [], Oe = new L.Box3(), xe = new L.Vector3(), Ce = me.length;
+      let et = 0;
+      for (let X = 0; X < Ce; X++) {
+        if (Z.current !== K) {
+          m(h("clash_cancelled"));
           return;
         }
-        const a = bounded[i];
-        const aMaxX = a.testBox.max.x;
-        for (let j = i + 1; j < n; j++) {
-          const b = bounded[j];
-          if (b.testBox.min.x > aMaxX) break;
-          if (!pairAllowed(a.modelId, b.modelId)) continue;
-          pairChecks++;
-          if (!a.testBox.intersectsBox(b.testBox)) continue;
-          if (clashUseNarrowPhase && a.obb && b.obb) {
-            const obbA = a.obb.clone();
-            const obbB = b.obb.clone();
-            if (clashTolerance > 0) {
-              obbA.halfSize.addScalar(clashTolerance);
-              obbB.halfSize.addScalar(clashTolerance);
-            }
-            if (!obbA.intersectsOBB(obbB, Number.EPSILON * 10)) continue;
+        const oe = me[X], Fe = oe.testBox.max.x;
+        for (let De = X + 1; De < Ce; De++) {
+          const Ve = me[De];
+          if (Ve.testBox.min.x > Fe) break;
+          if (!ve(oe.modelId, Ve.modelId) || (et++, !oe.testBox.intersectsBox(Ve.testBox))) continue;
+          if ($ && oe.obb && Ve.obb) {
+            const ut = oe.obb.clone(), wt = Ve.obb.clone();
+            if (R > 0 && (ut.halfSize.addScalar(R), wt.halfSize.addScalar(R)), !ut.intersectsOBB(wt, Number.EPSILON * 10)) continue;
           }
-          overlapBox.copy(a.box).intersect(b.box);
-          const hasOverlap = !overlapBox.isEmpty();
-          let overlapVolume = 0;
-          if (hasOverlap) {
-            overlapBox.getSize(overlapSize);
-            overlapVolume = Math.max(0, overlapSize.x) * Math.max(0, overlapSize.y) * Math.max(0, overlapSize.z);
-          }
-          const distance = hasOverlap ? 0 : distanceBetweenBoxes(a.box, b.box);
-          const isHardClash = hasOverlap && overlapVolume >= clashMinOverlapVolume;
-          const isClearanceClash = !hasOverlap && effectiveClearance > 0 && distance <= effectiveClearance;
-          if (!isHardClash && !isClearanceClash) continue;
-          if (clashUseTrianglePhase && hasOverlap && !passesTrianglePhase(a, b, overlapBox)) continue;
-          const pairKey = [a.uuid, b.uuid].sort().join("::");
-          const clashType = isHardClash ? "hard" : "clearance";
-          const severity = clashType === "hard" ? overlapVolume > Math.max(0.5, clashMinOverlapVolume * 10) ? "high" : "medium" : distance <= Math.max(1e-3, effectiveClearance * 0.25) ? "high" : "low";
-          results.push({
-            id: `clash_${clashType}_${pairKey}_${results.length}`,
-            pairKey,
-            groupKey: `${clashType}::${a.modelId || "unknown"}::${b.modelId || "unknown"}::${pairKey}`,
-            ruleId: clashType === "hard" ? "hard-clash-default" : "clearance-default",
-            aUuid: a.uuid,
-            bUuid: b.uuid,
-            aName: a.name,
-            bName: b.name,
-            overlapVolume,
-            distance,
-            severity,
-            type: clashType,
+          Oe.copy(oe.box).intersect(Ve.box);
+          const Ue = !Oe.isEmpty();
+          let Qe = 0;
+          Ue && (Oe.getSize(xe), Qe = Math.max(0, xe.x) * Math.max(0, xe.y) * Math.max(0, xe.z));
+          const bt = Ue ? 0 : fo(oe.box, Ve.box), vt = Ue && Qe >= I, lt = !Ue && ze > 0 && bt <= ze;
+          if (!vt && !lt || F && Ue && !de(oe, Ve, Oe)) continue;
+          const ct = [oe.key, Ve.key].sort().join("::"), J = vt ? "hard" : "clearance", St = J === "hard" ? Qe > Math.max(0.5, I * 10) ? "high" : "medium" : bt <= Math.max(1e-3, ze * 0.25) ? "high" : "low";
+          if (Re.push({
+            id: `clash_${J}_${ct}`,
+            pairKey: ct,
+            groupKey: `${J}::${oe.modelId || "unknown"}::${Ve.modelId || "unknown"}::${ct}`,
+            ruleId: J === "hard" ? "hard-clash-default" : "clearance-default",
+            aUuid: oe.uuid,
+            bUuid: Ve.uuid,
+            aName: oe.name,
+            bName: Ve.name,
+            overlapVolume: Qe,
+            distance: bt,
+            severity: St,
+            type: J,
             status: "new"
-          });
-          if (results.length >= maxResults) break;
+          }), Re.length >= Me) break;
         }
-        if (results.length >= maxResults) break;
-        if ((i + 1) % 50 === 0 || i === n - 1) {
-          const progress = 30 + (i + 1) / n * 70;
-          setClashProgress(progress);
-          setClashPairsScanned(pairChecks);
-          setClashStatus(`${t("clash_running")} ${i + 1}/${n}`);
-          await new Promise((resolve) => window.setTimeout(resolve, 0));
+        if (Re.length >= Me) break;
+        if ((X + 1) % 50 === 0 || X === Ce - 1) {
+          const De = 30 + (X + 1) / Ce * 70;
+          f(De), x(et), m(`${h("clash_running")} ${X + 1}/${Ce}`), await new Promise((Ve) => window.setTimeout(Ve, 0));
         }
       }
-      results.sort((x, y) => {
-        if (x.type !== y.type) return x.type === "hard" ? -1 : 1;
-        if (x.type === "hard") return y.overlapVolume - x.overlapVolume;
-        return x.distance - y.distance;
+      const $e = /* @__PURE__ */ new Map(), tt = { high: 3, medium: 2, low: 1 };
+      Re.forEach((X) => {
+        const oe = $e.get(X.pairKey);
+        if (!oe)
+          $e.set(X.pairKey, X);
+        else {
+          const Fe = (oe.type === "hard" ? 1e3 : 0) + tt[oe.severity], De = (X.type === "hard" ? 1e3 : 0) + tt[X.severity];
+          (De > Fe || De === Fe && (X.type === "hard" && X.overlapVolume > oe.overlapVolume || X.type === "clearance" && X.distance < oe.distance)) && $e.set(X.pairKey, X);
+        }
       });
-      setClashResults((prev) => {
-        const statusByPair = /* @__PURE__ */ new Map();
-        prev.forEach((item) => statusByPair.set(item.pairKey, item.status));
-        return results.map((item) => ({
-          ...item,
-          status: statusByPair.get(item.pairKey) || "new"
+      const nt = Array.from($e.values()).sort((X, oe) => X.type !== oe.type ? X.type === "hard" ? -1 : 1 : X.type === "hard" ? oe.overlapVolume - X.overlapVolume : X.distance - oe.distance);
+      u((X) => {
+        const oe = /* @__PURE__ */ new Map();
+        return X.forEach((Fe) => oe.set(Fe.pairKey, Fe.status)), nt.map((Fe) => ({
+          ...Fe,
+          status: oe.get(Fe.pairKey) || "new"
         }));
-      });
-      setClashPairsScanned(pairChecks);
-      setClashProgress(100);
-      setClashStatus(`${t("clash_results")}: ${results.length}`);
-      if (results.length === 0) {
-        sceneMgrRef.current.clearLocateFocus();
-      }
+      }), x(et), f(100), m(`${h("clash_results")}: ${nt.length}`), nt.length === 0 && e.current.clearLocateFocus();
     } finally {
-      const elapsed = performance.now() - startedAt;
-      const minVisibleMs = 220;
-      if (elapsed < minVisibleMs) {
-        await new Promise((resolve) => window.setTimeout(resolve, minVisibleMs - elapsed));
-      }
-      clashInFlightRef.current = false;
-      setClashRunning(false);
+      const Q = performance.now() - Y, M = 220;
+      Q < M && await new Promise((ie) => window.setTimeout(ie, M - Q)), te.current = !1, d(!1);
     }
-  }, [clashClearanceDistance, clashIncludeSameModel, clashMinOverlapVolume, clashSetA, clashSetB, clashTolerance, clashUseNarrowPhase, clashUseTrianglePhase, collectClashCandidates, passesTrianglePhase, sceneMgrRef, t]);
-  const handleCancelClashCheck = useCallback(() => {
-    if (!clashInFlightRef.current) return;
-    clashRunTokenRef.current++;
-    setClashStatus(t("clash_cancelling"));
-  }, [t]);
-  const handleClearClashResults = useCallback(() => {
-    clashRunTokenRef.current++;
-    clashInFlightRef.current = false;
-    setClashRunning(false);
-    setClashProgress(0);
-    setClashStatus("");
-    setClashScannedCount(0);
-    setClashPairsScanned(0);
-    setClashResultFilter("ALL");
-    setClashTypeFilter("ALL");
-    setClashResults([]);
-    sceneMgrRef.current?.clearLocateFocus();
-    sceneMgrRef.current?.highlightObjects(selectedUuids);
-  }, [sceneMgrRef, selectedUuids]);
-  const handleFocusClashResult = useCallback((item) => {
-    const uuids = [item.aUuid, item.bUuid];
-    focusObjectsInView({
-      uuids,
-      focusUuid: item.aUuid,
+  }, [D, U, I, b, g, R, $, F, ye, de, e, h]), be = T(() => {
+    te.current && (Z.current++, m(h("clash_cancelling")));
+  }, [h]), ke = T(() => {
+    Z.current++, te.current = !1, d(!1), f(0), m(""), o(0), x(0), z("ALL"), re("ALL"), u([]), e.current?.clearLocateFocus(), e.current?.highlightObjects(a);
+  }, [e, a]), We = T((K) => {
+    const Y = [K.aUuid, K.bUuid];
+    s({
+      uuids: Y,
+      focusUuid: K.aUuid,
       highlightColors: {
-        [item.aUuid]: "#ff4d4f",
-        [item.bUuid]: "#1890ff"
+        [K.aUuid]: "#ff4d4f",
+        [K.bUuid]: "#1890ff"
       }
     });
-  }, [focusObjectsInView]);
-  const handleUpdateClashResultStatus = useCallback((id, nextStatus) => {
-    setClashResults((prev) => prev.map((item) => item.id === id ? { ...item, status: nextStatus } : item));
-  }, []);
-  const handleMarkFilteredClashStatus = useCallback((nextStatus) => {
-    setClashResults((prev) => prev.map((item) => {
-      const matchedStatus = clashResultFilter === "ALL" || clashResultFilter === "NEW" && item.status === "new" || clashResultFilter === "CONFIRMED" && item.status === "confirmed" || clashResultFilter === "RESOLVED" && item.status === "resolved";
-      const matchedType = clashTypeFilter === "ALL" || clashTypeFilter === "HARD" && item.type === "hard" || clashTypeFilter === "CLEARANCE" && item.type === "clearance";
-      const matched = matchedStatus && matchedType;
-      return matched ? { ...item, status: nextStatus } : item;
+  }, [s]), Ne = T((K, Y) => {
+    u((Q) => Q.map((M) => M.id === K ? { ...M, status: Y } : M));
+  }, []), Ie = T((K) => {
+    u((Y) => Y.map((Q) => {
+      const M = V === "ALL" || V === "NEW" && Q.status === "new" || V === "CONFIRMED" && Q.status === "confirmed" || V === "RESOLVED" && Q.status === "resolved", ie = ce === "ALL" || ce === "HARD" && Q.type === "hard" || ce === "CLEARANCE" && Q.type === "clearance";
+      return M && ie ? { ...Q, status: K } : Q;
     }));
-  }, [clashResultFilter, clashTypeFilter]);
-  const handleExportClashCsv = useCallback(() => {
-    if (clashResults.length === 0) return;
-    const escapeCsv = (value) => {
-      const text = String(value ?? "");
-      if (text.includes(",") || text.includes('"') || text.includes("\n")) {
-        return `"${text.replace(/"/g, '""')}"`;
-      }
-      return text;
-    };
-    const header = ["pairKey", "type", "severity", "ruleId", "aUuid", "aName", "bUuid", "bName", "status", "overlapVolume", "distance"];
-    const lines = [header.join(",")];
-    clashResults.forEach((item) => {
-      lines.push([
-        escapeCsv(item.pairKey),
-        escapeCsv(item.type),
-        escapeCsv(item.severity),
-        escapeCsv(item.ruleId),
-        escapeCsv(item.aUuid),
-        escapeCsv(item.aName),
-        escapeCsv(item.bUuid),
-        escapeCsv(item.bName),
-        escapeCsv(item.status),
-        escapeCsv(item.overlapVolume.toFixed(6)),
-        escapeCsv(item.distance.toFixed(6))
+  }, [V, ce]), je = T(() => {
+    if (c.length === 0) return;
+    const K = (me) => {
+      const Me = String(me ?? "");
+      return Me.includes(",") || Me.includes('"') || Me.includes(`
+`) ? `"${Me.replace(/"/g, '""')}"` : Me;
+    }, Q = [["pairKey", "type", "severity", "ruleId", "aUuid", "aName", "bUuid", "bName", "status", "overlapVolume", "distance"].join(",")];
+    c.forEach((me) => {
+      Q.push([
+        K(me.pairKey),
+        K(me.type),
+        K(me.severity),
+        K(me.ruleId),
+        K(me.aUuid),
+        K(me.aName),
+        K(me.bUuid),
+        K(me.bName),
+        K(me.status),
+        K(me.overlapVolume.toFixed(6)),
+        K(me.distance.toFixed(6))
       ].join(","));
     });
-    const csv = "\uFEFF" + lines.join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const now = /* @__PURE__ */ new Date();
-    const pad = (value) => String(value).padStart(2, "0");
-    const fileName = `clash_report_${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.csv`;
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = fileName;
-    anchor.click();
-    URL.revokeObjectURL(url);
-  }, [clashResults]);
-  const resetClashState = useCallback(() => {
-    clashRunTokenRef.current++;
-    clashInFlightRef.current = false;
-    setClashResults([]);
-    setClashRunning(false);
-    setClashProgress(0);
-    setClashStatus("");
-    setClashScannedCount(0);
-    setClashPairsScanned(0);
-    setClashResultFilter("ALL");
-    setClashTypeFilter("ALL");
-  }, []);
-  const applyClashModelOptionBounds = useCallback(() => {
-    const validIds = new Set(clashModelOptions.map((item) => item.id));
-    setClashSetA((prev) => prev.filter((id) => validIds.has(id)));
-    setClashSetB((prev) => prev.filter((id) => validIds.has(id)));
-  }, [clashModelOptions]);
+    const M = "\uFEFF" + Q.join(`
+`), ie = new Blob([M], { type: "text/csv;charset=utf-8;" }), pe = URL.createObjectURL(ie), le = /* @__PURE__ */ new Date(), ve = (me) => String(me).padStart(2, "0"), Te = `clash_report_${le.getFullYear()}${ve(le.getMonth() + 1)}${ve(le.getDate())}_${ve(le.getHours())}${ve(le.getMinutes())}${ve(le.getSeconds())}.csv`, ze = document.createElement("a");
+    ze.href = pe, ze.download = Te, ze.click(), URL.revokeObjectURL(pe);
+  }, [c]), qe = T(() => {
+    Z.current++, te.current = !1, u([]), d(!1), f(0), m(""), o(0), x(0), z("ALL"), re("ALL");
+  }, []), st = T(() => {
+    const K = new Set(i.map((Y) => Y.id));
+    k((Y) => Y.filter((Q) => K.has(Q))), P((Y) => Y.filter((Q) => K.has(Q)));
+  }, [i]);
   return {
-    clashResults,
-    setClashResults,
-    clashRunning,
-    clashProgress,
-    clashStatus,
-    clashScannedCount,
-    clashSetA,
-    clashSetB,
-    clashTolerance,
-    clashMinOverlapVolume,
-    clashClearanceDistance,
-    clashUseNarrowPhase,
-    clashUseTrianglePhase,
-    clashIncludeSameModel,
-    clashPairsScanned,
-    clashResultFilter,
-    clashTypeFilter,
-    setClashSetA,
-    setClashSetB,
-    setClashTolerance,
-    setClashMinOverlapVolume,
-    setClashClearanceDistance,
-    setClashUseNarrowPhase,
-    setClashUseTrianglePhase,
-    setClashIncludeSameModel,
-    setClashResultFilter,
-    setClashTypeFilter,
-    handleRunClashCheck,
-    handleCancelClashCheck,
-    handleClearClashResults,
-    handleFocusClashResult,
-    handleUpdateClashResultStatus,
-    handleMarkFilteredClashStatus,
-    handleExportClashCsv,
-    resetClashState,
-    applyClashModelOptionBounds
+    clashResults: c,
+    setClashResults: u,
+    clashRunning: p,
+    clashProgress: y,
+    clashStatus: v,
+    clashScannedCount: _,
+    clashSetA: b,
+    clashSetB: g,
+    clashTolerance: R,
+    clashMinOverlapVolume: I,
+    clashClearanceDistance: D,
+    clashUseNarrowPhase: $,
+    clashUseTrianglePhase: F,
+    clashPruning: !0,
+    clashIncludeSameModel: U,
+    clashPairsScanned: H,
+    clashResultFilter: V,
+    clashTypeFilter: ce,
+    setClashSetA: k,
+    setClashSetB: P,
+    setClashTolerance: S,
+    setClashMinOverlapVolume: C,
+    setClashClearanceDistance: N,
+    setClashUseNarrowPhase: E,
+    setClashUseTrianglePhase: A,
+    setClashIncludeSameModel: G,
+    setClashResultFilter: z,
+    setClashTypeFilter: re,
+    handleRunClashCheck: he,
+    handleCancelClashCheck: be,
+    handleClearClashResults: ke,
+    handleFocusClashResult: We,
+    handleUpdateClashResultStatus: Ne,
+    handleMarkFilteredClashStatus: Ie,
+    handleExportClashCsv: je,
+    resetClashState: qe,
+    applyClashModelOptionBounds: st
   };
 }
-
-function useClashSummary(sceneMgrRef, clashResults) {
-  const annotatedUuidsRef = useRef(/* @__PURE__ */ new Set());
-  const clashSummaryByUuid = useMemo(() => {
-    const summary = /* @__PURE__ */ new Map();
-    const merge = (uuid, status) => {
-      if (!uuid) return;
-      const current = summary.get(uuid) || {
+function yo(e, n) {
+  const i = ee(/* @__PURE__ */ new Set()), a = Se(() => {
+    const r = /* @__PURE__ */ new Map(), s = (c, u) => {
+      if (!c) return;
+      const p = r.get(c) || {
         total: 0,
         newCount: 0,
         confirmedCount: 0,
         resolvedCount: 0,
         worstStatus: "resolved"
       };
-      current.total += 1;
-      if (status === "new") current.newCount += 1;
-      else if (status === "confirmed") current.confirmedCount += 1;
-      else current.resolvedCount += 1;
-      if (current.newCount > 0) current.worstStatus = "new";
-      else if (current.confirmedCount > 0) current.worstStatus = "confirmed";
-      else current.worstStatus = "resolved";
-      summary.set(uuid, current);
+      p.total += 1, u === "new" ? p.newCount += 1 : u === "confirmed" ? p.confirmedCount += 1 : p.resolvedCount += 1, p.newCount > 0 ? p.worstStatus = "new" : p.confirmedCount > 0 ? p.worstStatus = "confirmed" : p.worstStatus = "resolved", r.set(c, p);
     };
-    clashResults.forEach((item) => {
-      merge(item.aUuid, item.status);
-      merge(item.bUuid, item.status);
+    n.forEach((c) => {
+      s(c.aUuid, c.status), s(c.bUuid, c.status);
     });
-    const out = {};
-    summary.forEach((value, key) => {
-      out[key] = value;
-    });
-    return out;
-  }, [clashResults]);
-  useEffect(() => {
-    if (!sceneMgrRef.current) return;
-    const mgr = sceneMgrRef.current;
-    const previouslyAnnotated = annotatedUuidsRef.current;
-    previouslyAnnotated.forEach((uuid) => {
-      const obj = mgr.contentGroup.getObjectByProperty("uuid", uuid);
-      if (obj?.userData?.clash) delete obj.userData.clash;
-      const nodes = mgr.getStructureNodes(uuid) || [];
-      nodes.forEach((node) => {
-        if (node?.userData?.clash) delete node.userData.clash;
+    const h = {};
+    return r.forEach((c, u) => {
+      h[u] = c;
+    }), h;
+  }, [n]);
+  return q(() => {
+    if (!e.current) return;
+    const r = e.current;
+    i.current.forEach((c) => {
+      const u = r.contentGroup.getObjectByProperty("uuid", c);
+      u?.userData?.clash && delete u.userData.clash, (r.getStructureNodes(c) || []).forEach((d) => {
+        d?.userData?.clash && delete d.userData.clash;
       });
     });
-    const nextAnnotated = /* @__PURE__ */ new Set();
-    Object.entries(clashSummaryByUuid).forEach(([uuid, stat]) => {
-      nextAnnotated.add(uuid);
-      const payload = {
-        total: stat.total,
-        new: stat.newCount,
-        confirmed: stat.confirmedCount,
-        resolved: stat.resolvedCount,
-        status: stat.worstStatus
-      };
-      const obj = mgr.contentGroup.getObjectByProperty("uuid", uuid);
-      if (obj) {
-        if (!obj.userData) obj.userData = {};
-        obj.userData.clash = payload;
-      }
-      const nodes = mgr.getStructureNodes(uuid) || [];
-      nodes.forEach((node) => {
-        if (!node.userData) node.userData = {};
-        node.userData.clash = payload;
+    const h = /* @__PURE__ */ new Set();
+    Object.entries(a).forEach(([c, u]) => {
+      h.add(c);
+      const p = {
+        total: u.total,
+        new: u.newCount,
+        confirmed: u.confirmedCount,
+        resolved: u.resolvedCount,
+        status: u.worstStatus
+      }, d = r.contentGroup.getObjectByProperty("uuid", c);
+      d && (d.userData || (d.userData = {}), d.userData.clash = p), (r.getStructureNodes(c) || []).forEach((f) => {
+        f.userData || (f.userData = {}), f.userData.clash = p;
       });
-    });
-    annotatedUuidsRef.current = nextAnnotated;
-  }, [clashSummaryByUuid, sceneMgrRef]);
-  return clashSummaryByUuid;
+    }), i.current = h;
+  }, [a, e]), a;
 }
-
-function useFocusInView({
-  sceneMgrRef,
-  setSelectedUuids,
-  setSelectedProps
+function bo({
+  sceneMgrRef: e,
+  setSelectedUuids: n,
+  setSelectedProps: i
 }) {
-  const focusObjectsInView = useCallback(({
-    uuids,
-    focusUuid,
-    highlightColors,
-    updateSelection = true
-  }) => {
-    const sceneManager = sceneMgrRef.current;
-    if (!sceneManager) return false;
-    const normalized = Array.from(new Set((uuids || []).map((uuid) => String(uuid || "").trim()).filter(Boolean)));
-    if (normalized.length === 0) return false;
-    const targetFocus = focusUuid && normalized.includes(focusUuid) ? focusUuid : normalized[0];
-    sceneManager.setLocateFocusContext(normalized, targetFocus, highlightColors);
-    sceneManager.fitViewToObjects(normalized);
-    if (updateSelection) {
-      setSelectedUuids(normalized);
-      setSelectedProps?.(null);
-    }
-    return true;
-  }, [sceneMgrRef, setSelectedProps, setSelectedUuids]);
   return {
-    focusObjectsInView
+    focusObjectsInView: T(({
+      uuids: r,
+      focusUuid: s,
+      highlightColors: h,
+      updateSelection: c = !0
+    }) => {
+      const u = e.current;
+      if (!u) return !1;
+      const p = Array.from(new Set((r || []).map((y) => String(y || "").trim()).filter(Boolean)));
+      if (p.length === 0) return !1;
+      const d = s && p.includes(s) ? s : p[0];
+      return u.focusHighlightObjects(p, {
+        fitView: !0,
+        focusUuid: d,
+        highlightColors: h
+      }), c && (n(p), i?.(null)), !0;
+    }, [e, i, n])
   };
 }
-
-const IS_DEV = typeof window !== "undefined" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
-const ThreeViewer = ({
-  allowDragOpen = true,
-  hiddenMenus = [],
-  libPath = "./libs",
-  defaultLang,
-  showStats: propShowStats,
-  showOutline: propShowOutline,
-  showProperties: propShowProperties,
-  initialSettings,
-  initialFiles,
-  onSelect: propOnSelect,
-  onLoad,
-  hideDeleteModel = false,
-  performancePreset = "quality",
-  chunkOptions
+const Sn = typeof window < "u" && (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"), Lo = ({
+  allowDragOpen: e = !0,
+  hiddenMenus: n = [],
+  libPath: i = "./libs",
+  defaultLang: a,
+  showStats: r,
+  showOutline: s,
+  showProperties: h,
+  initialSettings: c,
+  initialFiles: u,
+  onSelect: p,
+  onLoad: d,
+  hideDeleteModel: y = !1,
+  performancePreset: f = "quality",
+  chunkOptions: v
 }) => {
-  const theme = themes.light;
-  const effectiveChunkOptions = useMemo(() => ({
-    chunkReadCacheSize: chunkOptions?.chunkReadCacheSize ?? 128,
-    chunkPrefetchWindow: chunkOptions?.chunkPrefetchWindow ?? 0,
-    targetMinFps: chunkOptions?.targetMinFps ?? 20,
-    ghostMode: chunkOptions?.ghostMode,
-    loadProfile: chunkOptions?.loadProfile ?? "max-speed",
-    deferIfcProperties: chunkOptions?.deferIfcProperties ?? true,
-    preferWorkerOctree: chunkOptions?.preferWorkerOctree ?? true,
-    fastGeometrySanitize: chunkOptions?.fastGeometrySanitize ?? true
-  }), [chunkOptions]);
-  const [lang, setLang] = usePersistentState(
+  const m = an.light, _ = Se(() => ({
+    chunkReadCacheSize: v?.chunkReadCacheSize ?? 128,
+    chunkPrefetchWindow: v?.chunkPrefetchWindow ?? 0,
+    targetMinFps: v?.targetMinFps ?? 20,
+    ghostMode: v?.ghostMode,
+    loadProfile: v?.loadProfile ?? "max-speed",
+    deferIfcProperties: v?.deferIfcProperties ?? !0,
+    preferWorkerOctree: v?.preferWorkerOctree ?? !0,
+    fastGeometrySanitize: v?.fastGeometrySanitize ?? !0
+  }), [v]), [o, b] = it(
     "3dbrowser_lang",
-    () => defaultLang || "zh",
+    () => a || "zh",
     {
-      serializer: (value) => value,
-      parser: (raw) => raw === "zh" || raw === "en" ? raw : "zh"
+      serializer: (w) => w,
+      parser: (w) => w === "zh" || w === "en" ? w : "zh"
     }
-  );
-  useEffect(() => {
-    if (defaultLang && defaultLang !== lang) {
-      setLang(defaultLang);
-    }
-  }, [defaultLang, lang, setLang]);
-  const t = useCallback((key) => getTranslation(lang, key), [lang]);
-  useEffect(() => {
-    const preventDefault = (event) => {
-      event.preventDefault();
+  ), k = ee(a);
+  q(() => {
+    a && a !== k.current && (b(a), k.current = a);
+  }, [a, b]);
+  const g = T((w) => Ct(o, w), [o]);
+  q(() => {
+    const w = (fe) => {
+      fe.preventDefault();
+    }, W = (fe) => {
+      (fe.button === 3 || fe.button === 4) && (fe.preventDefault(), fe.stopPropagation());
     };
-    const preventBrowserNavigation = (event) => {
-      if (event.button === 3 || event.button === 4) {
-        event.preventDefault();
-        event.stopPropagation();
-      }
-    };
-    document.addEventListener("contextmenu", preventDefault, { capture: true });
-    document.addEventListener("gesturestart", preventDefault, { capture: true });
-    window.addEventListener("auxclick", preventDefault, { capture: true });
-    window.addEventListener("mousedown", preventBrowserNavigation, { capture: true });
-    return () => {
-      document.removeEventListener("contextmenu", preventDefault, { capture: true });
-      document.removeEventListener("gesturestart", preventDefault, { capture: true });
-      window.removeEventListener("auxclick", preventDefault, { capture: true });
-      window.removeEventListener("mousedown", preventBrowserNavigation, { capture: true });
+    return document.addEventListener("contextmenu", w, { capture: !0 }), document.addEventListener("gesturestart", w, { capture: !0 }), window.addEventListener("auxclick", w, { capture: !0 }), window.addEventListener("mousedown", W, { capture: !0 }), () => {
+      document.removeEventListener("contextmenu", w, { capture: !0 }), document.removeEventListener("gesturestart", w, { capture: !0 }), window.removeEventListener("auxclick", w, { capture: !0 }), window.removeEventListener("mousedown", W, { capture: !0 });
     };
   }, []);
-  const [treeRoot, setTreeRoot] = useState([]);
-  const {
-    selectedUuids,
-    selectedUuid,
-    setSelectedUuids,
-    clearSelection
-  } = useSceneSelection();
-  const [selectedProps, setSelectedProps] = useState(null);
-  const [status, setStatus] = useState(getTranslation(lang, "ready"));
-  const [loading, setLoading] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [stats, setStats] = useState({
+  const [P, R] = O([]), {
+    selectedUuids: S,
+    selectedUuid: I,
+    setSelectedUuids: C,
+    clearSelection: D
+  } = Xa(), [N, $] = O(null), [E, F] = O(Ct(o, "ready")), [A, U] = O(!1), [G, H] = O(0), [x, V] = O({
     meshes: 0,
     faces: 0,
     memory: 0,
@@ -14657,1192 +6393,994 @@ const ThreeViewer = ({
     chunksTotal: 0,
     chunksQueued: 0,
     pixelRatio: 1
-  });
-  const [chunkProgress, setChunkProgress] = useState({ loaded: 0, total: 0 });
-  const [mgrInstance, setMgrInstance] = useState(null);
-  const [mousePos, setMousePos] = useState(null);
-  const [displayMode, setDisplayMode] = useState("solid");
-  const [currentFileSetId, setCurrentFileSetId] = useState("");
-  const {
-    activeTool,
-    setActiveTool,
-    explodeEnabled,
-    setExplodeEnabled,
-    explodeStrength,
-    setExplodeStrength,
-    explodeMode,
-    setExplodeMode,
-    resetExplodeState,
-    measureType,
-    setMeasureType,
-    measureHistory,
-    setMeasureHistory,
-    highlightedMeasureId,
-    setHighlightedMeasureId,
-    resetMeasurementState,
-    handleMeasureUpdate,
-    clipEnabled,
-    setClipEnabled,
-    clipValues,
-    setClipValues,
-    clipActive,
-    setClipActive,
-    clipHelperVisible,
-    setClipHelperVisible,
-    clipHelperOpacity,
-    setClipHelperOpacity
-  } = useViewerTools({
-    initialSettings,
-    mgrInstance
-  });
-  const [pickEnabled, setPickEnabled] = usePersistentState("3dbrowser_pickEnabled", false, {
-    serializer: (value) => String(value),
-    parser: (raw) => raw === "true"
-  });
-  const [showStats, setShowStats] = usePersistentState("3dbrowser_showStats", propShowStats ?? true, {
-    serializer: (value) => String(value),
-    parser: (raw) => raw === "true"
-  });
-  const [showOutline, setShowOutline] = usePersistentState("3dbrowser_showOutline", propShowOutline ?? true, {
-    serializer: (value) => String(value),
-    parser: (raw) => raw === "true"
-  });
-  const [showProps, setShowProps] = usePersistentState("3dbrowser_showProps", propShowProperties ?? true, {
-    serializer: (value) => String(value),
-    parser: (raw) => raw === "true"
-  });
-  const [sceneSettings, setSceneSettings] = usePersistentState("3dbrowser_sceneSettings", () => {
-    const baseSettings = {
+  }), [z, ce] = O({ loaded: 0, total: 0 }), [re, Z] = O(null), [te, ue] = O(null), [ne, ge] = O("solid"), [_e, ye] = O(""), {
+    activeTool: j,
+    setActiveTool: B,
+    explodeEnabled: de,
+    setExplodeEnabled: he,
+    explodeStrength: be,
+    setExplodeStrength: ke,
+    explodeMode: We,
+    setExplodeMode: Ne,
+    resetExplodeState: Ie,
+    measureType: je,
+    setMeasureType: qe,
+    measureHistory: st,
+    setMeasureHistory: K,
+    highlightedMeasureId: Y,
+    setHighlightedMeasureId: Q,
+    resetMeasurementState: M,
+    handleMeasureUpdate: ie,
+    clipEnabled: pe,
+    setClipEnabled: le,
+    clipValues: ve,
+    setClipValues: Te,
+    clipActive: ze,
+    setClipActive: me,
+    clipHelperVisible: Me,
+    setClipHelperVisible: Re,
+    clipHelperOpacity: Oe,
+    setClipHelperOpacity: xe
+  } = lo({
+    initialSettings: c,
+    mgrInstance: re
+  }), [Ce, et] = it("3dbrowser_pickEnabled", !1, {
+    serializer: (w) => String(w),
+    parser: (w) => w === "true"
+  }), [$e, tt] = it("3dbrowser_showStats", r ?? !0, {
+    serializer: (w) => String(w),
+    parser: (w) => w === "true"
+  }), [nt, X] = it("3dbrowser_showOutline", s ?? !0, {
+    serializer: (w) => String(w),
+    parser: (w) => w === "true"
+  }), [oe, Fe] = it("3dbrowser_showProps", h ?? !0, {
+    serializer: (w) => String(w),
+    parser: (w) => w === "true"
+  }), [De, Ve] = it("3dbrowser_sceneSettings", () => {
+    const w = {
       ambientInt: 2,
       dirInt: 1,
-      bgColor: theme.canvasBg,
+      bgColor: m.canvasBg,
       viewCubeSize: 120,
       colorSpace: "srgb",
       toneMapping: "aces",
       exposure: 1,
       shadowQuality: "medium",
-      adaptiveQuality: true,
+      adaptiveQuality: !0,
       minPixelRatio: 0.8,
       maxPixelRatio: 2,
       targetFps: 50,
       performanceMode: "balanced",
       backLightInt: 0.5,
-      highlightColor: "#ff9f1c",
-      highlightShowBox: false,
+      highlightColor: "#0c62a2",
+      highlightShowBox: !1,
       clip: {
-        helperVisible: initialSettings?.clip?.helperVisible ?? false,
-        helperOpacity: initialSettings?.clip?.helperOpacity ?? 0.12
+        helperVisible: c?.clip?.helperVisible ?? !1,
+        helperOpacity: c?.clip?.helperOpacity ?? 0.12
       }
-    };
-    const merged = initialSettings ? { ...baseSettings, ...initialSettings } : baseSettings;
-    return merged.bgColor === void 0 ? { ...merged, bgColor: theme.canvasBg } : merged;
+    }, W = c ? { ...w, ...c } : w;
+    return W.bgColor === void 0 ? { ...W, bgColor: m.canvasBg } : W;
   });
-  useEffect(() => {
-    if (propShowStats !== void 0) setShowStats(propShowStats);
-  }, [propShowStats, setShowStats]);
-  const [confirmState, setConfirmState] = useState({ isOpen: false, title: "", message: "", action: () => {
-  } });
-  const [isAboutOpen, setIsAboutOpen] = useState(false);
-  const canvasRef = useRef(null);
-  const viewportRef = useRef(null);
-  const sceneMgr = useRef(null);
-  const ifcPropertyCacheRef = useRef(/* @__PURE__ */ new Map());
-  const { focusObjectsInView } = useFocusInView({
-    sceneMgrRef: sceneMgr,
-    setSelectedUuids,
-    setSelectedProps
+  q(() => {
+    r !== void 0 && tt(r);
+  }, [r, tt]);
+  const [Ue, Qe] = O({ isOpen: !1, title: "", message: "", action: () => {
+  } }), [bt, vt] = O(!1), lt = ee(null), ct = ee(null), J = ee(null), St = ee(/* @__PURE__ */ new Map()), { focusObjectsInView: ut } = bo({
+    sceneMgrRef: J,
+    setSelectedUuids: C,
+    setSelectedProps: $
+  }), {
+    leftWidth: wt,
+    rightWidth: on,
+    resizingLeft: In,
+    resizingRight: On
+  } = ao({
+    propShowOutline: s,
+    propShowProperties: h,
+    setShowOutline: X,
+    setShowProps: Fe
   });
-  const {
-    leftWidth,
-    rightWidth,
-    resizingLeft,
-    resizingRight
-  } = useViewerLayout({
-    propShowOutline,
-    propShowProperties,
-    setShowOutline,
-    setShowProps
-  });
-  useEffect(() => {
-    const manager = sceneMgr.current;
-    if (!manager) return;
-    manager.setChunkOptions(effectiveChunkOptions);
-    manager.updateSettings({
-      ...sceneSettings,
-      performanceMode: performancePreset,
-      targetFps: effectiveChunkOptions.targetMinFps ?? sceneSettings.targetFps
-    });
-  }, [effectiveChunkOptions, performancePreset, sceneSettings]);
-  const hasModels = treeRoot.length > 0;
-  const clashModelOptions = useMemo(() => {
-    const options = [];
-    const seen = /* @__PURE__ */ new Set();
-    (treeRoot || []).forEach((node) => {
-      const id = String(node?.object?.userData?.originalUuid || node?.uuid || "");
-      if (!id || seen.has(id)) return;
-      seen.add(id);
-      options.push({ id, name: String(node?.name || id) });
-    });
-    return options;
-  }, [treeRoot]);
-  const {
-    clashResults,
-    clashRunning,
-    clashProgress,
-    clashStatus,
-    clashScannedCount,
-    clashSetA,
-    clashSetB,
-    clashTolerance,
-    clashMinOverlapVolume,
-    clashClearanceDistance,
-    clashUseNarrowPhase,
-    clashUseTrianglePhase,
-    clashIncludeSameModel,
-    clashPairsScanned,
-    clashResultFilter,
-    clashTypeFilter,
-    setClashSetA,
-    setClashSetB,
-    setClashTolerance,
-    setClashMinOverlapVolume,
-    setClashClearanceDistance,
-    setClashUseNarrowPhase,
-    setClashUseTrianglePhase,
-    setClashIncludeSameModel,
-    setClashResultFilter,
-    setClashTypeFilter,
-    handleRunClashCheck,
-    handleCancelClashCheck,
-    handleClearClashResults,
-    handleFocusClashResult,
-    handleUpdateClashResultStatus,
-    handleMarkFilteredClashStatus,
-    handleExportClashCsv,
-    resetClashState,
-    applyClashModelOptionBounds
-  } = useClashCheck({
-    sceneMgrRef: sceneMgr,
-    treeRoot,
-    clashModelOptions,
-    selectedUuids,
-    setSelectedUuids,
-    focusObjectsInView,
-    t
-  });
-  const clashSummaryByUuid = useClashSummary(sceneMgr, clashResults);
-  const completedFileSetsRef = useRef(/* @__PURE__ */ new Set());
-  const currentFileSetIdRef = useRef("");
-  useEffect(() => {
-    currentFileSetIdRef.current = currentFileSetId;
-  }, [currentFileSetId]);
-  const [errorState, setErrorState] = useState({ isOpen: false, title: "", message: "" });
-  const [toast, setToast] = useState(null);
-  const { onManagerChunkProgress } = useChunkProgress({
-    fileSetIdRef: currentFileSetIdRef,
-    completedFileSetsRef,
-    onProgress: setChunkProgress,
+  q(() => {
+    const w = J.current;
+    w && (w.setChunkOptions(_), w.updateSettings({
+      ...De,
+      performanceMode: f,
+      targetFps: _.targetMinFps ?? De.targetFps
+    }));
+  }, [_, f, De]);
+  const Fn = P.length > 0, kt = Se(() => {
+    const w = [], W = /* @__PURE__ */ new Set();
+    return (P || []).forEach((fe) => {
+      const we = String(fe?.object?.userData?.originalUuid || fe?.uuid || "");
+      !we || W.has(we) || (W.add(we), w.push({ id: we, name: String(fe?.name || we) }));
+    }), w;
+  }, [P]), {
+    clashResults: at,
+    clashRunning: Pn,
+    clashProgress: Tn,
+    clashStatus: Rn,
+    clashScannedCount: jn,
+    clashSetA: Un,
+    clashSetB: Hn,
+    clashTolerance: Gn,
+    clashMinOverlapVolume: Wn,
+    clashClearanceDistance: Kn,
+    clashUseNarrowPhase: Xn,
+    clashUseTrianglePhase: Yn,
+    clashIncludeSameModel: qn,
+    clashPairsScanned: Qn,
+    clashResultFilter: Jn,
+    clashTypeFilter: Zn,
+    setClashSetA: Ft,
+    setClashSetB: Pt,
+    setClashTolerance: ei,
+    setClashMinOverlapVolume: ti,
+    setClashClearanceDistance: ni,
+    setClashUseNarrowPhase: ii,
+    setClashUseTrianglePhase: ri,
+    setClashIncludeSameModel: ai,
+    setClashResultFilter: oi,
+    setClashTypeFilter: si,
+    handleRunClashCheck: li,
+    handleCancelClashCheck: ci,
+    handleClearClashResults: Tt,
+    handleFocusClashResult: ui,
+    handleUpdateClashResultStatus: di,
+    handleMarkFilteredClashStatus: hi,
+    handleExportClashCsv: pi,
+    resetClashState: mi,
+    applyClashModelOptionBounds: sn
+  } = go({
+    sceneMgrRef: J,
+    treeRoot: P,
+    clashModelOptions: kt,
+    selectedUuids: S,
+    setSelectedUuids: C,
+    focusObjectsInView: ut,
+    t: g
+  }), ln = yo(J, at), cn = ee(/* @__PURE__ */ new Set()), un = ee("");
+  q(() => {
+    un.current = _e;
+  }, [_e]);
+  const [Rt, jt] = O({ isOpen: !1, title: "", message: "" }), [dt, Ke] = O(null), { onManagerChunkProgress: dn } = Va({
+    fileSetIdRef: un,
+    completedFileSetsRef: cn,
+    onProgress: ce,
     onCompleted: () => {
-      setToast({ message: t("all_chunks_loaded"), type: "success" });
-      setChunkProgress({ loaded: 0, total: 0 });
+      Ke({ message: g("all_chunks_loaded"), type: "success" }), ce({ loaded: 0, total: 0 });
     }
+  }), fi = T((w, W) => {
+    dn(w, W);
+  }, [dn]);
+  Ga({
+    mgrInstance: re,
+    showStats: $e,
+    setStats: V
+  }), q(() => {
+    sn();
+  }, [sn]);
+  const Ut = ee(() => {
   });
-  const handleManagerChunkProgress = useCallback((loaded, total) => {
-    onManagerChunkProgress(loaded, total);
-  }, [onManagerChunkProgress]);
-  useSceneStats({
-    mgrInstance,
-    showStats,
-    setStats
-  });
-  useEffect(() => {
-    applyClashModelOptionBounds();
-  }, [applyClashModelOptionBounds]);
-  const resetLocateStateRef = useRef(() => {
-  });
-  useEffect(() => {
-    const prevLang = lang === "zh" ? "en" : "zh";
-    if (status === getTranslation(prevLang, "ready")) {
-      setStatus(getTranslation(lang, "ready"));
-    }
-  }, [lang]);
-  const formatNumber = (num) => {
-    if (num >= 1e6) return (num / 1e6).toFixed(2) + "M";
-    if (num >= 1e3) return (num / 1e3).toFixed(1) + "K";
-    return num.toString();
-  };
-  const formatMemory = (mb) => {
-    if (mb >= 1024) return (mb / 1024).toFixed(2) + " GB";
-    return mb.toFixed(1) + " MB";
-  };
-  function captureViewpointStateSnapshot(options) {
-    const snapshot = {};
-    if (options.visibility) {
-      snapshot.hiddenUuids = Array.from(hiddenUuids);
-      snapshot.isolatedUuids = Array.from(isolatedUuids);
-    }
-    if (options.selection) {
-      snapshot.selectedUuids = [...selectedUuids];
-    }
-    if (options.clip) {
-      snapshot.clip = {
-        enabled: clipEnabled,
-        values: {
-          x: [...clipValues.x],
-          y: [...clipValues.y],
-          z: [...clipValues.z]
-        },
-        active: { ...clipActive },
-        helperVisible: clipHelperVisible,
-        helperOpacity: clipHelperOpacity
-      };
-    }
-    if (options.explode) {
-      snapshot.explode = {
-        enabled: explodeEnabled,
-        strength: explodeStrength,
-        mode: explodeMode
-      };
-    }
-    return snapshot;
+  q(() => {
+    E === Ct(o === "zh" ? "en" : "zh", "ready") && F(Ct(o, "ready"));
+  }, [o]);
+  const hn = (w) => w >= 1e6 ? (w / 1e6).toFixed(2) + "M" : w >= 1e3 ? (w / 1e3).toFixed(1) + "K" : w.toString(), _i = (w) => w >= 1024 ? (w / 1024).toFixed(2) + " GB" : w.toFixed(1) + " MB";
+  function gi(w) {
+    const W = {};
+    return w.visibility && (W.hiddenUuids = Array.from(Mt), W.isolatedUuids = Array.from(Lt)), w.selection && (W.selectedUuids = [...S]), w.clip && (W.clip = {
+      enabled: pe,
+      values: {
+        x: [...ve.x],
+        y: [...ve.y],
+        z: [...ve.z]
+      },
+      active: { ...ze },
+      helperVisible: Me,
+      helperOpacity: Oe
+    }), w.explode && (W.explode = {
+      enabled: de,
+      strength: be,
+      mode: We
+    }), W;
   }
-  async function restoreViewpointStateSnapshot(snapshot) {
-    const manager = sceneMgr.current;
-    if (!manager || !snapshot) return;
-    resetLocateStateRef.current?.();
-    manager.clearLocateFocus();
-    if (snapshot.clip) {
-      setClipEnabled(snapshot.clip.enabled);
-      setClipValues(snapshot.clip.values);
-      setClipActive(snapshot.clip.active);
-      setClipHelperVisible(snapshot.clip.helperVisible);
-      setClipHelperOpacity(snapshot.clip.helperOpacity);
-    }
-    if (snapshot.explode) {
-      setExplodeEnabled(snapshot.explode.enabled);
-      setExplodeStrength(snapshot.explode.strength);
-      setExplodeMode(snapshot.explode.mode);
-    }
-    if (snapshot.hiddenUuids !== void 0 || snapshot.isolatedUuids !== void 0) {
-      manager.setAllVisibility(true);
-      const nextHidden = snapshot.hiddenUuids || [];
-      const nextIsolated = snapshot.isolatedUuids || [];
-      if (nextIsolated.length > 0) {
-        manager.isolateObjects(nextIsolated);
-        setHiddenUuids(/* @__PURE__ */ new Set());
-        setIsolatedUuids(new Set(nextIsolated));
-      } else {
-        nextHidden.forEach((uuid) => manager.setObjectVisibility(uuid, false));
-        setHiddenUuids(new Set(nextHidden));
-        setIsolatedUuids(/* @__PURE__ */ new Set());
+  async function yi(w) {
+    const W = J.current;
+    if (!(!W || !w)) {
+      if (Ut.current?.(), W.clearLocateFocus(), w.clip && (le(w.clip.enabled), Te(w.clip.values), me(w.clip.active), Re(w.clip.helperVisible), xe(w.clip.helperOpacity)), w.explode && (he(w.explode.enabled), ke(w.explode.strength), Ne(w.explode.mode)), w.hiddenUuids !== void 0 || w.isolatedUuids !== void 0) {
+        W.setAllVisibility(!0);
+        const fe = w.hiddenUuids || [], we = w.isolatedUuids || [];
+        we.length > 0 ? (W.isolateObjects(we), Et(/* @__PURE__ */ new Set()), zt(new Set(we))) : (fe.forEach((He) => W.setObjectVisibility(He, !1)), Et(new Set(fe)), zt(/* @__PURE__ */ new Set())), Je();
       }
-      updateTree();
-    }
-    if (snapshot.selectedUuids !== void 0) {
-      setSelectedUuids(snapshot.selectedUuids);
-      setSelectedProps(null);
-      manager.highlightObjects(snapshot.selectedUuids);
-      if (snapshot.selectedUuids.length === 1) {
-        const target = manager.contentGroup.getObjectByProperty("uuid", snapshot.selectedUuids[0]);
-        if (target) {
-          await handleSelect(target);
-        }
+      if (w.selectedUuids !== void 0 && (C(w.selectedUuids), $(null), W.highlightObjects(w.selectedUuids), w.selectedUuids.length === 1)) {
+        const fe = W.contentGroup.getObjectByProperty("uuid", w.selectedUuids[0]);
+        fe && await Dt(fe);
       }
-    }
-  }
-  const {
-    viewpoints,
-    handleSaveViewpoint,
-    handleUpdateViewpointName,
-    handleLoadViewpoint,
-    handleOverwriteViewpoint,
-    handleDeleteViewpoint
-  } = useViewpoints({
-    currentFileSetId,
-    sceneMgrRef: sceneMgr,
-    setToast,
-    setConfirmState,
-    t,
-    captureStateSnapshot: captureViewpointStateSnapshot,
-    restoreStateSnapshot: restoreViewpointStateSnapshot
-  });
-  useEffect(() => {
-    if (mgrInstance) {
-      requestAnimationFrame(() => {
-        mgrInstance.resize();
+      queueMicrotask(() => {
+        W.invalidateRender?.({ needsCulling: !0 }), requestAnimationFrame(() => W.invalidateRender?.({ needsCulling: !0 }));
       });
     }
-  }, [mgrInstance, showOutline, showProps, leftWidth, rightWidth]);
-  useEffect(() => {
-    if (toast) {
-      const timer = setTimeout(() => {
-        setToast(null);
+  }
+  const {
+    viewpoints: bi,
+    handleSaveViewpoint: vi,
+    handleUpdateViewpointName: wi,
+    handleLoadViewpoint: xi,
+    handleOverwriteViewpoint: Ci,
+    handleDeleteViewpoint: Ni
+  } = ho({
+    currentFileSetId: _e,
+    sceneMgrRef: J,
+    setToast: Ke,
+    setConfirmState: Qe,
+    t: g,
+    captureStateSnapshot: gi,
+    restoreStateSnapshot: yi
+  });
+  q(() => {
+    re && requestAnimationFrame(() => {
+      re.resize();
+    });
+  }, [re, nt, oe, wt, on]), q(() => {
+    if (dt) {
+      const w = setTimeout(() => {
+        Ke(null);
       }, 3e3);
-      return () => clearTimeout(timer);
+      return () => clearTimeout(w);
     }
-  }, [toast]);
-  const updateTree = useCallback(() => {
-    if (!sceneMgr.current) return;
-    const root = sceneMgr.current.structureRoot;
-    if (!root) {
-      setTreeRoot([]);
+  }, [dt]);
+  const Je = T(() => {
+    if (!J.current) return;
+    const w = J.current.structureRoot;
+    if (!w) {
+      R([]);
       return;
     }
-    const expandedMap = /* @__PURE__ */ new Map();
-    const loadedMap = /* @__PURE__ */ new Map();
-    const collectExpanded = (nodes) => {
-      const stack = (nodes || []).slice();
-      while (stack.length) {
-        const n = stack.pop();
-        if (!n) continue;
-        if (typeof n.uuid === "string") {
-          expandedMap.set(n.uuid, !!n.expanded);
-          loadedMap.set(n.uuid, n.childrenLoaded !== false);
-        }
-        if (Array.isArray(n.children) && n.children.length) {
-          for (const child of n.children) {
-            stack.push(child);
-          }
-        }
+    const W = /* @__PURE__ */ new Map(), fe = /* @__PURE__ */ new Map(), we = (Be) => {
+      const Ge = (Be || []).slice();
+      for (; Ge.length; ) {
+        const Ae = Ge.pop();
+        if (Ae && (typeof Ae.uuid == "string" && (W.set(Ae.uuid, !!Ae.expanded), fe.set(Ae.uuid, Ae.childrenLoaded !== !1)), Array.isArray(Ae.children) && Ae.children.length))
+          for (const xt of Ae.children)
+            Ge.push(xt);
       }
-    };
-    const convertNode = (node, depth = 0, isFileNode = false, forceLoadChildren = false) => {
-      const uuid = node.id;
-      const rawChildren = Array.isArray(node.children) ? node.children : [];
-      const hasChildren = rawChildren.length > 0;
-      const shouldLoadChildren = forceLoadChildren || loadedMap.get(uuid) === true;
+    }, He = (Be, Ge = 0, Ae = !1, xt = !1) => {
+      const Wt = Be.id, _n = Array.isArray(Be.children) ? Be.children : [], ar = _n.length > 0, gn = xt || fe.get(Wt) === !0;
       return {
-        uuid,
-        name: node.name,
-        type: node.type === "Mesh" ? "MESH" : "GROUP",
-        depth,
-        children: shouldLoadChildren ? rawChildren.map((child) => convertNode(child, depth + 1, false, false)) : [],
-        expanded: expandedMap.get(uuid) ?? false,
-        visible: node.visible !== false,
-        object: node,
-        isFileNode,
-        hasChildren,
-        childrenLoaded: shouldLoadChildren
+        uuid: Wt,
+        name: Be.name,
+        type: Be.type === "Mesh" ? "MESH" : "GROUP",
+        depth: Ge,
+        children: gn ? _n.map((or) => He(or, Ge + 1, !1, !1)) : [],
+        expanded: W.get(Wt) ?? !1,
+        visible: Be.visible !== !1,
+        object: Be,
+        isFileNode: Ae,
+        hasChildren: ar,
+        childrenLoaded: gn
       };
     };
-    setTreeRoot((prev) => {
-      collectExpanded(prev);
-      const roots = [];
-      (root.children || []).forEach((c) => {
-        if (c.name === "ImportedModels" || c.name === "Tilesets") {
-          (c.children || []).forEach((child) => {
-            roots.push(convertNode(child, 0, true, true));
-          });
-        } else {
-          roots.push(convertNode(c, 0, true, true));
-        }
-      });
-      return roots;
+    R((Be) => {
+      we(Be);
+      const Ge = [];
+      return (w.children || []).forEach((Ae) => {
+        Ae.name === "ImportedModels" || Ae.name === "Tilesets" ? (Ae.children || []).forEach((xt) => {
+          Ge.push(He(xt, 0, !0, !0));
+        }) : Ge.push(He(Ae, 0, !0, !0));
+      }), Ge;
     });
-  }, []);
-  const {
-    contextMenu,
-    hiddenUuids,
-    isolatedUuids,
-    setHiddenUuids,
-    setIsolatedUuids,
-    handleContextMenu,
-    closeContextMenu,
-    handleHideSelected,
-    handleShowAll,
-    handleToggleVisibility,
-    handleHideObject,
-    handleIsolateObject,
-    handleIsolateSelection,
-    handleUndoVisibility
-  } = useViewerVisibility({
-    sceneMgrRef: sceneMgr,
-    selectedUuids,
-    setSelectedUuids,
-    setSelectedProps,
-    updateTree,
-    resetLocateState: () => resetLocateStateRef.current()
-  });
-  const handleDeleteObject = (uuid) => {
-    if (!sceneMgr.current) return;
-    const obj = sceneMgr.current.contentGroup.getObjectByProperty("uuid", uuid);
-    const nodes = sceneMgr.current.getStructureNodes(uuid);
-    if (obj || nodes) {
-      const name = obj?.name || nodes?.[0]?.name || "Item";
-      setConfirmState({
-        isOpen: true,
-        title: t("delete_item"),
-        message: `${t("confirm_delete")} "${name}"?`,
+  }, []), {
+    contextMenu: Ht,
+    hiddenUuids: Mt,
+    isolatedUuids: Lt,
+    setHiddenUuids: Et,
+    setIsolatedUuids: zt,
+    handleContextMenu: Si,
+    closeContextMenu: ki,
+    handleHideSelected: Mi,
+    handleShowAll: ht,
+    handleToggleVisibility: Li,
+    handleHideObject: Ei,
+    handleIsolateObject: zi,
+    handleIsolateSelection: Di,
+    handleUndoVisibility: Vi
+  } = uo({
+    sceneMgrRef: J,
+    selectedUuids: S,
+    setSelectedUuids: C,
+    setSelectedProps: $,
+    updateTree: Je,
+    resetLocateState: () => Ut.current()
+  }), Ai = (w) => {
+    if (!J.current) return;
+    const W = J.current.contentGroup.getObjectByProperty("uuid", w), fe = J.current.getStructureNodes(w);
+    if (W || fe) {
+      const we = W?.name || fe?.[0]?.name || "Item";
+      Qe({
+        isOpen: !0,
+        title: g("delete_item"),
+        message: `${g("confirm_delete")} "${we}"?`,
         action: async () => {
-          setLoading(true);
-          setStatus(t("delete_item") + "...");
+          U(!0), F(g("delete_item") + "...");
           try {
-            await sceneMgr.current?.removeModel(uuid);
-            setSelectedUuids((prev) => {
-              const next = prev.filter((id) => id !== uuid);
-              sceneMgr.current?.highlightObjects(next);
-              if (next.length === 0) setSelectedProps(null);
-              return next;
-            });
-            updateTree();
-            setStatus(t("ready"));
-            setToast({ message: t("success"), type: "success" });
-          } catch (error) {
-            console.error("删除对象失败:", error);
-            setToast({ message: t("failed") + ": " + (error instanceof Error ? error.message : String(error)), type: "error" });
+            await J.current?.removeModel(w), C((He) => {
+              const Be = He.filter((Ge) => Ge !== w);
+              return J.current?.highlightObjects(Be), Be.length === 0 && $(null), Be;
+            }), Je(), F(g("ready")), Ke({ message: g("success"), type: "success" });
+          } catch (He) {
+            console.error("删除对象失败:", He), Ke({ message: g("failed") + ": " + (He instanceof Error ? He.message : String(He)), type: "error" });
           } finally {
-            setLoading(false);
+            U(!1);
           }
         }
       });
     }
+  }, pn = () => {
+    D(), $(null), J.current?.highlightObjects([]), J.current?.invalidateRender?.({ needsCulling: !0 });
   };
-  const handleClearSelection = () => {
-    clearSelection();
-    setSelectedProps(null);
-    sceneMgr.current?.highlightObjects([]);
-  };
-  useEffect(() => {
-    if (!canvasRef.current) return;
-    const manager = new SceneManager(canvasRef.current, {
-      performancePreset,
-      chunkOptions: effectiveChunkOptions
+  q(() => {
+    if (!lt.current) return;
+    const w = new ur(lt.current, {
+      performancePreset: f,
+      chunkOptions: _
     });
-    sceneMgr.current = manager;
-    setMgrInstance(manager);
-    if (onLoad) onLoad(manager);
-    manager.updateSettings(sceneSettings);
-    requestAnimationFrame(() => {
-      manager.resize();
-    });
-    manager.onChunkProgress = handleManagerChunkProgress;
-    manager.onMeasureUpdate = handleMeasureUpdate;
-    manager.onStructureUpdate = () => {
-      updateTree();
+    return J.current = w, Z(w), d && d(w), w.updateSettings(De), requestAnimationFrame(() => {
+      w.resize();
+    }), w.onChunkProgress = fi, w.onMeasureUpdate = ie, w.onStructureUpdate = () => {
+      Je();
+    }, () => {
+      w.dispose();
     };
-    return () => {
-      manager.dispose();
+  }, []), q(() => {
+    if (!re || !u) return;
+    (async () => {
+      const W = Array.isArray(u) ? u : [u];
+      console.log("[ThreeViewer] loadInitial with items:", W), await Gt(W);
+    })();
+  }, [re, u]);
+  const $i = (w) => {
+    const W = {
+      ...De,
+      ...w
     };
-  }, []);
-  useEffect(() => {
-    if (!mgrInstance || !initialFiles) return;
-    const loadInitial = async () => {
-      const itemsToProcess = Array.isArray(initialFiles) ? initialFiles : [initialFiles];
-      console.log("[ThreeViewer] loadInitial with items:", itemsToProcess);
-      await processFiles(itemsToProcess);
-    };
-    loadInitial();
-  }, [mgrInstance, initialFiles]);
-  const handleSettingsUpdate = (newSettings) => {
-    const merged = {
-      ...sceneSettings,
-      ...newSettings
-    };
-    setSceneSettings(merged);
-    if (sceneMgr.current) {
-      sceneMgr.current.updateSettings(merged);
-    }
-  };
+    Ve(W), J.current && J.current.updateSettings(W);
+  }, {
+    locatedUuid: Bi,
+    locateResultUuids: Ii,
+    resetLocateState: mn,
+    handleSelect: Dt,
+    handleLocateObject: Oi,
+    handleLocateResultsChange: Fi,
+    handleClearLocate: Pi
+  } = eo({
+    sceneMgrRef: J,
+    selectedUuids: S,
+    setSelectedUuids: C,
+    setSelectedProps: $,
+    setHiddenUuids: Et,
+    setIsolatedUuids: zt,
+    updateTree: Je,
+    propOnSelect: p,
+    ifcPropertyCacheRef: St,
+    clashSummaryByUuid: ln,
+    focusObjectsInView: ut,
+    t: g,
+    isDev: Sn
+  });
+  Ut.current = mn;
   const {
-    locatedUuid,
-    locateResultUuids,
-    resetLocateState,
-    handleSelect,
-    handleLocateObject,
-    handleLocateResultsChange,
-    handleClearLocate
-  } = useViewerSelection({
-    sceneMgrRef: sceneMgr,
-    selectedUuids,
-    setSelectedUuids,
-    setSelectedProps,
-    setHiddenUuids,
-    setIsolatedUuids,
-    updateTree,
-    propOnSelect,
-    ifcPropertyCacheRef,
-    clashSummaryByUuid,
-    focusObjectsInView,
-    t,
-    isDev: IS_DEV
-  });
-  resetLocateStateRef.current = resetLocateState;
-  const {
-    searchConditions,
-    setSearchConditions,
-    searchResults,
-    searching,
-    searchProgress,
-    searchStatus,
-    handleRunPropertySearch,
-    handleApplySearchResultHighlight,
-    handleClearSearchResult,
-    handleCancelSearch
-  } = usePropertySearch({
-    sceneMgrRef: sceneMgr,
-    selectedUuids,
-    setSelectedUuids,
-    onSelectObject: handleSelect,
-    focusObjectsInView,
-    t,
-    setToast
-  });
-  const modeTrayItems = useMemo(() => {
-    const items = [];
-    if (measureType !== "none") {
-      items.push({
-        key: "measure",
-        label: t("mode_measure"),
-        onClear: () => {
-          setMeasureType("none");
-          setActiveTool("none");
-          sceneMgr.current?.clearMeasurementPreview();
-        }
-      });
-    }
-    if (clipEnabled) {
-      items.push({
-        key: "clip",
-        label: t("mode_clip"),
-        onClear: () => {
-          setClipEnabled(false);
-          setActiveTool("none");
-        }
-      });
-    }
-    if (searchResults.length > 0) {
-      items.push({
-        key: "search",
-        label: `${t("mode_search")} ${searchResults.length}`,
-        onClear: handleClearSearchResult
-      });
-    }
-    if (hiddenUuids.size > 0) {
-      items.push({
-        key: "hidden",
-        label: `${t("mode_hidden")} ${hiddenUuids.size}`,
-        onClear: handleShowAll
-      });
-    }
-    if (isolatedUuids.size > 0) {
-      items.push({
-        key: "isolated",
-        label: `${t("mode_isolated")} ${isolatedUuids.size}`,
-        onClear: handleShowAll
-      });
-    }
-    if (activeTool === "boxSelect") {
-      items.push({
-        key: "boxSelect",
-        label: t("mode_box_select"),
-        onClear: () => setActiveTool("none")
-      });
-    }
-    if (clashResults.length > 0) {
-      items.push({
-        key: "clash",
-        label: `${t("mode_clash")} ${clashResults.length}`,
-        onClear: handleClearClashResults
-      });
-    }
-    return items;
-  }, [
-    activeTool,
-    clashResults.length,
-    clipEnabled,
-    handleClearClashResults,
-    handleClearSearchResult,
-    handleShowAll,
-    hiddenUuids.size,
-    isolatedUuids.size,
-    measureType,
-    searchResults.length,
-    t
-  ]);
-  const handleIsolateClashByStatus = useCallback((status2) => {
-    if (!sceneMgr.current) return;
-    const uuids = Array.from(new Set(
-      clashResults.filter((item) => item.status === status2).flatMap((item) => [item.aUuid, item.bUuid]).filter(Boolean)
-    ));
-    if (uuids.length === 0) return;
-    sceneMgr.current.clearLocateFocus();
-    sceneMgr.current.isolateObjects(uuids);
-    setHiddenUuids(/* @__PURE__ */ new Set());
-    setIsolatedUuids(new Set(uuids));
-    updateTree();
-    sceneMgr.current.fitViewToObjects(uuids);
-  }, [clashResults, updateTree]);
-  const { processFiles, loadItemsIntoScene } = useFileLoadingFlow({
-    managerRef: sceneMgr,
-    sceneSettings,
-    libPath,
-    t,
-    setCurrentFileSetId,
-    setLoading,
-    setStatus,
-    setProgress,
-    setToast,
-    updateTree
-  });
-  useViewportLifecycle({
-    allowDragOpen,
-    mgrInstance,
-    viewportRef,
-    t,
-    processFiles,
-    setToast,
-    setErrorState
-  });
-  const {
-    getDefaultExportFileName,
-    handleExport,
-    handleClear,
-    handleScreenshot
-  } = useViewerActions({
-    sceneMgrRef: sceneMgr,
-    t,
-    setLoading,
-    setProgress,
-    setStatus,
-    setToast,
-    setActiveTool,
-    setConfirmState,
-    setSelectedUuids,
-    setSelectedProps,
-    setChunkProgress,
-    resetLocateState,
-    clearSearchResult: handleClearSearchResult,
-    resetClashState,
-    resetMeasurementState,
-    resetExplodeState,
-    updateTree,
-    ifcPropertyCacheRef,
-    completedFileSetsRef
-  });
-  const {
-    handleOpenFiles,
-    handleBatchConvert,
-    handleOpenUrl,
-    handleDragOver,
-    handleDrop
-  } = useViewerFileActions({
-    sceneMgrRef: sceneMgr,
-    t,
-    processFiles,
-    loadItemsIntoScene,
-    setLoading,
-    setStatus,
-    setProgress,
-    setToast,
-    setActiveTool,
-    setSelectedUuids,
-    setSelectedProps,
-    resetMeasurementState,
-    updateTree,
-    isDev: IS_DEV
-  });
-  useViewerCanvasInteractions({
-    sceneMgrRef: sceneMgr,
-    canvasRef,
-    activeTool,
-    setActiveTool,
-    measureType,
-    setMeasureType,
-    pickEnabled,
-    selectedUuids,
-    setSelectedUuids,
-    setSelectedProps,
-    setMousePos,
-    setHighlightedMeasureId,
-    handleSelect,
-    handleContextMenu,
-    handleUndoVisibility,
-    clearSelectionState: handleClearSelection
-  });
-  const handleView = (v) => {
-    sceneMgr.current?.setView(v);
-  };
-  const handleDisplayModeChange = (mode) => {
-    if (!sceneMgr.current) return;
-    setDisplayMode(mode);
-    sceneMgr.current.contentGroup.traverse((child) => {
-      if (child.isMesh && child.material) {
-        const materials = Array.isArray(child.material) ? child.material : [child.material];
-        materials.forEach((m) => {
-          if (mode === "transparent") {
-            m.wireframe = false;
-            m.transparent = true;
-            m.opacity = 0.5;
-          } else {
-            m.wireframe = false;
-            m.transparent = false;
-            m.opacity = 1;
-          }
-        });
+    searchConditions: Ti,
+    setSearchConditions: Ri,
+    searchResults: Vt,
+    searching: ji,
+    searchProgress: Ui,
+    searchStatus: Hi,
+    handleRunPropertySearch: Gi,
+    handleApplySearchResultHighlight: Wi,
+    handleClearSearchResult: At,
+    handleCancelSearch: Ki
+  } = mo({
+    sceneMgrRef: J,
+    selectedUuids: S,
+    setSelectedUuids: C,
+    onSelectObject: Dt,
+    focusObjectsInView: ut,
+    t: g,
+    setToast: Ke
+  }), fn = Se(() => {
+    const w = [];
+    return je !== "none" && w.push({
+      key: "measure",
+      label: g("mode_measure"),
+      onClear: () => {
+        qe("none"), B("none"), J.current?.clearMeasurementPreview();
       }
-    });
-    sceneMgr.current.requestRender();
-  };
-  return /* @__PURE__ */ jsx(ErrorBoundary, { t, theme, children: /* @__PURE__ */ jsxs(
+    }), pe && w.push({
+      key: "clip",
+      label: g("mode_clip"),
+      onClear: () => {
+        le(!1), B("none");
+      }
+    }), Vt.length > 0 && w.push({
+      key: "search",
+      label: `${g("mode_search")} ${Vt.length}`,
+      onClear: At
+    }), Mt.size > 0 && w.push({
+      key: "hidden",
+      label: `${g("mode_hidden")} ${Mt.size}`,
+      onClear: ht
+    }), Lt.size > 0 && w.push({
+      key: "isolated",
+      label: `${g("mode_isolated")} ${Lt.size}`,
+      onClear: ht
+    }), j === "boxSelect" && w.push({
+      key: "boxSelect",
+      label: g("mode_box_select"),
+      onClear: () => B("none")
+    }), at.length > 0 && w.push({
+      key: "clash",
+      label: `${g("mode_clash")} ${at.length}`,
+      onClear: Tt
+    }), w;
+  }, [
+    j,
+    at.length,
+    pe,
+    Tt,
+    At,
+    ht,
+    Mt.size,
+    Lt.size,
+    je,
+    Vt.length,
+    g
+  ]), Xi = T((w) => {
+    if (!J.current) return;
+    const W = Array.from(new Set(
+      at.filter((fe) => fe.status === w).flatMap((fe) => [fe.aUuid, fe.bUuid]).filter(Boolean)
+    ));
+    W.length !== 0 && (J.current.clearLocateFocus(), J.current.isolateObjects(W), Et(/* @__PURE__ */ new Set()), zt(new Set(W)), Je(), J.current.fitViewToObjects(W));
+  }, [at, Je]), { processFiles: Gt, loadItemsIntoScene: Yi } = Ha({
+    managerRef: J,
+    sceneSettings: De,
+    libPath: i,
+    t: g,
+    setCurrentFileSetId: ye,
+    setLoading: U,
+    setStatus: F,
+    setProgress: H,
+    setToast: Ke,
+    updateTree: Je
+  });
+  po({
+    allowDragOpen: e,
+    mgrInstance: re,
+    viewportRef: ct,
+    t: g,
+    processFiles: Gt,
+    setToast: Ke,
+    setErrorState: jt
+  });
+  const {
+    getDefaultExportFileName: qi,
+    handleExport: Qi,
+    handleClear: Ji,
+    handleScreenshot: Zi
+  } = to({
+    sceneMgrRef: J,
+    t: g,
+    setLoading: U,
+    setProgress: H,
+    setStatus: F,
+    setToast: Ke,
+    setActiveTool: B,
+    setConfirmState: Qe,
+    setSelectedUuids: C,
+    setSelectedProps: $,
+    setChunkProgress: ce,
+    resetLocateState: mn,
+    clearSearchResult: At,
+    resetClashState: mi,
+    resetMeasurementState: M,
+    resetExplodeState: Ie,
+    updateTree: Je,
+    ifcPropertyCacheRef: St,
+    completedFileSetsRef: cn
+  }), {
+    handleOpenFiles: er,
+    handleBatchConvert: tr,
+    handleOpenUrl: nr,
+    handleDragOver: ir,
+    handleDrop: rr
+  } = ro({
+    sceneMgrRef: J,
+    t: g,
+    processFiles: Gt,
+    loadItemsIntoScene: Yi,
+    setLoading: U,
+    setStatus: F,
+    setProgress: H,
+    setToast: Ke,
+    setActiveTool: B,
+    setSelectedUuids: C,
+    setSelectedProps: $,
+    resetMeasurementState: M,
+    updateTree: Je,
+    isDev: Sn
+  });
+  return no({
+    sceneMgrRef: J,
+    canvasRef: lt,
+    activeTool: j,
+    setActiveTool: B,
+    measureType: je,
+    setMeasureType: qe,
+    pickEnabled: Ce,
+    selectedUuids: S,
+    setSelectedUuids: C,
+    setSelectedProps: $,
+    setMousePos: ue,
+    setHighlightedMeasureId: Q,
+    handleSelect: Dt,
+    handleContextMenu: Si,
+    handleUndoVisibility: Vi,
+    clearSelectionState: pn
+  }), /* @__PURE__ */ t(Da, { t: g, theme: m, children: /* @__PURE__ */ l(
     "div",
     {
-      className: `ui-container ui-app-shell font-medium`,
-      onDragOver: handleDragOver,
-      onDrop: handleDrop,
+      className: "ui-container ui-app-shell font-medium",
+      onDragOver: ir,
+      onDrop: rr,
       children: [
-        /* @__PURE__ */ jsx(
-          Toolbar,
+        /* @__PURE__ */ t(
+          Qr,
           {
-            t,
-            handleOpenFiles,
-            handleBatchConvert,
-            handleOpenUrl,
-            handleView,
-            handleClear,
-            openScreenshotPanel: () => setActiveTool("screenshot"),
-            handleDisplayModeChange,
-            displayMode,
-            pickEnabled,
-            setPickEnabled,
-            activeTool,
-            setActiveTool,
-            showOutline,
-            setShowOutline,
-            showProps,
-            setShowProps,
-            showStats,
-            setShowStats,
-            sceneMgr: sceneMgr.current,
-            theme,
-            hiddenMenus,
-            onOpenAbout: () => setIsAboutOpen(true),
-            hasModels
+            t: g,
+            handleOpenFiles: er,
+            handleBatchConvert: tr,
+            handleOpenUrl: nr,
+            handleView: (w) => {
+              J.current?.setView(w);
+            },
+            handleClear: Ji,
+            openScreenshotPanel: () => B("screenshot"),
+            handleDisplayModeChange: (w) => {
+              J.current && (ge(w), J.current.contentGroup.traverse((W) => {
+                W.isMesh && W.material && (Array.isArray(W.material) ? W.material : [W.material]).forEach((we) => {
+                  w === "transparent" ? (we.wireframe = !1, we.transparent = !0, we.opacity = 0.5) : (we.wireframe = !1, we.transparent = !1, we.opacity = 1);
+                });
+              }), J.current.requestRender());
+            },
+            displayMode: ne,
+            pickEnabled: Ce,
+            setPickEnabled: et,
+            activeTool: j,
+            setActiveTool: B,
+            showOutline: nt,
+            setShowOutline: X,
+            showProps: oe,
+            setShowProps: Fe,
+            showStats: $e,
+            setShowStats: tt,
+            sceneMgr: J.current,
+            theme: m,
+            hiddenMenus: n,
+            onOpenAbout: () => vt(!0),
+            hasModels: Fn
           }
         ),
-        /* @__PURE__ */ jsxs("div", { className: "ui-main-layout", children: [
-          showOutline && /* @__PURE__ */ jsxs("div", { className: "ui-sidebar ui-sidebar-left", style: { width: `${leftWidth}px` }, children: [
-            /* @__PURE__ */ jsxs("div", { className: "ui-sidebar-header", children: [
-              /* @__PURE__ */ jsx("span", { children: t("interface_outline") }),
-              /* @__PURE__ */ jsx(
+        /* @__PURE__ */ l("div", { className: "ui-main-layout", children: [
+          nt && /* @__PURE__ */ l("div", { className: "ui-sidebar ui-sidebar-left", style: { width: `${wt}px` }, children: [
+            /* @__PURE__ */ l("div", { className: "ui-sidebar-header", children: [
+              /* @__PURE__ */ t("span", { children: g("interface_outline") }),
+              /* @__PURE__ */ t(
                 "button",
                 {
                   className: "ui-sidebar-close",
-                  onClick: () => setShowOutline(false),
-                  children: /* @__PURE__ */ jsx(IconClose, { width: 16, height: 16 })
+                  onClick: () => X(!1),
+                  children: /* @__PURE__ */ t(ot, { width: 16, height: 16 })
                 }
               )
             ] }),
-            /* @__PURE__ */ jsx("div", { className: "ui-sidebar-content", children: /* @__PURE__ */ jsx(
-              SceneTree,
+            /* @__PURE__ */ t("div", { className: "ui-sidebar-content", children: /* @__PURE__ */ t(
+              ra,
               {
-                t,
-                treeRoot,
-                setTreeRoot,
-                selectedUuid,
-                locatedUuid,
-                onSelect: (_uuid, obj) => handleSelect(obj),
-                onToggleVisibility: handleToggleVisibility,
-                onDelete: (obj) => {
-                  const uuid = obj?.uuid || obj?.id;
-                  if (uuid) handleDeleteObject(uuid);
+                t: g,
+                treeRoot: P,
+                setTreeRoot: R,
+                selectedUuid: I,
+                locatedUuid: Bi,
+                onSelect: (w, W) => Dt(W, null, !1, !0),
+                onToggleVisibility: Li,
+                onDelete: (w) => {
+                  const W = w?.uuid || w?.id;
+                  W && Ai(W);
                 },
-                onHide: handleHideObject,
-                onIsolate: handleIsolateObject,
-                onShowAll: handleShowAll,
-                onLocate: handleLocateObject,
-                onClearLocate: handleClearLocate,
-                onLocateResultsChange: handleLocateResultsChange,
-                locateResultUuids,
-                clashSummaryByUuid
+                onHide: Ei,
+                onIsolate: zi,
+                onShowAll: ht,
+                onLocate: Oi,
+                onClearLocate: Pi,
+                onLocateResultsChange: Fi,
+                locateResultUuids: Ii,
+                clashSummaryByUuid: ln
               }
             ) }),
-            /* @__PURE__ */ jsx(
+            /* @__PURE__ */ t(
               "div",
               {
                 className: "ui-sidebar-resize ui-sidebar-resize-left",
-                onMouseDown: () => resizingLeft.current = true
+                onMouseDown: () => In.current = !0
               }
             )
           ] }),
-          /* @__PURE__ */ jsxs("div", { ref: viewportRef, className: "ui-viewport-shell", style: { backgroundColor: theme.canvasBg }, children: [
-            /* @__PURE__ */ jsx("canvas", { ref: canvasRef, className: "ui-viewport-canvas" }),
-            /* @__PURE__ */ jsx(ViewCube, { sceneMgr: mgrInstance, theme, lang }),
-            contextMenu.visible && /* @__PURE__ */ jsx(
-              ContextMenu,
+          /* @__PURE__ */ l("div", { ref: ct, className: "ui-viewport-shell", style: { backgroundColor: m.canvasBg }, children: [
+            /* @__PURE__ */ t("canvas", { ref: lt, className: "ui-viewport-canvas" }),
+            /* @__PURE__ */ t(za, { sceneMgr: re, theme: m, lang: o }),
+            Ht.visible && /* @__PURE__ */ t(
+              Ln,
               {
-                x: contextMenu.x,
-                y: contextMenu.y,
+                x: Ht.x,
+                y: Ht.y,
                 items: [
                   {
-                    label: t("hide_selected"),
-                    onClick: handleHideSelected,
-                    disabled: selectedUuids.length === 0
+                    label: g("hide_selected"),
+                    onClick: Mi,
+                    disabled: S.length === 0
                   },
                   {
-                    label: t("isolate_selection"),
-                    onClick: handleIsolateSelection,
-                    disabled: selectedUuids.length === 0
+                    label: g("isolate_selection"),
+                    onClick: Di,
+                    disabled: S.length === 0
                   },
                   {
-                    label: t("clear_selection"),
-                    onClick: handleClearSelection,
-                    disabled: selectedUuids.length === 0
+                    label: g("clear_selection"),
+                    onClick: pn,
+                    disabled: S.length === 0
                   },
                   {
-                    label: t("show_all"),
-                    onClick: handleShowAll
+                    label: g("show_all"),
+                    onClick: ht
                   }
                 ],
-                onClose: closeContextMenu,
-                theme
+                onClose: ki,
+                theme: m
               }
             ),
-            toast && /* @__PURE__ */ jsxs("div", { className: "ui-toast", children: [
-              /* @__PURE__ */ jsx("div", { className: `ui-toast-dot ${toast.type === "error" ? "ui-toast-dot-error" : toast.type === "success" ? "ui-toast-dot-success" : "ui-toast-dot-info"}` }),
-              /* @__PURE__ */ jsx("span", { className: "ui-toast-message", children: toast.message }),
-              /* @__PURE__ */ jsx(
+            dt && /* @__PURE__ */ l("div", { className: "ui-toast", children: [
+              /* @__PURE__ */ t("div", { className: `ui-toast-dot ${dt.type === "error" ? "ui-toast-dot-error" : dt.type === "success" ? "ui-toast-dot-success" : "ui-toast-dot-info"}` }),
+              /* @__PURE__ */ t("span", { className: "ui-toast-message", children: dt.message }),
+              /* @__PURE__ */ t(
                 "button",
                 {
                   className: "ui-toast-close",
-                  onClick: () => setToast(null),
-                  children: /* @__PURE__ */ jsx(IconClose, { size: 12 })
+                  onClick: () => Ke(null),
+                  children: /* @__PURE__ */ t(ot, { size: 12 })
                 }
               )
             ] }),
-            /* @__PURE__ */ jsx(LoadingOverlay, { t, loading, status, progress, theme }),
-            activeTool === "measure" && /* @__PURE__ */ jsx(
-              MeasurePanel,
+            /* @__PURE__ */ t(wa, { t: g, loading: A, status: E, progress: G, theme: m }),
+            j === "measure" && /* @__PURE__ */ t(
+              ua,
               {
-                t,
-                sceneMgr: sceneMgr.current,
-                measureType,
-                setMeasureType,
-                measureHistory,
-                highlightedId: highlightedMeasureId,
-                onHighlight: (id) => {
-                  setHighlightedMeasureId(id);
-                  sceneMgr.current?.highlightMeasurement(id);
-                  if (id) sceneMgr.current?.locateMeasurement(id);
+                t: g,
+                sceneMgr: J.current,
+                measureType: je,
+                setMeasureType: qe,
+                measureHistory: st,
+                highlightedId: Y,
+                onHighlight: (w) => {
+                  Q(w), J.current?.highlightMeasurement(w), w && J.current?.locateMeasurement(w);
                 },
-                onDelete: (id) => {
-                  sceneMgr.current?.removeMeasurement(id);
-                  setMeasureHistory((prev) => prev.filter((i) => i.id !== id));
-                  if (highlightedMeasureId === id) {
-                    setHighlightedMeasureId(null);
-                    sceneMgr.current?.highlightMeasurement(null);
-                  }
+                onDelete: (w) => {
+                  J.current?.removeMeasurement(w), K((W) => W.filter((fe) => fe.id !== w)), Y === w && (Q(null), J.current?.highlightMeasurement(null));
                 },
                 onClear: () => {
-                  sceneMgr.current?.clearAllMeasurements();
-                  resetMeasurementState();
+                  J.current?.clearAllMeasurements(), M();
                 },
-                onClose: () => setActiveTool("none"),
-                theme
+                onClose: () => B("none"),
+                theme: m
               }
             ),
-            activeTool === "clip" && /* @__PURE__ */ jsx(
-              ClipPanel,
+            j === "clip" && /* @__PURE__ */ t(
+              da,
               {
-                t,
-                sceneMgr: sceneMgr.current,
-                onClose: () => setActiveTool("none"),
-                clipEnabled,
-                setClipEnabled,
-                clipValues,
-                setClipValues,
-                clipActive,
-                setClipActive,
-                clipHelperVisible,
-                setClipHelperVisible,
-                clipHelperOpacity,
-                setClipHelperOpacity,
-                theme
+                t: g,
+                sceneMgr: J.current,
+                onClose: () => B("none"),
+                clipEnabled: pe,
+                setClipEnabled: le,
+                clipValues: ve,
+                setClipValues: Te,
+                clipActive: ze,
+                setClipActive: me,
+                clipHelperVisible: Me,
+                setClipHelperVisible: Re,
+                clipHelperOpacity: Oe,
+                setClipHelperOpacity: xe,
+                theme: m
               }
             ),
-            activeTool === "export" && /* @__PURE__ */ jsx(
-              ExportPanel,
+            j === "export" && /* @__PURE__ */ t(
+              ha,
               {
-                t,
-                onClose: () => setActiveTool("none"),
-                onExport: handleExport,
-                getDefaultFileName: getDefaultExportFileName,
-                theme
+                t: g,
+                onClose: () => B("none"),
+                onExport: Qi,
+                getDefaultFileName: qi,
+                theme: m
               }
             ),
-            activeTool === "screenshot" && /* @__PURE__ */ jsx(
-              ScreenshotPanel,
+            j === "screenshot" && /* @__PURE__ */ t(
+              pa,
               {
-                t,
-                onClose: () => setActiveTool("none"),
-                onCapture: (mode) => {
-                  handleScreenshot(mode);
-                  setActiveTool("none");
+                t: g,
+                onClose: () => B("none"),
+                onCapture: (w) => {
+                  Zi(w), B("none");
                 },
-                theme
+                theme: m
               }
             ),
-            activeTool === "settings" && /* @__PURE__ */ jsx(
-              SettingsPanel,
+            j === "settings" && /* @__PURE__ */ t(
+              aa,
               {
-                t,
-                onClose: () => setActiveTool("none"),
-                settings: sceneSettings,
-                onUpdate: handleSettingsUpdate,
-                currentLang: lang,
-                setLang,
-                showStats,
-                setShowStats,
-                theme
+                t: g,
+                onClose: () => B("none"),
+                settings: De,
+                onUpdate: $i,
+                currentLang: o,
+                setLang: b,
+                showStats: $e,
+                setShowStats: tt,
+                theme: m
               }
             ),
-            activeTool === "viewpoint" && /* @__PURE__ */ jsx(
-              ViewpointPanel,
+            j === "viewpoint" && /* @__PURE__ */ t(
+              fa,
               {
-                t,
-                viewpoints,
-                onSave: handleSaveViewpoint,
-                onUpdateName: handleUpdateViewpointName,
-                onLoad: handleLoadViewpoint,
-                onDelete: handleDeleteViewpoint,
-                onOverwrite: handleOverwriteViewpoint,
-                onClose: () => setActiveTool("none"),
-                theme
+                t: g,
+                viewpoints: bi,
+                onSave: vi,
+                onUpdateName: wi,
+                onLoad: xi,
+                onDelete: Ni,
+                onOverwrite: Ci,
+                onClose: () => B("none"),
+                theme: m
               }
             ),
-            activeTool === "search" && /* @__PURE__ */ jsx(
-              SearchPanel,
+            j === "search" && /* @__PURE__ */ t(
+              ba,
               {
-                t,
-                onClose: () => setActiveTool("none"),
-                conditions: searchConditions,
-                results: searchResults,
-                searching,
-                searchProgress,
-                searchStatus,
-                onConditionsChange: setSearchConditions,
-                onSearch: () => void handleRunPropertySearch(),
-                onCancelSearch: handleCancelSearch,
-                onApplyResultHighlight: handleApplySearchResultHighlight,
-                onClearResult: handleClearSearchResult,
-                theme
+                t: g,
+                onClose: () => B("none"),
+                conditions: Ti,
+                results: Vt,
+                searching: ji,
+                searchProgress: Ui,
+                searchStatus: Hi,
+                onConditionsChange: Ri,
+                onSearch: () => void Gi(),
+                onCancelSearch: Ki,
+                onApplyResultHighlight: Wi,
+                onClearResult: At,
+                theme: m
               }
             ),
-            activeTool === "clash" && /* @__PURE__ */ jsx(
-              ClashPanel,
+            j === "clash" && /* @__PURE__ */ t(
+              va,
               {
-                t,
-                onClose: () => setActiveTool("none"),
-                running: clashRunning,
-                progress: clashProgress,
-                status: clashStatus,
-                scannedCount: clashScannedCount,
-                pairsScanned: clashPairsScanned,
-                results: clashResults,
-                resultFilter: clashResultFilter,
-                modelOptions: clashModelOptions,
-                setA: clashSetA,
-                setB: clashSetB,
-                tolerance: clashTolerance,
-                minOverlapVolume: clashMinOverlapVolume,
-                clearanceDistance: clashClearanceDistance,
-                useNarrowPhase: clashUseNarrowPhase,
-                useTrianglePhase: clashUseTrianglePhase,
-                includeSameModel: clashIncludeSameModel,
-                onSetAChange: setClashSetA,
-                onSetBChange: setClashSetB,
-                onToleranceChange: setClashTolerance,
-                onMinOverlapVolumeChange: setClashMinOverlapVolume,
-                onClearanceDistanceChange: setClashClearanceDistance,
-                onUseNarrowPhaseChange: setClashUseNarrowPhase,
-                onUseTrianglePhaseChange: setClashUseTrianglePhase,
-                onIncludeSameModelChange: setClashIncludeSameModel,
-                onRun: () => void handleRunClashCheck(),
-                onCancel: handleCancelClashCheck,
-                onClear: handleClearClashResults,
-                onExportCsv: handleExportClashCsv,
-                onIsolateByStatus: handleIsolateClashByStatus,
-                onRestoreVisibility: handleShowAll,
-                onResultFilterChange: setClashResultFilter,
-                typeFilter: clashTypeFilter,
-                onTypeFilterChange: setClashTypeFilter,
-                onUpdateResultStatus: handleUpdateClashResultStatus,
-                onMarkFilteredStatus: handleMarkFilteredClashStatus,
-                onSetASelectAll: () => setClashSetA(clashModelOptions.map((item) => item.id)),
-                onSetAClear: () => setClashSetA([]),
-                onSetBSelectAll: () => setClashSetB(clashModelOptions.map((item) => item.id)),
-                onSetBClear: () => setClashSetB([]),
-                onFocusResult: handleFocusClashResult,
-                theme
+                t: g,
+                onClose: () => B("none"),
+                running: Pn,
+                progress: Tn,
+                status: Rn,
+                scannedCount: jn,
+                pairsScanned: Qn,
+                results: at,
+                resultFilter: Jn,
+                modelOptions: kt,
+                setA: Un,
+                setB: Hn,
+                tolerance: Gn,
+                minOverlapVolume: Wn,
+                clearanceDistance: Kn,
+                useNarrowPhase: Xn,
+                useTrianglePhase: Yn,
+                includeSameModel: qn,
+                onSetAChange: Ft,
+                onSetBChange: Pt,
+                onToleranceChange: ei,
+                onMinOverlapVolumeChange: ti,
+                onClearanceDistanceChange: ni,
+                onUseNarrowPhaseChange: ii,
+                onUseTrianglePhaseChange: ri,
+                onIncludeSameModelChange: ai,
+                onRun: () => void li(),
+                onCancel: ci,
+                onClear: Tt,
+                onExportCsv: pi,
+                onIsolateByStatus: Xi,
+                onRestoreVisibility: ht,
+                onResultFilterChange: oi,
+                typeFilter: Zn,
+                onTypeFilterChange: si,
+                onUpdateResultStatus: di,
+                onMarkFilteredStatus: hi,
+                onSetASelectAll: () => Ft(kt.map((w) => w.id)),
+                onSetAClear: () => Ft([]),
+                onSetBSelectAll: () => Pt(kt.map((w) => w.id)),
+                onSetBClear: () => Pt([]),
+                onFocusResult: ui,
+                theme: m
               }
             ),
-            activeTool === "explode" && /* @__PURE__ */ jsx(
-              ExplodePanel,
+            j === "explode" && /* @__PURE__ */ t(
+              _a,
               {
-                t,
-                onClose: () => setActiveTool("none"),
-                enabled: explodeEnabled,
-                strength: explodeStrength,
-                mode: explodeMode,
-                onEnabledChange: setExplodeEnabled,
-                onStrengthChange: setExplodeStrength,
-                onModeChange: setExplodeMode,
+                t: g,
+                onClose: () => B("none"),
+                enabled: de,
+                strength: be,
+                mode: We,
+                onEnabledChange: he,
+                onStrengthChange: ke,
+                onModeChange: Ne,
                 onReset: () => {
-                  resetExplodeState();
-                  sceneMgr.current?.resetExplode();
+                  Ie(), J.current?.resetExplode();
                 },
-                theme
+                theme: m
               }
             )
           ] }),
-          showProps && /* @__PURE__ */ jsxs("div", { className: "ui-sidebar ui-sidebar-right", style: { width: `${rightWidth}px` }, children: [
-            /* @__PURE__ */ jsxs("div", { className: "ui-sidebar-header", children: [
-              /* @__PURE__ */ jsx("span", { children: t("interface_props") }),
-              /* @__PURE__ */ jsx(
+          oe && /* @__PURE__ */ l("div", { className: "ui-sidebar ui-sidebar-right", style: { width: `${on}px` }, children: [
+            /* @__PURE__ */ l("div", { className: "ui-sidebar-header", children: [
+              /* @__PURE__ */ t("span", { children: g("interface_props") }),
+              /* @__PURE__ */ t(
                 "button",
                 {
                   className: "ui-sidebar-close",
-                  onClick: () => setShowProps(false),
-                  children: /* @__PURE__ */ jsx(IconClose, { width: 16, height: 16 })
+                  onClick: () => Fe(!1),
+                  children: /* @__PURE__ */ t(ot, { width: 16, height: 16 })
                 }
               )
             ] }),
-            /* @__PURE__ */ jsx("div", { className: "ui-sidebar-content", children: /* @__PURE__ */ jsx(PropertiesPanel, { t, selectedProps, theme }) }),
-            /* @__PURE__ */ jsx(
+            /* @__PURE__ */ t("div", { className: "ui-sidebar-content", children: /* @__PURE__ */ t(Ma, { t: g, selectedProps: N, theme: m }) }),
+            /* @__PURE__ */ t(
               "div",
               {
-                onMouseDown: () => resizingRight.current = true,
+                onMouseDown: () => On.current = !0,
                 className: "ui-sidebar-resize ui-sidebar-resize-right"
               }
             )
           ] })
         ] }),
-        /* @__PURE__ */ jsxs("div", { className: "ui-statusbar", children: [
-          /* @__PURE__ */ jsxs("div", { className: "ui-statusbar-left", children: [
-            /* @__PURE__ */ jsx("span", { children: status }),
-            loading && /* @__PURE__ */ jsxs("span", { children: [
-              progress,
+        /* @__PURE__ */ l("div", { className: "ui-statusbar", children: [
+          /* @__PURE__ */ l("div", { className: "ui-statusbar-left", children: [
+            /* @__PURE__ */ t("span", { children: E }),
+            A && /* @__PURE__ */ l("span", { children: [
+              G,
               "%"
             ] }),
-            selectedUuid && selectedUuids.length > 1 && /* @__PURE__ */ jsxs("span", { className: "ui-statusbar-meta", children: [
-              t("selected_count"),
+            I && S.length > 1 && /* @__PURE__ */ l("span", { className: "ui-statusbar-meta", children: [
+              g("selected_count"),
               ": ",
-              selectedUuids.length
+              S.length
             ] }),
-            chunkProgress.total > 0 && chunkProgress.loaded < chunkProgress.total && /* @__PURE__ */ jsxs("div", { className: "ui-chunk-progress", children: [
-              /* @__PURE__ */ jsxs("span", { children: [
-                t("chunk_loading"),
+            z.total > 0 && z.loaded < z.total && /* @__PURE__ */ l("div", { className: "ui-chunk-progress", children: [
+              /* @__PURE__ */ l("span", { children: [
+                g("chunk_loading"),
                 ": ",
-                chunkProgress.loaded,
+                z.loaded,
                 "/",
-                chunkProgress.total
+                z.total
               ] }),
-              /* @__PURE__ */ jsx("div", { className: "ui-progress-bar ui-progress-bar-compact", children: /* @__PURE__ */ jsx(
+              /* @__PURE__ */ t("div", { className: "ui-progress-bar ui-progress-bar-compact", children: /* @__PURE__ */ t(
                 "div",
                 {
                   className: "ui-progress-fill",
-                  style: { width: `${chunkProgress.loaded / chunkProgress.total * 100}%` }
+                  style: { width: `${z.loaded / z.total * 100}%` }
                 }
               ) })
             ] }),
-            modeTrayItems.length > 0 && /* @__PURE__ */ jsx("div", { className: "ui-mode-tray", children: modeTrayItems.map((item) => /* @__PURE__ */ jsxs("div", { className: "ui-mode-pill", children: [
-              /* @__PURE__ */ jsx("span", { children: item.label }),
-              /* @__PURE__ */ jsx("button", { onClick: item.onClear, children: t("mode_clear") })
-            ] }, item.key)) })
+            fn.length > 0 && /* @__PURE__ */ t("div", { className: "ui-mode-tray", children: fn.map((w) => /* @__PURE__ */ l("div", { className: "ui-mode-pill", children: [
+              /* @__PURE__ */ t("span", { children: w.label }),
+              /* @__PURE__ */ t("button", { onClick: w.onClear, children: g("mode_clear") })
+            ] }, w.key)) })
           ] }),
-          /* @__PURE__ */ jsxs("div", { className: "ui-statusbar-right", children: [
-            mousePos && /* @__PURE__ */ jsxs("div", { className: "ui-statusbar-coords", children: [
-              mousePos.x.toFixed(2),
+          /* @__PURE__ */ l("div", { className: "ui-statusbar-right", children: [
+            te && /* @__PURE__ */ l("div", { className: "ui-statusbar-coords", children: [
+              te.x.toFixed(2),
               ", ",
-              mousePos.y.toFixed(2),
+              te.y.toFixed(2),
               ", ",
-              mousePos.z.toFixed(2)
+              te.z.toFixed(2)
             ] }),
-            /* @__PURE__ */ jsxs("div", { className: "ui-tips", children: [
-              /* @__PURE__ */ jsx("span", { children: t("tips_rotate") }),
-              /* @__PURE__ */ jsx("span", { children: t("tips_pan") }),
-              /* @__PURE__ */ jsx("span", { children: t("tips_zoom") })
+            /* @__PURE__ */ l("div", { className: "ui-tips", children: [
+              /* @__PURE__ */ t("span", { children: g("tips_rotate") }),
+              /* @__PURE__ */ t("span", { children: g("tips_pan") }),
+              /* @__PURE__ */ t("span", { children: g("tips_zoom") })
             ] }),
-            showStats && /* @__PURE__ */ jsxs("div", { className: "ui-stats-group", children: [
-              /* @__PURE__ */ jsxs("div", { className: "ui-stats-item", title: t("stats_original_meshes"), children: [
-                /* @__PURE__ */ jsx(IconBox, { width: 14, height: 14 }),
-                /* @__PURE__ */ jsx("span", { children: formatNumber(stats.meshes) })
+            $e && /* @__PURE__ */ l("div", { className: "ui-stats-group", children: [
+              /* @__PURE__ */ l("div", { className: "ui-stats-item", title: g("stats_original_meshes"), children: [
+                /* @__PURE__ */ t(kn, { width: 14, height: 14 }),
+                /* @__PURE__ */ t("span", { children: hn(x.meshes) })
               ] }),
-              /* @__PURE__ */ jsxs("div", { className: "ui-stats-item", title: t("stats_triangles"), children: [
-                /* @__PURE__ */ jsx(IconGrid, { width: 14, height: 14 }),
-                /* @__PURE__ */ jsx("span", { children: formatNumber(stats.faces) })
+              /* @__PURE__ */ l("div", { className: "ui-stats-item", title: g("stats_triangles"), children: [
+                /* @__PURE__ */ t(Vr, { width: 14, height: 14 }),
+                /* @__PURE__ */ t("span", { children: hn(x.faces) })
               ] }),
-              /* @__PURE__ */ jsxs("div", { className: "ui-stats-item", children: [
-                /* @__PURE__ */ jsx(IconActivity, { width: 14, height: 14 }),
-                /* @__PURE__ */ jsx("span", { children: formatMemory(stats.memory) })
+              /* @__PURE__ */ l("div", { className: "ui-stats-item", children: [
+                /* @__PURE__ */ t(Lr, { width: 14, height: 14 }),
+                /* @__PURE__ */ t("span", { children: _i(x.memory) })
               ] }),
-              stats.chunksTotal > 0 && /* @__PURE__ */ jsxs("div", { className: "ui-statusbar-metric", title: t("stats_chunks"), children: [
+              x.chunksTotal > 0 && /* @__PURE__ */ l("div", { className: "ui-statusbar-metric", title: g("stats_chunks"), children: [
                 "CH ",
-                stats.chunksLoaded,
+                x.chunksLoaded,
                 "/",
-                stats.chunksTotal
+                x.chunksTotal
               ] }),
-              /* @__PURE__ */ jsxs("div", { className: "ui-statusbar-metric", title: t("stats_pixel_ratio"), children: [
+              /* @__PURE__ */ l("div", { className: "ui-statusbar-metric", title: g("stats_pixel_ratio"), children: [
                 "DPR ",
-                stats.pixelRatio
+                x.pixelRatio
               ] })
             ] }),
-            /* @__PURE__ */ jsx("div", { className: "ui-divider-vertical ui-divider-vertical-compact ui-divider-vertical-short" }),
-            /* @__PURE__ */ jsx(
+            /* @__PURE__ */ t("div", { className: "ui-divider-vertical ui-divider-vertical-compact ui-divider-vertical-short" }),
+            /* @__PURE__ */ t(
               "button",
               {
                 className: "ui-statusbar-tag ui-statusbar-tag-compact",
-                onClick: () => setLang(lang === "zh" ? "en" : "zh"),
-                children: lang === "zh" ? "EN" : "中文"
+                onClick: () => b(o === "zh" ? "en" : "zh"),
+                children: o === "zh" ? "EN" : "中文"
               }
             ),
-            /* @__PURE__ */ jsx("div", { className: "ui-divider-vertical ui-divider-vertical-compact ui-divider-vertical-short" }),
-            /* @__PURE__ */ jsx("div", { className: "ui-statusbar-tag ui-statusbar-tag-compact ui-statusbar-brand", children: /* @__PURE__ */ jsx("span", { className: "ui-statusbar-brand-label", children: "3D BROWSER" }) })
+            /* @__PURE__ */ t("div", { className: "ui-divider-vertical ui-divider-vertical-compact ui-divider-vertical-short" }),
+            /* @__PURE__ */ t("div", { className: "ui-statusbar-tag ui-statusbar-tag-compact ui-statusbar-brand", children: /* @__PURE__ */ t("span", { className: "ui-statusbar-brand-label", children: "3D BROWSER" }) })
           ] })
         ] }),
-        /* @__PURE__ */ jsx(
-          ConfirmModal,
+        /* @__PURE__ */ t(
+          La,
           {
-            isOpen: confirmState.isOpen,
-            title: confirmState.title,
-            message: confirmState.message,
+            isOpen: Ue.isOpen,
+            title: Ue.title,
+            message: Ue.message,
             onConfirm: () => {
-              confirmState.action();
-              setConfirmState({ ...confirmState, isOpen: false });
+              Ue.action(), Qe({ ...Ue, isOpen: !1 });
             },
-            onCancel: () => setConfirmState({ ...confirmState, isOpen: false }),
-            t,
-            theme
+            onCancel: () => Qe({ ...Ue, isOpen: !1 }),
+            t: g,
+            theme: m
           }
         ),
-        /* @__PURE__ */ jsx(
-          AboutModal,
+        /* @__PURE__ */ t(
+          Ea,
           {
-            isOpen: isAboutOpen,
-            onClose: () => setIsAboutOpen(false),
-            t,
-            theme
+            isOpen: bt,
+            onClose: () => vt(!1),
+            t: g,
+            theme: m
           }
         ),
-        errorState.isOpen && /* @__PURE__ */ jsx("div", { className: "ui-error-overlay", children: /* @__PURE__ */ jsxs("div", { className: "ui-error-content ui-error-content-wide", children: [
-          /* @__PURE__ */ jsxs("div", { className: "ui-error-header ui-error-header-danger", children: [
-            /* @__PURE__ */ jsx("span", { children: errorState.title }),
-            /* @__PURE__ */ jsx(
+        Rt.isOpen && /* @__PURE__ */ t("div", { className: "ui-error-overlay", children: /* @__PURE__ */ l("div", { className: "ui-error-content ui-error-content-wide", children: [
+          /* @__PURE__ */ l("div", { className: "ui-error-header ui-error-header-danger", children: [
+            /* @__PURE__ */ t("span", { children: Rt.title }),
+            /* @__PURE__ */ t(
               "div",
               {
-                onClick: () => setErrorState((prev) => ({ ...prev, isOpen: false })),
+                onClick: () => jt((w) => ({ ...w, isOpen: !1 })),
                 className: "ui-error-close",
-                children: /* @__PURE__ */ jsx(IconClose, { width: 18, height: 18 })
+                children: /* @__PURE__ */ t(ot, { width: 18, height: 18 })
               }
             )
           ] }),
-          /* @__PURE__ */ jsxs("div", { className: "ui-error-body", children: [
-            /* @__PURE__ */ jsx("div", { className: "ui-error-message", children: errorState.message }),
-            /* @__PURE__ */ jsx("div", { className: "ui-error-actions", children: /* @__PURE__ */ jsx(
+          /* @__PURE__ */ l("div", { className: "ui-error-body", children: [
+            /* @__PURE__ */ t("div", { className: "ui-error-message", children: Rt.message }),
+            /* @__PURE__ */ t("div", { className: "ui-error-actions", children: /* @__PURE__ */ t(
               "button",
               {
                 className: "ui-btn ui-btn-primary ui-btn-modal-confirm",
-                onClick: () => setErrorState((prev) => ({ ...prev, isOpen: false })),
-                children: t("confirm")
+                onClick: () => jt((w) => ({ ...w, isOpen: !1 })),
+                children: g("confirm")
               }
             ) })
           ] })
@@ -15851,5 +7389,13 @@ const ThreeViewer = ({
     }
   ) });
 };
-
-export { ThreeViewer, ThreeViewer as default };
+export {
+  hr as DEFAULT_FONT,
+  ur as SceneManager,
+  Lo as ThreeViewer,
+  ko as colors,
+  Ct as getTranslation,
+  Ra as loadModelFiles,
+  Mo as resolveThemeColors,
+  an as themes
+};

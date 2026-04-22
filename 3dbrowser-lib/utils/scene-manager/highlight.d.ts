@@ -1,14 +1,11 @@
 import * as THREE from "three";
-type OptimizedMappingEntry = {
-    mesh: THREE.BatchedMesh;
-    instanceId: number;
-    originalColor: number;
-    geometry?: THREE.BufferGeometry;
-};
+import { type OptimizedMappingEntry } from "./renderTargets";
+import type { StructureTreeNode } from "./types";
 type LocateDimmedInstance = {
     mesh: THREE.BatchedMesh;
     instanceId: number;
     originalColor: number;
+    originalVisible: boolean;
 };
 type SceneManagerHighlightState = {
     highlightedUuids: Set<string>;
@@ -20,6 +17,7 @@ interface SceneManagerHighlightContext {
     contentGroup: THREE.Group;
     selectionBox: THREE.Box3Helper;
     highlightMesh: THREE.Mesh;
+    nodeMap: Map<string, StructureTreeNode[]>;
     optimizedMapping: Map<string, OptimizedMappingEntry[]>;
     settings: {
         highlightColor?: string;

@@ -18,6 +18,6 @@ export interface ThemeColors {
 export declare const themes: {
     light: ThemeColors;
 };
-export declare const DEFAULT_FONT = "'Roboto', 'Inter', 'Segoe UI', 'Microsoft YaHei', sans-serif";
+export declare const DEFAULT_FONT = "'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif";
 export declare const colors: ThemeColors;
 export declare function resolveThemeColors(): ThemeColors;
