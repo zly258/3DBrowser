@@ -19,16 +19,13 @@ interface SceneManagerHighlightContext {
     highlightMesh: THREE.Mesh;
     nodeMap: Map<string, StructureTreeNode[]>;
     optimizedMapping: Map<string, OptimizedMappingEntry[]>;
+    totalMeshCount: number;
     settings: {
         highlightColor?: string;
         highlightShowBox?: boolean;
     };
     state: SceneManagerHighlightState;
-    locateMaterialCache: Map<string, {
-        transparent: boolean;
-        opacity: number;
-        depthWrite: boolean;
-    }>;
+    locateMaterialCache: Map<string, THREE.Material | THREE.Material[]>;
     locateObjectMaterialCache: Map<string, THREE.Material | THREE.Material[]>;
     locateDimmedInstances: Map<string, LocateDimmedInstance>;
     clearClashPairHighlight: () => void;

@@ -3,7 +3,7 @@ import { type PropertyGroups } from "../viewer/propertyIndex";
 interface PropertiesPanelProps {
     t: (key: string) => string;
     selectedProps: PropertyGroups | null;
-    theme: any;
+    theme?: any;
 }
 export declare const PropertiesPanel: React.FC<PropertiesPanelProps>;
 export {};

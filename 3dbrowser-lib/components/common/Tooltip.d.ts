@@ -1,8 +1,8 @@
-import React from 'react';
+import React from "react";
 export interface TooltipProps {
     children: React.ReactNode;
     title: React.ReactNode;
-    placement?: 'top' | 'bottom' | 'left' | 'right';
+    placement?: "top" | "bottom" | "left" | "right";
     className?: string;
     style?: React.CSSProperties;
 }

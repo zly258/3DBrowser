@@ -1,6 +1,6 @@
 import type { Dispatch, SetStateAction } from "react";
 import type { SceneManager, MeasureType, SceneSettings, MeasurementRecord } from "../utils/scene-manager/SceneManager";
-export type ViewerTool = "none" | "measure" | "clip" | "settings" | "export" | "screenshot" | "viewpoint" | "search" | "boxSelect" | "explode" | "clash";
+export type ViewerTool = "none" | "measure" | "clip" | "settings" | "export" | "screenshot" | "viewpoint" | "search" | "boxSelect" | "explode" | "clash" | "sun";
 export type ExplodeMode = "radial" | "horizontal" | "vertical";
 export interface MeasureHistoryItem {
     id: string;

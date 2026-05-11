@@ -24,6 +24,11 @@ interface SearchPanelProps {
     searching: boolean;
     searchProgress: number;
     searchStatus: string;
+    propertyFieldOptions: Array<{
+        value: string;
+        label: string;
+        count?: number;
+    }>;
     onConditionsChange: (next: PropertySearchCondition[]) => void;
     onSearch: () => void;
     onCancelSearch: () => void;

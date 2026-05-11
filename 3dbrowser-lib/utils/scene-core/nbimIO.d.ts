@@ -4,6 +4,28 @@ export interface NbimHeader {
     manifestOffset: number;
     manifestLength: number;
 }
+export interface NbimPropertyRow {
+    group: string;
+    key: string;
+    path: string;
+    value: string;
+    source?: string;
+    rawKey?: string;
+}
+export interface NbimPropertyDocument {
+    owner: string;
+    bimId: string;
+    uuid: string;
+    name: string;
+    rows: NbimPropertyRow[];
+}
+export interface NbimPropertyNameIndexItem {
+    group: string;
+    key: string;
+    path: string;
+    rawKey?: string;
+    count: number;
+}
 export interface NbimManifest {
     globalBounds?: {
         min: {
@@ -21,6 +43,8 @@ export interface NbimManifest {
     structureTree?: any;
     bimIdTable?: string[];
     bimProperties?: Record<string, any>;
+    bimPropertyDocs?: Record<string, NbimPropertyDocument>;
+    propertyNameIndex?: NbimPropertyNameIndexItem[];
     stats?: {
         meshes: number;
         faces: number;

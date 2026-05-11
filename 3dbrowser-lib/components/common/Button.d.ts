@@ -1,8 +1,9 @@
-import React from 'react';
+import React from "react";
+import { ComponentSize, ComponentVariant } from "./types";
 export interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
-    variant?: 'primary' | 'secondary' | 'danger' | 'ghost' | 'default';
-    size?: 'sm' | 'md' | 'lg';
+    variant?: ComponentVariant;
+    size?: ComponentSize;
     active?: boolean;
     theme?: any;
 }
-export declare const Button: React.FC<ButtonProps>;
+export declare const Button: React.ForwardRefExoticComponent<ButtonProps & React.RefAttributes<HTMLButtonElement>>;

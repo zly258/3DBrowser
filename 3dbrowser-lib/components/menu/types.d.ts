@@ -1,20 +1,21 @@
 import React from "react";
 import { ThemeColors } from "../../theme/styles";
-interface MenuBarProps {
+export type ThemeType = "light";
+export type MenuTool = "none" | "measure" | "clip" | "settings" | "export" | "screenshot" | "viewpoint" | "search" | "boxSelect" | "explode" | "clash" | "sun";
+export type DisplayMode = "solid" | "transparent";
+export interface BaseMenuProps {
     t: (key: string) => string;
     theme: ThemeColors;
+    hiddenMenus?: string[];
     handleOpenFiles?: (e: React.ChangeEvent<HTMLInputElement>) => void;
     handleBatchConvert?: (e: React.ChangeEvent<HTMLInputElement>) => void;
     handleOpenUrl?: () => void;
     handleView?: (view: string) => void;
     handleClear?: () => void;
-    openScreenshotPanel?: () => void;
-    handleDisplayModeChange?: (mode: 'solid' | 'transparent') => void;
-    displayMode?: 'solid' | 'transparent';
     pickEnabled?: boolean;
     setPickEnabled?: (enabled: boolean) => void;
-    activeTool?: 'none' | 'measure' | 'clip' | 'settings' | 'export' | 'screenshot' | 'viewpoint' | 'search' | 'boxSelect' | 'explode' | 'clash';
-    setActiveTool?: (tool: 'none' | 'measure' | 'clip' | 'settings' | 'export' | 'screenshot' | 'viewpoint' | 'search' | 'boxSelect' | 'explode' | 'clash') => void;
+    activeTool?: MenuTool;
+    setActiveTool?: (tool: MenuTool) => void;
     showOutline?: boolean;
     setShowOutline?: (show: boolean) => void;
     showProps?: boolean;
@@ -22,9 +23,15 @@ interface MenuBarProps {
     showStats?: boolean;
     setShowStats?: (show: boolean) => void;
     sceneMgr?: any;
-    hiddenMenus?: string[];
     onOpenAbout?: () => void;
     hasModels?: boolean;
 }
-export declare const Toolbar: React.FC<MenuBarProps>;
-export {};
+export interface ClassicMenuBarProps extends BaseMenuProps {
+    themeType?: ThemeType;
+    setThemeType?: (type: ThemeType) => void;
+}
+export interface ToolbarProps extends BaseMenuProps {
+    openScreenshotPanel?: () => void;
+    handleDisplayModeChange?: (mode: DisplayMode) => void;
+    displayMode?: DisplayMode;
+}

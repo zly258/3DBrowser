@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import type { StructureTreeNode } from "./types";
+import type { NbimPropertyDocument, NbimPropertyNameIndexItem } from "../scene-core/nbimIO";
 export declare function sanitizeDisplayLabel(...candidates: Array<string | null | undefined | number>): string;
 export declare function countStructureRenderableNodes(node: StructureTreeNode | undefined): number;
 export declare function buildExportStructureTree(structureRoot: StructureTreeNode): any;
@@ -8,7 +9,8 @@ export declare function encodeNbimManifest(manifest: {
     chunks: unknown[];
     structureTree: any;
     bimIdTable: string[];
-    bimProperties: Record<string, any>;
+    bimPropertyDocs?: Record<string, NbimPropertyDocument>;
+    propertyNameIndex?: NbimPropertyNameIndexItem[];
 }, structureRoot: StructureTreeNode): Uint8Array<ArrayBufferLike>;
 export declare function deriveDefaultNbimStem(contentGroup: THREE.Group): string;
 export declare function groupNbimPropertiesByOwner(manifestBimProperties: Record<string, any>, rootId: string): {
@@ -32,11 +34,34 @@ export declare function collectIfcModelReferences(contentGroup: THREE.Group): {
     ifcApiByModel: Map<string, IfcApiRef>;
     ifcManagerByModel: Map<string, IfcManagerRef>;
 };
+export declare function buildPropertyNameIndex(docs: Record<string, NbimPropertyDocument>): NbimPropertyNameIndexItem[];
 export declare function collectNbimBimProperties(options: {
     structureRoot: StructureTreeNode;
     ifcApiByModel: Map<string, IfcApiRef>;
     ifcManagerByModel: Map<string, IfcManagerRef>;
-}): Promise<Record<string, any>>;
+}): Promise<{
+    bimProperties: Record<string, any>;
+    bimPropertyDocs: Record<string, NbimPropertyDocument>;
+    propertyNameIndex: NbimPropertyNameIndexItem[];
+}>;
+export declare function collectIfcObjectBasicPropertyIndex(object: THREE.Object3D): {
+    bimPropertyDocs: Record<string, NbimPropertyDocument>;
+    propertyNameIndex: NbimPropertyNameIndexItem[];
+};
+export declare function collectIfcObjectPropertyIndex(options: {
+    object: THREE.Object3D;
+    ifcApiByModel: Map<string, IfcApiRef>;
+    ifcManagerByModel: Map<string, IfcManagerRef>;
+    onProgress?: (processed: number, total: number) => void;
+}): Promise<{
+    bimProperties: Record<string, any>;
+    bimPropertyDocs: Record<string, NbimPropertyDocument>;
+    propertyNameIndex: NbimPropertyNameIndexItem[];
+}>;
+export declare function convertLegacyBimPropertiesToDocs(bimProperties: Record<string, any>): {
+    bimPropertyDocs: Record<string, NbimPropertyDocument>;
+    propertyNameIndex: NbimPropertyNameIndexItem[];
+};
 export declare function prepareNbimExportChunks(options: {
     chunks: any[];
     nbimFiles: Map<string, File>;

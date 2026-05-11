@@ -1,7 +1,4 @@
-import React from 'react';
-/**
- * SliderProps - 滑块组件属性接口
- */
+import React from "react";
 export interface SliderProps {
     min: number;
     max: number;
@@ -12,9 +9,6 @@ export interface SliderProps {
     disabled?: boolean;
     style?: React.CSSProperties;
     showValue?: boolean;
+    className?: string;
 }
-/**
- * Slider - 基础滑块组件
- * 支持拖拽操作，步进值控制
- */
 export declare const Slider: React.FC<SliderProps>;

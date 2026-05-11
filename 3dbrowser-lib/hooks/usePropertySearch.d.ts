@@ -17,6 +17,11 @@ export type PropertySearchResultItem = {
     source: string;
     matchedBy: string[];
 };
+export type PropertyFieldOption = {
+    value: string;
+    label: string;
+    count?: number;
+};
 interface UsePropertySearchParams {
     sceneMgrRef: MutableRefObject<SceneManager | null>;
     selectedUuids: string[];
@@ -41,6 +46,7 @@ export declare function usePropertySearch({ sceneMgrRef, selectedUuids, setSelec
     searching: boolean;
     searchProgress: number;
     searchStatus: string;
+    propertyFieldOptions: PropertyFieldOption[];
     handleRunPropertySearch: () => Promise<void>;
     handleApplySearchResultHighlight: (uuid: string) => void;
     handleClearSearchResult: () => void;

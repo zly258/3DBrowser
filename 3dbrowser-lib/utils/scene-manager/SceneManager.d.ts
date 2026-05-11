@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { type NbimPropertyDocument, type NbimPropertyNameIndexItem } from "../scene-core/nbimIO";
 import { type RenderTarget } from "./renderTargets";
 import { type SceneVisibilityBatchOptions, type SceneVisibilityChange } from "./visibility";
 import { type PerformancePreset, type SceneChunkOptions, type SceneManagerOptions } from "../scene-core/types";
@@ -33,6 +34,8 @@ export declare class SceneManager {
     private locateMaterialCache;
     private locateObjectMaterialCache;
     private locateDimmedInstances;
+    private locateIsolationRestoreChanges;
+    private locateIsolationActive;
     private clashPairObjectMaterialCache;
     private clashPairInstanceColorCache;
     private clashPairUuids;
@@ -86,6 +89,10 @@ export declare class SceneManager {
     private nbimFiles;
     private nbimMeta;
     private nbimPropsByOriginalUuid;
+    private nbimPropertyDocsByOriginalUuid;
+    private nbimSearchDocsByUuid;
+    private nbimPropertyNameIndex;
+    private nbimPropertyNameIndexVersion;
     private sharedMaterial;
     private interactableList;
     private interactableListValid;
@@ -148,6 +155,8 @@ export declare class SceneManager {
     private chunkRegistrationBatchSize;
     private chunkGhostBatchSize;
     private animationFrameId;
+    private cameraFlightFrameId;
+    private cameraFlightToken;
     private animateFramePending;
     private disposed;
     private interactionShadowDowngraded;
@@ -263,6 +272,10 @@ export declare class SceneManager {
     removeObject(uuid: string): boolean;
     removeModel(uuid: string): Promise<boolean>;
     private generateChunkBinaryV8;
+    private registerPropertyDocuments;
+    private rebuildSearchPropertyIndexForObject;
+    private scheduleSearchPropertyIndexRebuild;
+    private buildExportPropertyDocsFromCache;
     exportNbim(fileName?: string): Promise<void>;
     loadNbim(file: File, onProgress?: (p: number, msg: string) => void): Promise<void>;
     clear(): Promise<void>;
@@ -273,8 +286,15 @@ export declare class SceneManager {
     private resolveNbimNode;
     getNbimProperties(id: string): any | null;
     getNbimIfcPropertyGroups(id: string, mode?: "raw" | "normalized"): Record<string, PropertyGroupInput> | null;
+    getNbimPropertyNameIndex(): NbimPropertyNameIndexItem[];
+    getNbimPropertyNameIndexVersion(): number;
+    getNbimPropertySearchDocument(uuid: string): NbimPropertyDocument | null;
+    getAllNbimPropertySearchDocuments(): NbimPropertyDocument[];
+    hasRenderableTarget(uuid: string): boolean;
     private getVisibilityContext;
     private getHighlightContext;
+    private cancelCameraFlight;
+    private isWorldVisible;
     private getPickingContext;
     private syncHighlightState;
     private syncPickingState;
@@ -292,6 +312,11 @@ export declare class SceneManager {
         refreshExplode?: boolean;
     }): void;
     isolateObjects(uuids: string[]): void;
+    isolateObjectsForLocate(uuids: string[]): void;
+    restoreLocateIsolation(options?: {
+        clearFocus?: boolean;
+        invalidate?: boolean;
+    }): boolean;
     setObjectVisibility(uuid: string, visible: boolean, showParents?: boolean): void;
     highlightObject(uuid: string | null): void;
     private toLocalDirection;
@@ -309,6 +334,7 @@ export declare class SceneManager {
     clearClashPairHighlight(): void;
     setClashPairHighlight(aUuid: string, bUuid: string, colorAHex?: string, colorBHex?: string): void;
     clearLocateFocus(): void;
+    restoreView(keepOrientation?: boolean): void;
     private expandLocateTargets;
     setLocateResultSet(uuids: string[], focusUuid?: string | null): void;
     setLocateFocusContext(uuids: string[], focusUuid?: string | null, highlightColors?: Record<string, string>): void;
@@ -316,7 +342,7 @@ export declare class SceneManager {
     highlightObjects(uuids: string[]): void;
     /**
      * 通用多构件聚焦高亮入口：
-     * - 高亮 uuids 中的所有物体（橙色），其余设为半透明灰色
+     * - 高亮 uuids 中的所有物体
      * - 可选 fitView 将镜头飞到这批物体
      * - 可选 highlightColors 支持按 UUID 指定不同颜色（碰撞场景 A/B 色对）
      * - 传空数组等同于 clearLocateFocus()
@@ -343,7 +369,7 @@ export declare class SceneManager {
     getBoundsForObject(uuid: string): any;
     collectBoundsForUuids(uuids: string[]): any;
     fitViewToObjects(uuids: string[]): void;
-    fitBox(box: THREE.Box3, updateCameraPosition?: boolean, paddingOverride?: number): void;
+    fitBox(box: THREE.Box3, updateCameraPosition?: boolean, paddingOverride?: number, needsCullingOnCameraMove?: boolean): void;
     setView(view: string): void;
     getCameraState(): {
         position: any;

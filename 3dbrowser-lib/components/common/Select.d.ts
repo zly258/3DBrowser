@@ -1,14 +1,16 @@
-import React from 'react';
-export interface SelectOption {
-    value: string;
-    label: string;
-}
-export interface SelectProps {
-    value: string;
-    options: SelectOption[];
-    onChange: (value: string) => void;
+import React from "react";
+import { ValueOption } from "./types";
+export type SelectOption<T extends string = string> = ValueOption<T>;
+export interface SelectProps<T extends string = string> {
+    value: T;
+    options: Array<SelectOption<T>>;
+    onChange: (value: T) => void;
     className?: string;
     style?: React.CSSProperties;
     disabled?: boolean;
+    placeholder?: React.ReactNode;
+    searchable?: boolean;
+    searchPlaceholder?: string;
+    emptyText?: string;
 }
-export declare const Select: React.FC<SelectProps>;
+export declare function Select<T extends string = string>({ value, options, onChange, className, style, disabled, placeholder, searchable, searchPlaceholder, emptyText }: SelectProps<T>): import("react/jsx-runtime").JSX.Element;

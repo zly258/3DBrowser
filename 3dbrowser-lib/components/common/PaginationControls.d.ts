@@ -1,5 +1,5 @@
 import React from "react";
-interface PaginationControlsProps {
+export interface PaginationControlsProps {
     prevTitle: string;
     nextTitle: string;
     currentPage: number;
@@ -9,4 +9,3 @@ interface PaginationControlsProps {
     rightContent?: React.ReactNode;
 }
 export declare const PaginationControls: React.FC<PaginationControlsProps>;
-export {};

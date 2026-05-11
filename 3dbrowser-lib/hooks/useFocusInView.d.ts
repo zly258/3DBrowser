@@ -5,6 +5,8 @@ interface FocusInViewOptions {
     sceneMgrRef: MutableRefObject<SceneManager | null>;
     setSelectedUuids: Dispatch<SetStateAction<string[]>>;
     setSelectedProps?: Dispatch<SetStateAction<PropertyGroups | null>>;
+    isolateLocate?: boolean;
+    onIsolateLocate?: (uuids: string[]) => void;
 }
 interface FocusRequest {
     uuids: string[];
@@ -12,7 +14,7 @@ interface FocusRequest {
     highlightColors?: Record<string, string>;
     updateSelection?: boolean;
 }
-export declare function useFocusInView({ sceneMgrRef, setSelectedUuids, setSelectedProps }: FocusInViewOptions): {
+export declare function useFocusInView({ sceneMgrRef, setSelectedUuids, setSelectedProps, isolateLocate, onIsolateLocate }: FocusInViewOptions): {
     focusObjectsInView: ({ uuids, focusUuid, highlightColors, updateSelection }: FocusRequest) => boolean;
 };
 export {};

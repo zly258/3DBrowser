@@ -1,10 +1,11 @@
-import React from 'react';
+import React from "react";
+import { ComponentStatus } from "./types";
 export interface BadgeProps {
     count?: number | React.ReactNode;
     overflowCount?: number;
     dot?: boolean;
     showZero?: boolean;
-    status?: 'success' | 'error' | 'default' | 'processing' | 'warning';
+    status?: ComponentStatus;
     text?: React.ReactNode;
     offset?: [number, number];
     className?: string;
