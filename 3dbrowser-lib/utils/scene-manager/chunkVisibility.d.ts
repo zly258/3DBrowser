@@ -63,7 +63,7 @@ export declare function evaluateChunkVisibility(options: {
     centerPriorityWindow: boolean;
     isPeripheralCandidate: boolean;
     priority: number;
-    dist: any;
+    dist: number;
     centrality: number;
     forwardness: number;
     pixelSize: number;

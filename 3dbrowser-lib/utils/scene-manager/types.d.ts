@@ -10,6 +10,7 @@ export interface MeasurementRecord {
 export interface SceneSettings {
     ambientInt: number;
     dirInt: number;
+    hemiInt?: number;
     backLightInt?: number;
     bgColor: string;
     highlightColor?: string;
@@ -31,6 +32,8 @@ export interface SceneSettings {
     targetFps?: number;
     performanceMode?: "balanced" | "smooth" | "quality";
     locateIsolateMode?: boolean;
+    themeType?: "indigo" | "sky" | "emerald" | "violet" | "rose" | "amber" | "custom";
+    themeCustomColor?: string;
 }
 export interface StructureTreeNode {
     id: string;

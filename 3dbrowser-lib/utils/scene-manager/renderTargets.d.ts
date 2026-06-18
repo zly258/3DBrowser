@@ -28,4 +28,4 @@ export interface RenderTargetContext {
 export declare function expandRenderableIds(context: RenderTargetContext, ids: string[]): Set<string>;
 export declare function collectRenderableTargetsForIds(context: RenderTargetContext, ids: string[]): RenderTarget[];
 export declare function collectAllRenderableTargets(context: RenderTargetContext): RenderTarget[];
-export declare function collectRenderableBoundsForIds(context: RenderTargetContext, ids: string[]): any;
+export declare function collectRenderableBoundsForIds(context: RenderTargetContext, ids: string[]): THREE.Box3;

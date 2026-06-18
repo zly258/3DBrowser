@@ -25,7 +25,7 @@ export declare function resolveChunkMeshForLoad(options: {
     chunks: any[];
     processingChunks: Set<string>;
 }): Promise<{
-    mesh: any;
+    mesh: THREE.BatchedMesh;
     prefetchCandidates: string[];
 }>;
 export declare function attachLoadedChunkMesh(options: {

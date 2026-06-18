@@ -20,7 +20,7 @@ export declare function takeCachedChunkMeshEntry(options: {
     chunkMeshCache: Map<string, THREE.BatchedMesh>;
     chunkCacheOrder: string[];
 }): {
-    mesh: any;
+    mesh: THREE.BatchedMesh;
     chunkCacheOrder: string[];
 };
 export declare function clearChunkMeshCacheEntries(options: {
@@ -41,7 +41,7 @@ export declare function acquireGhostLineResource(options: {
     ghostMeshPool: THREE.LineSegments[];
     ghostEdgesGeometry: THREE.BufferGeometry;
     ghostMaterial: THREE.Material;
-}): any;
+}): THREE.LineSegments<THREE.BufferGeometry<THREE.NormalBufferAttributes, THREE.BufferGeometryEventMap>, THREE.Material<THREE.MaterialEventMap> | THREE.Material<THREE.MaterialEventMap>[], THREE.Object3DEventMap>;
 export declare function releaseGhostLineResource(options: {
     line: THREE.LineSegments;
     ghostMeshPool: THREE.LineSegments[];
@@ -50,7 +50,7 @@ export declare function createGhostLineResource(options: {
     name: string;
     bounds: THREE.Box3;
     acquireGhostLine: () => THREE.LineSegments;
-}): THREE.LineSegments;
+}): THREE.LineSegments<THREE.BufferGeometry<THREE.NormalBufferAttributes, THREE.BufferGeometryEventMap>, THREE.Material<THREE.MaterialEventMap> | THREE.Material<THREE.MaterialEventMap>[], THREE.Object3DEventMap>;
 export declare function ensureChunkGhostResource(options: {
     chunk: any;
     ghostGroup: THREE.Group;

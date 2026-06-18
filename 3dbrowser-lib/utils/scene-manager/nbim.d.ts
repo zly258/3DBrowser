@@ -21,7 +21,7 @@ export declare function createNbimContainerGroup(options: {
     fileName: string;
     modelRootName?: string;
     rootId: string;
-}): any;
+}): THREE.Group<THREE.Object3DEventMap>;
 type IfcApiRef = {
     ifcApi: any;
     modelID: number;

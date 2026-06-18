@@ -20,6 +20,7 @@ export declare class SceneManager {
     ghostGroup: THREE.Group;
     clipHelpersGroup: THREE.Group;
     ambientLight: THREE.AmbientLight;
+    hemiLight: THREE.HemisphereLight;
     dirLight: THREE.DirectionalLight;
     backLight: THREE.DirectionalLight;
     structureRoot: StructureTreeNode;
@@ -185,7 +186,7 @@ export declare class SceneManager {
         invalidateInteractables?: boolean;
     }): void;
     updateSettings(newSettings: Partial<SceneSettings>): void;
-    createCircleTexture(): any;
+    createCircleTexture(): THREE.CanvasTexture<HTMLCanvasElement>;
     animate: () => void;
     private updateAdaptiveQuality;
     private updateInteractionPerformance;
@@ -366,19 +367,19 @@ export declare class SceneManager {
     private unionOptimizedBounds;
     private unionNodeBounds;
     fitViewToObject(uuid: string): void;
-    getBoundsForObject(uuid: string): any;
-    collectBoundsForUuids(uuids: string[]): any;
+    getBoundsForObject(uuid: string): THREE.Box3;
+    collectBoundsForUuids(uuids: string[]): THREE.Box3;
     fitViewToObjects(uuids: string[]): void;
     fitBox(box: THREE.Box3, updateCameraPosition?: boolean, paddingOverride?: number, needsCullingOnCameraMove?: boolean): void;
     setView(view: string): void;
     getCameraState(): {
-        position: any;
-        target: any;
-        zoom: any;
-        left: any;
-        right: any;
-        top: any;
-        bottom: any;
+        position: THREE.Vector3Tuple;
+        target: THREE.Vector3Tuple;
+        zoom: number;
+        left: number;
+        right: number;
+        top: number;
+        bottom: number;
     };
     setCameraState(state: any): void;
     locateMeasurement(id: string): void;

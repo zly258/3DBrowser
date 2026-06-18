@@ -15,7 +15,7 @@ export declare const decodeNormal: (packed: number) => {
 export declare const parseColor: (color: number) => number;
 export declare const extractScaleFromMatrix3: (matrix: Float32Array) => number[];
 export declare const normalizeMatrix3: (matrix: Float32Array) => Float32Array<ArrayBuffer>;
-export declare const composeMatrixByMatrix3: (matrix: Float32Array, position: Float32Array) => any;
+export declare const composeMatrixByMatrix3: (matrix: Float32Array, position: Float32Array) => THREE.Matrix4;
 export declare class LMBLoader extends Loader {
     manager: LoadingManager;
     private static expressIdCounter;
@@ -26,7 +26,7 @@ export declare class LMBLoader extends Loader {
     }): Promise<THREE.Group>;
     parse(buffer: ArrayBuffer, onProgress?: (progress: number) => void, options?: {
         fastMode?: boolean;
-    }): any;
+    }): THREE.Group<THREE.Object3DEventMap>;
     parseNode(buffer: ArrayBuffer, view: DataView, offset: number, options?: {
         decodeNames?: boolean;
     }): {
