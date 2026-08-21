@@ -61,7 +61,7 @@ function App() {
 |------|------|---------|-------------|
 | `libPath` | `string` | `'./libs'` | Path to the folder containing WASM/Worker files (relative to window.location) |
 | `allowDragOpen` | `boolean` | `true` | Allow opening files via drag and drop |
-| `hiddenMenus` | `string[]` | `[]` | List of menu IDs to hide. Available IDs: `file`, `open_file`, `export`, `clear`, `view`, `fit_view`, `views`, `interface`, `outline`, `props`, `stats`, `pick`, `tool`, `measure`, `clip`, `viewpoint`, `sun`, `about`. |
+| `hiddenMenus` | `string[]` | `[]` | List of menu IDs to hide. Available IDs: `file`, `open_file`, `export`, `clear`, `view`, `fit_view`, `views`, `interface`, `outline`, `props`, `stats`, `pick`[...]
 | `defaultTheme` | `'dark' \| 'light'` | `'light'` | Default UI theme |
 | `defaultLang` | `'zh' \| 'en'` | `'zh'` | Default UI language |
 | `showStats` | `boolean` | `true` | Show performance statistics panel |
@@ -90,7 +90,7 @@ const handleLoad = (manager: SceneManager) => {
 
 ### Free for Non-Commercial Use (Commercial Use Prohibited)
 
-This project is intended for learning and research purposes only. **Commercial use of any kind is strictly prohibited**. For commercial licensing or enterprise support, please contact the author at `zhangly1403@163.com`.
+This project is intended for learning and research purposes only. **Commercial use of any kind is strictly prohibited**. For commercial licensing or enterprise support, please contact the author a[...]
 
 ---
 
@@ -157,7 +157,7 @@ function App() {
 |------|------|---------|-------------|
 | `libPath` | `string` | `'./libs'` | 包含 WASM/Worker 文件的文件夹路径（相对于 window.location） |
 | `allowDragOpen` | `boolean` | `true` | 是否允许通过拖拽打开文件 |
-| `hiddenMenus` | `string[]` | `[]` | 需要隐藏的菜单 ID 列表。可用 ID: `file`, `open_file`, `export`, `clear`, `view`, `fit_view`, `views`, `interface`, `outline`, `props`, `stats`, `pick`, `tool`, `measure`, `clip`, `viewpoint`, `sun`, `about`。 |
+| `hiddenMenus` | `string[]` | `[]` | 需要隐藏的菜单 ID 列表。可用 ID: `file`, `open_file`, `export`, `clear`, `view`, `fit_view`, `views`, `interface`, `outline`, `props`, `stats`, `[...]
 | `defaultTheme` | `'dark' \| 'light'` | `'light'` | 默认界面主题 |
 | `defaultLang` | `'zh' \| 'en'` | `'zh'` | 默认界面语言 |
 | `showStats` | `boolean` | `true` | 是否显示性能统计面板 |
@@ -173,4 +173,4 @@ function App() {
 
 ### 非商业用途免费（禁止用于商业目的）
 
-本项目仅供学习和研究使用，**禁止用于任何商业目的**。如需商业授权或企业级支持，请联系作者：`zhangly1403@163.com`。
+本项目仅供学习和研究使用，**禁止用于任何商业目的**。如需商业授权或企业级支持，请联系作者：`zhangly1403@gmail.com`。
