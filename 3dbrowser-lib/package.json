@@ -10,7 +10,7 @@
     "browser"
   ],
   "license": "CC-BY-NC-4.0",
-  "author": "zhangly1403@163.com",
+  "author": "zly258 <zhangly1403@gmail.com>",
   "type": "module",
   "main": "./3dbrowser.js",
   "module": "./3dbrowser.js",
